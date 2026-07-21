@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title data-i18n="ci.pagetitle">Компанія чи ви особисто? — CatMan Pro</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="wrap header-row">
+    <a class="brand" href="../index.html#top">
+      <span class="brand-mark" aria-hidden="true"></span>
+      CatMan&nbsp;Pro
+    </a>
+    <nav class="nav" aria-label="Основна навігація">
+      <a href="../index.html#tabs" data-i18n="nav.features">Можливості</a>
+      <a href="gsm-extension.html" data-i18n="nav.gsm">Розширення</a>
+      <a href="company-individual.html" class="active" data-i18n="nav.company">Компанія/Користувач</a>
+      <a href="pricing.html" data-i18n="nav.pricing">Тарифи</a>
+      <a href="../index.html#faq" data-i18n="nav.faq">Питання</a>
+    </nav>
+    <div class="lang-switch">
+      <button class="lang-btn" id="langBtn" aria-haspopup="listbox" aria-expanded="false">
+        <span id="langCurrent">UA</span>
+        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"></path></svg>
+      </button>
+      <ul class="lang-list" id="langList" role="listbox">
+        <li role="option" data-lang="uk">Українська</li>
+        <li role="option" data-lang="en">English</li>
+        <li role="option" data-lang="pl">Polski</li>
+        <li role="option" data-lang="zh">中文</li>
+        <li role="option" data-lang="de">Deutsch</li>
+      </ul>
+    </div>
+    <a class="btn btn-primary btn-small" href="../index.html#download" data-i18n="nav.download">Завантажити</a>
+    <button class="nav-toggle" id="navToggle" aria-label="Меню" aria-expanded="false">
+      <span></span><span></span><span></span>
+    </button>
+  </div>
+</header>
+
+<main>
+  <section class="page-hero section">
+    <div class="wrap wrap-narrow">
+      <p class="breadcrumb"><a href="../index.html" data-i18n="breadcrumb.home">Головна</a> / <span data-i18n="hub.card.companyindividual.title">Компанія чи ви особисто?</span></p>
+      <h1 class="section-title" data-i18n="ci.title">Компанія чи ви особисто? На VPS чи локально?</h1>
+      <p class="section-lede" data-i18n="ci.lede">CatMan Pro тепер підходить не тільки командам — а й одній людині, яка веде облік сама. При реєстрації просто відповідаєте на два питання.</p>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top: 8px;">
+    <div class="wrap">
+      <div class="choice-grid">
+        <div class="choice-card">
+          <h3 data-i18n="ci.company.title">Компанія</h3>
+          <p data-i18n="ci.company.desc">Для команди з кількома людьми. Є керівник, який бачить усе, і менеджери, кожен зі своєю зоною відповідальності.</p>
+          <div class="choice-sub">
+            <div class="choice-sub-item">
+              <strong data-i18n="ci.company.vps.title">VPS (в хмарі)</strong>
+              <span data-i18n="ci.company.vps.desc">Дані на віддаленому сервері. Заходьте з будь-якого пристрою — вся команда працює з одними даними, а керівник бачить аналітику по кожному працівнику.</span>
+            </div>
+            <div class="choice-sub-item">
+              <strong data-i18n="ci.company.local.title">Локально (дешевше)</strong>
+              <span data-i18n="ci.company.local.desc">Кожен працівник веде свій облік на своєму робочому пристрої — дешевше, бо не потрібен окремий сервер. Вхід у програму все одно потребує інтернету для авторизації, але сама база даних зберігається локально, і керівник не бачить загальної картини по всій команді.</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="choice-card choice-card--highlight">
+          <h3 data-i18n="ci.user.title">Окремий користувач</h3>
+          <p data-i18n="ci.user.desc">Для одного підприємця без команди. Весь функціонал компанії, тільки простіше — не треба нікого запрошувати, ви самі й власник, і єдиний користувач.</p>
+          <div class="choice-sub">
+            <div class="choice-sub-item">
+              <strong data-i18n="ci.user.vps.title">VPS</strong>
+              <span data-i18n="ci.user.vps.desc">Дані на сервері — можна користуватись з телефону й з комп'ютера одночасно, дані завжди на місці.</span>
+            </div>
+            <div class="choice-sub-item">
+              <strong data-i18n="ci.user.local.title">Локально</strong>
+              <span data-i18n="ci.user.local.desc">Найдешевший варіант: база даних зберігається просто в папці поруч з програмою на вашому комп'ютері. Вхід усе одно потребує інтернету для авторизації. Щоб користуватись на іншому пристрої — треба перенести цю папку.</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="choice-grid" style="margin-top: 22px;">
+        <div class="choice-card">
+          <h3 data-i18n="ci.migrate.title">Можна перейти пізніше</h3>
+          <p data-i18n="ci.migrate.desc">Почали Локально — можна будь-коли перейти на VPS. Ваша база даних переїде разом з вами, нічого не губиться. Якщо ви компанія — після переходу на VPS одразу розблоковується загальний огляд для керівника.</p>
+        </div>
+        <div class="choice-card">
+          <h3 data-i18n="ci.limit.title">Скільки людей — вирішуєте ви</h3>
+          <p data-i18n="ci.limit.desc">Для компаній є тарифи на кількість користувачів: від однієї людини до необмеженої команди. Можна почати з малого і розширюватись, коли буде потрібно.</p>
+        </div>
+        <div class="choice-card" style="grid-column: 1 / -1;">
+          <h3 data-i18n="ci.backup.title">Ручна резервна копія — ваша страховка</h3>
+          <p data-i18n="ci.backup.desc">У будь-який момент можна зберегти повну копію бази даних у вказану теку — на комп'ютер, флешку чи навіть телефон. Якщо щось піде не так, дані відновлюються звідти ж, тим самим шляхом. Кілька кліків, без підписок на хмарні бекапи — працює і для VPS, і для Локального зберігання.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top: 8px;">
+    <div class="wrap">
+      <p class="eyebrow center" data-i18n="ci.vpsadv.eyebrow">Переваги VPS</p>
+      <h2 class="section-title center" data-i18n="ci.vpsadv.title">Що додатково дає VPS для компанії</h2>
+      <p class="section-lede center" data-i18n="ci.vpsadv.lede">Коли вся команда працює з однією базою даних у хмарі, керівнику відкриваються можливості, яких немає в Локальному режимі.</p>
+
+      <div class="trust-grid" style="grid-template-columns: repeat(3, 1fr); margin-top: 8px;">
+        <div class="trust-card">
+          <span class="feature-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 19V10M10 19V5M16 19v-7M20 19H4"></path>
+            </svg>
+          </span>
+          <h3 data-i18n="ci.vpsadv.1.title">Керівник бачить повну картину</h3>
+          <p data-i18n="ci.vpsadv.1.desc">Власник у будь-який момент бачить аналітику по кожному підлеглому — хто скільки замовив, які категорії веде, яка динаміка. У Локальному режимі кожен зберігає дані на своєму пристрої, і такої спільної картини немає.</p>
+        </div>
+        <div class="trust-card">
+          <span class="feature-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M13 3L4 14h7l-1 7 9-11h-7l1-7z"></path>
+            </svg>
+          </span>
+          <h3 data-i18n="ci.vpsadv.2.title">Передача доступів за кілька хвилин</h3>
+          <p data-i18n="ci.vpsadv.2.desc">Потрібно обмінятись категоріями чи постачальниками між менеджерами? На VPS це питання прав доступу, а не перенесення файлів — зміни видно одразу всім, і нічого не треба копіювати вручну.</p>
+        </div>
+        <div class="trust-card">
+          <span class="feature-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="5" y="11" width="14" height="9" rx="2"></rect>
+              <path d="M8 11V7a4 4 0 0 1 8 0v4"></path>
+              <path d="M9.5 15.5l1.7 1.7 3.3-3.4"></path>
+            </svg>
+          </span>
+          <h3 data-i18n="ci.vpsadv.3.title">Звільнення без втрати даних</h3>
+          <p data-i18n="ci.vpsadv.3.desc">Якщо працівник іде з компанії, усі його дані — товари, замовлення, історія — залишаються на сервері. Досить закрити йому доступ і передати зону відповідальності новому менеджеру: нічого не пропадає.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap footer-row">
+    <span>© <span id="year"></span> CatMan Pro</span>
+    <a href="#" data-i18n="footer.contact">Контакти</a>
+  </div>
+</footer>
+
+<div class="lightbox-overlay" id="lightbox">
+  <div class="lightbox-box">
+    <div class="lightbox-head">
+      <h4 id="lightboxTitle"></h4>
+      <button class="lightbox-close" id="lightboxClose" data-i18n-attr="aria-label" data-i18n="lightbox.close" aria-label="Закрити">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+      </button>
+    </div>
+    <div class="lightbox-body">
+      <img id="lightboxImg" alt="">
+      <div class="shot-placeholder lightbox-placeholder" id="lightboxPlaceholder">
+        <p data-i18n="shot.label">Скріншот</p>
+        <strong id="lightboxPlaceholderTitle"></strong>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>window.ASSET_PREFIX = "../";</script>
+<script src="../js/i18n.js"></script>
+<script src="../js/main.js"></script>
+</body>
+</html>

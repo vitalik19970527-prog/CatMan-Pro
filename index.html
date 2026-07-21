@@ -1,151 +1,404 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="uk">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CatMan-Pro — Завантаження</title>
-<meta name="description" content="Завантажити CatMan-Pro для Windows (.exe) та Android (.apk)">
-<style>
-  :root {
-    --bg: #f5f6f8;
-    --card: #ffffff;
-    --text: #1a1d21;
-    --muted: #5b6270;
-    --border: #e2e5ea;
-    --accent: #2563eb;
-    --accent-hover: #1d4ed8;
-    --android: #3ddc84;
-    --android-hover: #2fc470;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #14161a;
-      --card: #1d2025;
-      --text: #eef0f3;
-      --muted: #9aa2af;
-      --border: #2b2f36;
-      --accent: #3b82f6;
-      --accent-hover: #60a5fa;
-      --android: #3ddc84;
-      --android-hover: #4eeb93;
-    }
-  }
-  :root[data-theme="dark"] {
-    --bg: #14161a; --card: #1d2025; --text: #eef0f3; --muted: #9aa2af; --border: #2b2f36;
-    --accent: #3b82f6; --accent-hover: #60a5fa; --android: #3ddc84; --android-hover: #4eeb93;
-  }
-  :root[data-theme="light"] {
-    --bg: #f5f6f8; --card: #ffffff; --text: #1a1d21; --muted: #5b6270; --border: #e2e5ea;
-    --accent: #2563eb; --accent-hover: #1d4ed8; --android: #3ddc84; --android-hover: #2fc470;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    min-height: 100vh;
-    background: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 24px;
-  }
-  .card {
-    width: 100%;
-    max-width: 560px;
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 16px;
-    padding: 40px 32px;
-    text-align: center;
-  }
-  h1 {
-    font-size: 1.7rem;
-    margin: 0 0 6px;
-  }
-  .subtitle {
-    color: var(--muted);
-    margin: 0 0 28px;
-    font-size: 0.95rem;
-  }
-  .version {
-    display: inline-block;
-    font-size: 0.8rem;
-    color: var(--muted);
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    padding: 4px 12px;
-    margin-bottom: 28px;
-  }
-  .downloads {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-  }
-  .btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 10px;
-    padding: 16px 20px;
-    border-radius: 12px;
-    text-decoration: none;
-    font-weight: 600;
-    font-size: 1.02rem;
-    color: #fff;
-    transition: background 0.15s ease;
-  }
-  .btn small {
-    font-weight: 400;
-    opacity: 0.85;
-    font-size: 0.82rem;
-  }
-  .btn-windows { background: var(--accent); }
-  .btn-windows:hover { background: var(--accent-hover); }
-  .btn-android { background: var(--android); color: #06331b; }
-  .btn-android:hover { background: var(--android-hover); }
-  .icon { width: 20px; height: 20px; flex-shrink: 0; }
-  footer {
-    margin-top: 28px;
-    font-size: 0.8rem;
-    color: var(--muted);
-  }
-  footer a { color: var(--muted); }
-</style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title data-i18n="meta.title">CatMan Pro — програма для тих, хто продає товари</title>
+<meta name="description" content="CatMan Pro — проста програма для магазинів і оптовиків: замовлення постачальникам, оплати, склад і реальна ціна товару в одному місці." data-i18n-attr="content" data-i18n="meta.description">
+<link rel="stylesheet" href="css/style.css">
 </head>
 <body>
-  <div class="card">
-    <h1>CatMan-Pro</h1>
-    <p class="subtitle">Програма для управління асортиментом і замовленнями</p>
-    <div class="version" id="version">Завантаження інформації про версію…</div>
 
-    <div class="downloads">
-      <a class="btn btn-windows" href="https://github.com/vitalik19970527-prog/CatMan-Pro/releases/latest/download/CatManPro-Setup.exe">
-        <svg class="icon" viewBox="0 0 24 24" fill="currentColor"><path d="M3 5.5L10.5 4.4V11.4H3V5.5M11.5 4.3L21 3V11.3H11.5V4.3M3 12.4H10.5V19.5L3 18.4V12.4M11.5 12.4H21V20.9L11.5 19.6V12.4Z"/></svg>
-        <span>Завантажити для Windows <small>(.exe)</small></span>
-      </a>
-      <a class="btn btn-android" href="https://github.com/vitalik19970527-prog/CatMan-Pro/releases/latest/download/CatManPro-android.apk">
-        <svg class="icon" viewBox="0 0 24 24" fill="currentColor"><path d="M17.523 15.34l1.987-3.44a.416.416 0 00-.152-.567.416.416 0 00-.567.152l-2.01 3.483a11.36 11.36 0 00-4.781-1.031c-1.71 0-3.316.371-4.781 1.03L5.209 11.49a.416.416 0 00-.567-.152.416.416 0 00-.152.567l1.987 3.44C3.24 17.18.9 20.4.5 24h23c-.4-3.6-2.74-6.82-5.977-8.66zM7 20a1 1 0 110-2 1 1 0 010 2zm10 0a1 1 0 110-2 1 1 0 010 2z"/></svg>
-        <span>Завантажити для Android <small>(.apk)</small></span>
-      </a>
+<header class="site-header">
+  <div class="wrap header-row">
+    <a class="brand" href="index.html#top">
+      <span class="brand-mark" aria-hidden="true"></span>
+      CatMan&nbsp;Pro
+    </a>
+    <nav class="nav" aria-label="Основна навігація">
+      <a href="index.html#tabs" class="active" data-i18n="nav.features">Можливості</a>
+      <a href="pages/gsm-extension.html" data-i18n="nav.gsm">Розширення</a>
+      <a href="pages/company-individual.html" data-i18n="nav.company">Компанія/Користувач</a>
+      <a href="pages/pricing.html" data-i18n="nav.pricing">Тарифи</a>
+      <a href="index.html#faq" data-i18n="nav.faq">Питання</a>
+    </nav>
+    <div class="lang-switch">
+      <button class="lang-btn" id="langBtn" aria-haspopup="listbox" aria-expanded="false">
+        <span id="langCurrent">UA</span>
+        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"></path></svg>
+      </button>
+      <ul class="lang-list" id="langList" role="listbox">
+        <li role="option" data-lang="uk">Українська</li>
+        <li role="option" data-lang="en">English</li>
+        <li role="option" data-lang="pl">Polski</li>
+        <li role="option" data-lang="zh">中文</li>
+        <li role="option" data-lang="de">Deutsch</li>
+      </ul>
     </div>
+    <a class="btn btn-primary btn-small" href="index.html#download" data-i18n="nav.download">Завантажити</a>
+    <button class="nav-toggle" id="navToggle" aria-label="Меню" aria-expanded="false">
+      <span></span><span></span><span></span>
+    </button>
+  </div>
+</header>
 
-    <footer>
-      <a href="https://github.com/vitalik19970527-prog/CatMan-Pro">Репозиторій на GitHub</a>
-    </footer>
+<main id="top">
+
+  <section class="hero">
+    <div class="wrap hero-grid">
+      <div class="hero-copy">
+        <p class="eyebrow" data-i18n="hero.eyebrow">Для тих, хто продає товари — в магазині чи оптом</p>
+        <h1 data-i18n-html="hero.h1">Одна програма замість&nbsp;десятка таблиць і&nbsp;нотаток</h1>
+        <p class="lede" data-i18n="hero.lede">
+          У CatMan Pro ви записуєте замовлення постачальникам, бачите асортиментну
+          матрицю товарів і аналітику по замовленнях, а також знаєте, скільки
+          насправді коштує кожен товар з урахуванням доставки. Все в одному
+          місці — замість Excel-файлів, які кожен веде по-своєму.
+        </p>
+        <div class="hero-actions">
+          <a class="btn btn-primary" href="#download" data-i18n="hero.cta1">Завантажити безкоштовно</a>
+          <a class="btn btn-ghost" href="#tabs" data-i18n="hero.cta2">Подивитись, що вміє</a>
+        </div>
+        <p class="hero-note" data-i18n="hero.note">Для Windows · спробувати можна без картки · дані вашої компанії ніхто інший не бачить</p>
+      </div>
+      <div class="hero-shot">
+        <div class="shot-frame shot-frame--wide" data-shot="hero-dashboard.png" tabindex="0" role="button">
+          <div class="shot-chrome"><span></span><span></span><span></span></div>
+          <!-- TODO: img/hero-dashboard.png (вкладка "Головна") -->
+          <div class="shot-placeholder">
+            <p data-i18n="shot.label">Скріншот</p>
+            <strong data-i18n="card.home.title">Головна</strong>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="ukraine-band">
+    <span class="ukraine-flag" aria-hidden="true"><span></span><span></span></span>
+    <p data-i18n-html="ukraine.text">
+      <strong>CatMan Pro — український продукт.</strong> Частина коштів з кожної оплати
+      йде на потреби ЗСУ.
+    </p>
   </div>
 
-  <script>
-    fetch("https://api.github.com/repos/vitalik19970527-prog/CatMan-Pro/releases/latest")
-      .then(r => r.ok ? r.json() : Promise.reject())
-      .then(rel => {
-        const el = document.getElementById("version");
-        const date = new Date(rel.published_at).toLocaleDateString("uk-UA");
-        el.textContent = "Версія " + rel.tag_name.replace(/^v/, "") + " · " + date;
-      })
-      .catch(() => {
-        document.getElementById("version").remove();
-      });
-  </script>
+  <section class="band">
+    <div class="wrap band-narrow">
+      <p class="band-text" data-i18n-html="band.text">
+        Таблиці в Excel губляться між менеджерами. Ціни постачальників застарівають,
+        поки хтось відкриє прайс. А скільки товар коштує насправді — з доставкою і
+        всіма витратами — ніхто не рахує, бо для цього нема зручного місця.
+        <strong>CatMan Pro збирає все це в одній програмі.</strong>
+      </p>
+    </div>
+  </section>
+
+  <section id="tabs" class="section">
+    <div class="wrap">
+      <p class="eyebrow center" data-i18n="features.eyebrow">Що вміє програма</p>
+      <h2 class="section-title center" data-i18n="hub.title">16 вкладок — і на кожну є своя сторінка з поясненням</h2>
+      <p class="section-lede center" data-i18n="hub.lede">Натисніть на розділ, щоб побачити скріншоти і прочитати простими словами, що там можна робити.</p>
+
+      <div class="teaser-grid">
+        <a class="teaser-card" href="pages/orders-money.html">
+          <span class="feature-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="5" y="3.5" width="14" height="17" rx="2"></rect>
+              <path d="M9 2.5h6v2H9z"></path>
+              <path d="M8.5 11l2 2 4-4"></path>
+              <path d="M8.5 16h7"></path>
+            </svg>
+          </span>
+          <h3 data-i18n="hub.card.ordersmoney.title">Замовлення і гроші</h3>
+          <p data-i18n="hub.card.ordersmoney.desc">Хто що замовив, кому скільки винні, і що товар коштує насправді.</p>
+          <div class="teaser-tabs">
+            <span data-i18n="feat.orders.title">Замовлення</span>
+            <span data-i18n="feat.payments.title">Взаєморозрахунки</span>
+            <span data-i18n="feat.cost.title">Собівартість замовлень</span>
+          </div>
+          <span class="teaser-link" data-i18n="hub.more">Детальніше</span>
+        </a>
+
+        <a class="teaser-card teaser-card--highlight" href="pages/company-individual.html">
+          <span class="feature-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="9" cy="8" r="3"></circle>
+              <path d="M3.5 19c0-3 2.5-5 5.5-5s5.5 2 5.5 5"></path>
+              <circle cx="17" cy="7.5" r="2.3"></circle>
+              <path d="M14.8 12.3c2.4.3 4.2 2 4.2 4.7"></path>
+            </svg>
+          </span>
+          <h3 data-i18n="hub.card.companyindividual.title">Компанія чи ви особисто?</h3>
+          <p data-i18n="hub.card.companyindividual.desc">Тепер програма підходить і команді, і одній людині — з хмарою (доступ з кількох пристроїв) або локально (дешевше).</p>
+          <div class="teaser-tabs">
+            <span data-i18n="ci.company.title">Компанія</span>
+            <span data-i18n="ci.user.title">Окремий користувач</span>
+            <span data-i18n="ci.vps.title">VPS</span>
+            <span data-i18n="ci.local.title">Локально</span>
+          </div>
+          <span class="teaser-link" data-i18n="hub.more">Детальніше</span>
+        </a>
+
+        <a class="teaser-card" href="pages/catalog.html">
+          <span class="feature-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3.5" y="3.5" width="7" height="7" rx="1.3"></rect>
+              <rect x="13.5" y="3.5" width="7" height="7" rx="1.3"></rect>
+              <rect x="3.5" y="13.5" width="7" height="7" rx="1.3"></rect>
+              <rect x="13.5" y="13.5" width="7" height="7" rx="1.3"></rect>
+            </svg>
+          </span>
+          <h3 data-i18n="hub.card.catalog.title">Каталог товарів</h3>
+          <p data-i18n="hub.card.catalog.desc">Товари, категорії, постачальники, пакування і всі файли компанії.</p>
+          <div class="teaser-tabs">
+            <span data-i18n="feat.products.title">Товари</span>
+            <span data-i18n="card.categories.title">Категорії та бренди</span>
+            <span data-i18n="card.suppliers.title">Постачальники</span>
+            <span data-i18n="card.packaging.title">Пакування</span>
+            <span data-i18n="card.files.title">Файли</span>
+          </div>
+          <span class="teaser-link" data-i18n="hub.more">Детальніше</span>
+        </a>
+
+        <a class="teaser-card" href="pages/stock-planning.html">
+          <span class="feature-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3l8 8-8.5 8.5a1.5 1.5 0 0 1-2.1 0L3 13V5a2 2 0 0 1 2-2h7z"></path>
+              <circle cx="8" cy="8" r="1.4" fill="currentColor" stroke="none"></circle>
+            </svg>
+          </span>
+          <h3 data-i18n="hub.card.stockplanning.title">Склад і план закупівель</h3>
+          <p data-i18n="hub.card.stockplanning.desc">Скільки коштує ваш асортимент, скільки лишилось пакування, і що купувати наперед.</p>
+          <div class="teaser-tabs">
+            <span data-i18n="card.coststock.title">Собівартість складу</span>
+            <span data-i18n="card.packstock.title">Склад пакування</span>
+            <span data-i18n="card.mediaplan.title">Медіа План</span>
+            <span data-i18n="card.schedule.title">Розклад замовлень</span>
+          </div>
+          <span class="teaser-link" data-i18n="hub.more">Детальніше</span>
+        </a>
+
+        <a class="teaser-card" href="pages/personal-tools.html">
+          <span class="feature-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="9"></circle>
+              <path d="M12 8v5l3 2"></path>
+            </svg>
+          </span>
+          <h3 data-i18n="hub.card.personaltools.title">Особисті інструменти</h3>
+          <p data-i18n="hub.card.personaltools.desc">Дашборд, блокнот і калькулятори — усе особисте в одному місці.</p>
+          <div class="teaser-tabs">
+            <span data-i18n="card.home.title">Головна</span>
+            <span data-i18n="card.notebook.title">Блокнот</span>
+            <span data-i18n="card.calc.title">Калькулятори</span>
+          </div>
+          <span class="teaser-link" data-i18n="hub.more">Детальніше</span>
+        </a>
+
+        <a class="teaser-card" href="pages/gsm-extension.html">
+          <span class="feature-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="7" y="2.5" width="10" height="19" rx="2"></rect>
+              <path d="M10.5 18.5h3"></path>
+            </svg>
+          </span>
+          <h3 data-i18n="hub.card.gsm.title">GSM Parser — розширення</h3>
+          <p data-i18n="hub.card.gsm.desc">Можливий доступ до унікального інструменту, який дозволяє бути в курсі оновлень на ринку смартфонів, смарт-годинників і планшетів.</p>
+          <div class="teaser-tabs">
+            <span data-i18n="gsm.title">База цін на телефони, планшети й годинники</span>
+          </div>
+          <span class="teaser-link" data-i18n="hub.more">Детальніше</span>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section trust">
+    <div class="wrap trust-grid">
+      <div class="trust-card">
+        <span class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="5" y="11" width="14" height="9" rx="2"></rect>
+            <path d="M8 11V7a4 4 0 0 1 8 0v4"></path>
+            <circle cx="12" cy="15.5" r="1.3" fill="currentColor" stroke="none"></circle>
+          </svg>
+        </span>
+        <h3 data-i18n="trust.db.title">Ваші дані — тільки ваші</h3>
+        <p data-i18n="trust.db.desc">Дані вашої компанії зберігаються окремо від усіх інших — у власній базі даних, а не в спільній таблиці з паролями.</p>
+      </div>
+      <div class="trust-card">
+        <span class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="9" cy="8" r="3"></circle>
+            <path d="M3.5 19c0-3 2.5-5 5.5-5s5.5 2 5.5 5"></path>
+            <circle cx="17" cy="7.5" r="2.3"></circle>
+            <path d="M14.8 12.3c2.4.3 4.2 2 4.2 4.7"></path>
+          </svg>
+        </span>
+        <h3 data-i18n="trust.roles.title">Кожному менеджеру — своє</h3>
+        <p data-i18n="trust.roles.desc">Кожен менеджер бачить тільки те, за що відповідає. Власник бачить усе.</p>
+      </div>
+      <div class="trust-card">
+        <span class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="8.5"></circle>
+            <ellipse cx="12" cy="12" rx="3.6" ry="8.5"></ellipse>
+            <path d="M3.5 12h17"></path>
+          </svg>
+        </span>
+        <h3 data-i18n="trust.lang.title">П'ять мов на вибір</h3>
+        <p data-i18n="trust.lang.desc">Українська, англійська, польська, китайська, німецька — кожен працює своєю мовою.</p>
+      </div>
+      <div class="trust-card">
+        <span class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="9"></circle>
+            <path d="M12 8v5l3 2"></path>
+            <path d="M9 3.5A9 9 0 0 0 3 12"></path>
+          </svg>
+        </span>
+        <h3 data-i18n="trust.help.title">Підказка є завжди</h3>
+        <p data-i18n="trust.help.desc">На кожному екрані є кнопка «?» — натиснули і одразу зрозуміло, що тут можна робити.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="start" class="section">
+    <div class="wrap wrap-narrow">
+      <p class="eyebrow center" data-i18n="start.eyebrow">Як почати</p>
+      <h2 class="section-title center" data-i18n="start.title">Від встановлення до першого замовлення — один вечір</h2>
+
+      <ol class="steps-plain">
+        <li data-i18n-html="start.step1"><strong>Завантажте і встановіть програму</strong> — звичайний інсталятор для Windows, як і будь-яка інша програма.</li>
+        <li data-i18n-html="start.step2"><strong>Оберіть, хто ви</strong> — компанія з командою чи окремий користувач. І де зберігати дані — на VPS чи локально.</li>
+        <li data-i18n-html="start.step3"><strong>Додайте постачальників і товари</strong> — вручну або Excell вигрузкою.</li>
+        <li data-i18n-html="start.step4"><strong>Запросіть менеджерів</strong> (якщо ви компанія) — кожен одразу отримає свою зону відповідальності.</li>
+      </ol>
+    </div>
+  </section>
+
+  <section id="demo" class="section" style="padding-top: 8px;">
+    <div class="wrap wrap-narrow">
+      <p class="eyebrow center" data-i18n="demo.eyebrow">Спробуйте без реєстрації</p>
+      <h2 class="section-title center" data-i18n="demo.title">Тестовий акаунт з прикладами даних</h2>
+      <p class="section-lede center" data-i18n="demo.lede">
+        Завантажте й встановіть програму, а на екрані входу не реєструйте свою
+        компанію — просто введіть тестові дані нижче. Одразу побачите приклади
+        товарів, замовлень і постачальників у всіх вкладках.
+      </p>
+
+      <div class="demo-card">
+        <div class="demo-row"><span class="demo-label" data-i18n="demo.company">Компанія</span><span class="demo-value">Test</span></div>
+        <div class="demo-row"><span class="demo-label" data-i18n="demo.name">Ім'я</span><span class="demo-value">Test</span></div>
+        <div class="demo-row"><span class="demo-label" data-i18n="demo.phone">Телефон</span><span class="demo-value">Test</span></div>
+        <div class="demo-row"><span class="demo-label" data-i18n="demo.email">Пошта</span><span class="demo-value">Test</span></div>
+        <div class="demo-row"><span class="demo-label" data-i18n="demo.password">Пароль</span><span class="demo-value">Test</span></div>
+      </div>
+
+      <div style="text-align:center; margin-bottom: 14px;">
+        <a class="btn btn-primary" href="#download" data-i18n="demo.cta">Завантажити програму</a>
+      </div>
+      <p class="hero-note" style="text-align:center;" data-i18n="demo.note">Це спільний ознайомчий акаунт для всіх відвідувачів — не залишайте в ньому реальні дані бізнесу.</p>
+    </div>
+  </section>
+
+  <section class="section pricing">
+    <div class="wrap wrap-narrow">
+      <p class="eyebrow center" data-i18n="pricing.eyebrow">Тарифи</p>
+      <h2 class="section-title center" data-i18n="pricing.title">Оберіть тариф під розмір команди</h2>
+      <p class="section-lede center" data-i18n="pricing.teaserlede">
+        Є варіанти і для команди, і для однієї людини, з хмарою або локально —
+        повна сітка на окремій сторінці.
+      </p>
+      <div style="text-align:center; margin-top: 8px;">
+        <a class="btn btn-primary" href="pages/pricing.html" data-i18n="pricing.seefull">Переглянути тарифи</a>
+      </div>
+    </div>
+  </section>
+
+  <section id="faq" class="section faq">
+    <div class="wrap wrap-narrow">
+      <p class="eyebrow center" data-i18n="faq.eyebrow">Питання</p>
+      <h2 class="section-title center" data-i18n="faq.title">Що зазвичай запитують</h2>
+
+      <div class="accordion">
+        <details class="acc-item" open>
+          <summary data-i18n="faq.q1">Чи безпечні мої дані?</summary>
+          <p data-i18n="faq.a1">Так — кожна компанія отримує власну окрему базу даних. Дані інших компаній ви не бачите, і вони не бачать ваших.</p>
+        </details>
+        <details class="acc-item">
+          <summary data-i18n="faq.q2">Чи можна працювати на кількох комп'ютерах?</summary>
+          <p data-i18n="faq.a2">Так, якщо дані на VPS. Кожен менеджер входить зі свого комп'ютера під власним акаунтом і одразу бачить актуальні дані.</p>
+        </details>
+        <details class="acc-item">
+          <summary data-i18n="faq.q3">Чи можна перенести базу на свій сервер?</summary>
+          <p data-i18n="faq.a3">Так — можна перенести на орендований сервер (VPS) або на сервер компанії, якщо він постійно увімкнений.</p>
+        </details>
+        <details class="acc-item">
+          <summary data-i18n="faq.q4">Чи важко в цьому розібратись?</summary>
+          <p data-i18n="faq.a4">Ні. Встановлення й перший вхід займають кілька хвилин, а на кожному екрані є кнопка «?» з поясненням.</p>
+        </details>
+        <details class="acc-item">
+          <summary data-i18n="faq.q5">Чи є підтримка, якщо щось незрозуміло?</summary>
+          <p data-i18n="faq.a5">Так, за контактами нижче.</p>
+        </details>
+        <details class="acc-item">
+          <summary data-i18n="faq.q6">Чи підходить програма одній людині без команди?</summary>
+          <p data-i18n="faq.a6">Так — є окремий тип акаунта «Користувач», без зайвих налаштувань під команду, з вибором VPS або локального зберігання. Детальніше на сторінці «Компанія/Користувач».</p>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <section id="download" class="section download">
+    <div class="wrap download-inner">
+      <h2 class="section-title center on-dark" data-i18n="download.title">Спробуйте CatMan Pro вже сьогодні</h2>
+      <div class="download-buttons">
+        <a class="btn btn-primary btn-large" href="https://github.com/vitalik19970527-prog/CatMan-Pro/releases/latest/download/CatManPro-Setup.exe">
+          <span class="dl-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 4h16v2H4V4zm0 4h7v10.6l-3.3-3.3-1.4 1.4L12 22.7l5.7-5.7-1.4-1.4-3.3 3.3V8h7v14H4V8z"></path></svg>
+          </span>
+          <span data-i18n="download.windows">Завантажити для Windows</span>
+        </a>
+        <a class="btn btn-ghost btn-large btn-on-dark" href="https://github.com/vitalik19970527-prog/CatMan-Pro/releases/latest/download/CatManPro-android.apk">
+          <span class="dl-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M17.6 9.5l1.8-3.1a.5.5 0 0 0-.87-.5l-1.83 3.17a8.6 8.6 0 0 0-7.4 0L7.47 5.9a.5.5 0 1 0-.87.5L8.4 9.5C6.1 10.9 4.5 13.3 4.2 16h15.6c-.3-2.7-1.9-5.1-4.2-6.5zM9 14a1 1 0 1 1 0-2 1 1 0 0 1 0 2zm6 0a1 1 0 1 1 0-2 1 1 0 0 1 0 2zM4 17v4a1 1 0 0 0 2 0v-4H4zm14 0v4a1 1 0 0 0 2 0v-4h-2z"></path></svg>
+          </span>
+          <span data-i18n="download.android">Завантажити для Android</span>
+        </a>
+      </div>
+      <p class="hero-note on-dark" data-i18n="download.note">Останню версію і що змінилось — дивіться тут після встановлення.</p>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap footer-row">
+    <span>© <span id="year"></span> CatMan Pro</span>
+    <a href="#" data-i18n="footer.contact">Контакти</a>
+  </div>
+</footer>
+
+<div class="lightbox-overlay" id="lightbox">
+  <div class="lightbox-box">
+    <div class="lightbox-head">
+      <h4 id="lightboxTitle"></h4>
+      <button class="lightbox-close" id="lightboxClose" data-i18n-attr="aria-label" data-i18n="lightbox.close" aria-label="Закрити">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+      </button>
+    </div>
+    <div class="lightbox-body">
+      <img id="lightboxImg" alt="">
+      <div class="shot-placeholder lightbox-placeholder" id="lightboxPlaceholder">
+        <p data-i18n="shot.label">Скріншот</p>
+        <strong id="lightboxPlaceholderTitle"></strong>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="js/i18n.js"></script>
+<script src="js/main.js"></script>
 </body>
 </html>

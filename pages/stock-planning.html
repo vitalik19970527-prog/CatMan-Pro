@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title data-i18n="pg.stockplanning.pagetitle">Склад і план закупівель — CatMan Pro</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="wrap header-row">
+    <a class="brand" href="../index.html#top">
+      <span class="brand-mark" aria-hidden="true"></span>
+      CatMan&nbsp;Pro
+    </a>
+    <nav class="nav" aria-label="Основна навігація">
+      <a href="../index.html#tabs" class="active" data-i18n="nav.features">Можливості</a>
+      <a href="gsm-extension.html" data-i18n="nav.gsm">Розширення</a>
+      <a href="company-individual.html" data-i18n="nav.company">Компанія/Користувач</a>
+      <a href="pricing.html" data-i18n="nav.pricing">Тарифи</a>
+      <a href="../index.html#faq" data-i18n="nav.faq">Питання</a>
+    </nav>
+    <div class="lang-switch">
+      <button class="lang-btn" id="langBtn" aria-haspopup="listbox" aria-expanded="false">
+        <span id="langCurrent">UA</span>
+        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"></path></svg>
+      </button>
+      <ul class="lang-list" id="langList" role="listbox">
+        <li role="option" data-lang="uk">Українська</li>
+        <li role="option" data-lang="en">English</li>
+        <li role="option" data-lang="pl">Polski</li>
+        <li role="option" data-lang="zh">中文</li>
+        <li role="option" data-lang="de">Deutsch</li>
+      </ul>
+    </div>
+    <a class="btn btn-primary btn-small" href="../index.html#download" data-i18n="nav.download">Завантажити</a>
+    <button class="nav-toggle" id="navToggle" aria-label="Меню" aria-expanded="false">
+      <span></span><span></span><span></span>
+    </button>
+  </div>
+</header>
+
+<main>
+  <section class="page-hero section">
+    <div class="wrap wrap-narrow">
+      <p class="breadcrumb"><a href="../index.html" data-i18n="breadcrumb.home">Головна</a> / <span data-i18n="hub.card.stockplanning.title">Склад і план закупівель</span></p>
+      <h1 class="section-title" data-i18n="hub.card.stockplanning.title">Склад і план закупівель</h1>
+      <p class="section-lede" data-i18n="pg.stockplanning.lede">Чотири вкладки про собівартість вашого асортименту, залишки пакування і планування майбутніх закупівель, щоб нічого не докупити запізно.</p>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top: 8px;">
+    <div class="wrap">
+
+      <div class="tab-detail">
+        <div class="tab-detail-head">
+          <h3 data-i18n="card.coststock.title">Собівартість складу</h3>
+          <p class="tab-hook" data-i18n="card.coststock.hook">Собівартість усього вашого асортименту — однією цифрою, а не по одному замовленню.</p>
+          <p class="tab-body" data-i18n="card.coststock.detail">Рахує загальну собівартість по всьому асортименту, який ви ведете в програмі — на основі того, що ви самі записали як отримане. Це не синхронізація зі складом чи 1С, а власний облік. Приклад: перевірили раз на місяць — і побачили, скільки грошей вкладено в товар і як ця сума змінюється з часом.</p>
+        </div>
+        <div class="tab-detail-shots">
+          <div class="shot-frame" data-shot="coststock-total.png" tabindex="0" role="button">
+            <div class="shot-chrome"><span></span><span></span><span></span></div>
+            <!-- TODO: img/coststock-total.png (загальна собівартість складу) -->
+            <div class="shot-placeholder"><p data-i18n="shot.label">Скріншот</p><strong data-i18n="card.coststock.shot1">Загальна собівартість складу</strong></div>
+          </div>
+          <div class="shot-frame" data-shot="coststock-breakdown.png" tabindex="0" role="button">
+            <div class="shot-chrome"><span></span><span></span><span></span></div>
+            <!-- TODO: img/coststock-breakdown.png (розбивка по товарах) -->
+            <div class="shot-placeholder"><p data-i18n="shot.label">Скріншот</p><strong data-i18n="card.coststock.shot2">Розбивка по товарах</strong></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tab-detail">
+        <div class="tab-detail-head">
+          <h3 data-i18n="card.packstock.title">Склад пакування</h3>
+          <p class="tab-hook" data-i18n="card.packstock.hook">Пакування рахується окремо від товару — щоб не переплутати.</p>
+          <p class="tab-body" data-i18n="card.packstock.detail">Приклад: замовили 1000 пакетиків, використали 400 — тут завжди видно, скільки лишилось, і коли пора замовляти ще, до того як вони закінчаться.</p>
+        </div>
+        <div class="tab-detail-shots">
+          <div class="shot-frame" data-shot="packstock-balance.png" tabindex="0" role="button">
+            <div class="shot-chrome"><span></span><span></span><span></span></div>
+            <!-- TODO: img/packstock-balance.png (залишки пакування) -->
+            <div class="shot-placeholder"><p data-i18n="shot.label">Скріншот</p><strong data-i18n="card.packstock.shot1">Залишки пакування</strong></div>
+          </div>
+          <div class="shot-frame" data-shot="packstock-history.png" tabindex="0" role="button">
+            <div class="shot-chrome"><span></span><span></span><span></span></div>
+            <!-- TODO: img/packstock-history.png (історія списання) -->
+            <div class="shot-placeholder"><p data-i18n="shot.label">Скріншот</p><strong data-i18n="card.packstock.shot2">Історія списання</strong></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tab-detail">
+        <div class="tab-detail-head">
+          <h3 data-i18n="card.mediaplan.title">Медіа План</h3>
+          <p class="tab-hook" data-i18n="card.mediaplan.hook">Календар: що і коли постити в соцмережах, щоб не забути.</p>
+          <p class="tab-body" data-i18n="card.mediaplan.detail">Кожен товар має свою клітинку на кожен день. Приклад: якщо про якийсь товар не постили два тижні — клітинка підсвітиться кольором, і ви одразу побачите, про кого забули.</p>
+        </div>
+        <div class="tab-detail-shots">
+          <div class="shot-frame" data-shot="mediaplan-calendar.png" tabindex="0" role="button">
+            <div class="shot-chrome"><span></span><span></span><span></span></div>
+            <!-- TODO: img/mediaplan-calendar.png (календар публікацій) -->
+            <div class="shot-placeholder"><p data-i18n="shot.label">Скріншот</p><strong data-i18n="card.mediaplan.shot1">Календар публікацій</strong></div>
+          </div>
+          <div class="shot-frame" data-shot="mediaplan-card.png" tabindex="0" role="button">
+            <div class="shot-chrome"><span></span><span></span><span></span></div>
+            <!-- TODO: img/mediaplan-card.png (картка товару в плані) -->
+            <div class="shot-placeholder"><p data-i18n="shot.label">Скріншот</p><strong data-i18n="card.mediaplan.shot2">Картка товару в плані</strong></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tab-detail">
+        <div class="tab-detail-head">
+          <h3 data-i18n="card.schedule.title">Розклад замовлень</h3>
+          <p class="tab-hook" data-i18n="card.schedule.hook">План закупівель на рік вперед — скільки й коли купувати.</p>
+          <p class="tab-body" data-i18n="card.schedule.detail">Для кожного товару можна розписати, скільки й коли планується купити наперед. Приклад: подивились наперед і зрозуміли — за два місяці треба замовити ще партію чохлів, бо на складі закінчується. Є й кнопка «Бюджет»: показує, скільки грошей треба підготувати на майбутні закупівлі, і скільки реально витратили минулого разу.</p>
+        </div>
+        <div class="tab-detail-shots">
+          <div class="shot-frame" data-shot="schedule-list.png" tabindex="0" role="button">
+            <div class="shot-chrome"><span></span><span></span><span></span></div>
+            <!-- TODO: img/schedule-list.png (розклад по товарах) -->
+            <div class="shot-placeholder"><p data-i18n="shot.label">Скріншот</p><strong data-i18n="card.schedule.shot1">Розклад по товарах</strong></div>
+          </div>
+          <div class="shot-frame" data-shot="schedule-budget.png" tabindex="0" role="button">
+            <div class="shot-chrome"><span></span><span></span><span></span></div>
+            <!-- TODO: img/schedule-budget.png (модалка Бюджет) -->
+            <div class="shot-placeholder"><p data-i18n="shot.label">Скріншот</p><strong data-i18n="card.schedule.shot2">Модалка «Бюджет»</strong></div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap footer-row">
+    <span>© <span id="year"></span> CatMan Pro</span>
+    <a href="#" data-i18n="footer.contact">Контакти</a>
+  </div>
+</footer>
+
+<div class="lightbox-overlay" id="lightbox">
+  <div class="lightbox-box">
+    <div class="lightbox-head">
+      <h4 id="lightboxTitle"></h4>
+      <button class="lightbox-close" id="lightboxClose" data-i18n-attr="aria-label" data-i18n="lightbox.close" aria-label="Закрити">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+      </button>
+    </div>
+    <div class="lightbox-body">
+      <img id="lightboxImg" alt="">
+      <div class="shot-placeholder lightbox-placeholder" id="lightboxPlaceholder">
+        <p data-i18n="shot.label">Скріншот</p>
+        <strong id="lightboxPlaceholderTitle"></strong>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>window.ASSET_PREFIX = "../";</script>
+<script src="../js/i18n.js"></script>
+<script src="../js/main.js"></script>
+</body>
+</html>

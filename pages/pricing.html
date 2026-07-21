@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title data-i18n="pg.pricing.pagetitle">Тарифи — CatMan Pro</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="wrap header-row">
+    <a class="brand" href="../index.html#top">
+      <span class="brand-mark" aria-hidden="true"></span>
+      CatMan&nbsp;Pro
+    </a>
+    <nav class="nav" aria-label="Основна навігація">
+      <a href="../index.html#tabs" data-i18n="nav.features">Можливості</a>
+      <a href="gsm-extension.html" data-i18n="nav.gsm">Розширення</a>
+      <a href="company-individual.html" data-i18n="nav.company">Компанія/Користувач</a>
+      <a href="pricing.html" class="active" data-i18n="nav.pricing">Тарифи</a>
+      <a href="../index.html#faq" data-i18n="nav.faq">Питання</a>
+    </nav>
+    <div class="lang-switch">
+      <button class="lang-btn" id="langBtn" aria-haspopup="listbox" aria-expanded="false">
+        <span id="langCurrent">UA</span>
+        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"></path></svg>
+      </button>
+      <ul class="lang-list" id="langList" role="listbox">
+        <li role="option" data-lang="uk">Українська</li>
+        <li role="option" data-lang="en">English</li>
+        <li role="option" data-lang="pl">Polski</li>
+        <li role="option" data-lang="zh">中文</li>
+        <li role="option" data-lang="de">Deutsch</li>
+      </ul>
+    </div>
+    <a class="btn btn-primary btn-small" href="../index.html#download" data-i18n="nav.download">Завантажити</a>
+    <button class="nav-toggle" id="navToggle" aria-label="Меню" aria-expanded="false">
+      <span></span><span></span><span></span>
+    </button>
+  </div>
+</header>
+
+<main>
+  <section class="page-hero section">
+    <div class="wrap wrap-narrow">
+      <p class="breadcrumb"><a href="../index.html" data-i18n="breadcrumb.home">Головна</a> / <span data-i18n="pricing.title">Оберіть тариф під розмір команди</span></p>
+      <h1 class="section-title" data-i18n="pricing.title">Оберіть тариф під розмір команди</h1>
+      <p class="section-lede" data-i18n="pricing.lede">Оберіть окремі вкладки й кількість людей — або готовий тариф нижче. Ціни у гривнях і доларах; менеджер уточнить деталі при зв'язку.</p>
+    </div>
+  </section>
+
+  <!-- ===== 1. Per-tab pricing (by headcount) ===== -->
+  <section class="section" style="padding-top: 8px;">
+    <div class="wrap wrap-narrow">
+      <p class="eyebrow" data-i18n="pricing.tabs.title">Скільки коштує кожна вкладка</p>
+      <p class="section-lede" data-i18n="pricing.tabs.lede" style="margin-bottom: 20px;">5 базових вкладок нижче завжди активні й входять у вартість кожного користувача — без них програма не працює, відключити їх не можна. Решту вкладок можна додавати чи прибирати окремо: ціна залежить від кількості людей у компанії.</p>
+
+      <p class="tab-price-included" data-i18n="pricing.tabs.included">Головна, Товари, Категорії та бренди, Постачальники, Замовлення — обов'язкова основа. Їх не можна відключити, і саме вони формують ціну в таблиці нижче.</p>
+
+      <div class="price-table-wrap">
+        <table class="price-table">
+          <thead>
+            <tr>
+              <th data-i18n="pricing.col.tab">Вкладка</th>
+              <th data-i18n="pricing.col.1">1 людина</th>
+              <th data-i18n="pricing.col.5">5 людей</th>
+              <th data-i18n="pricing.col.10">10 людей</th>
+              <th data-i18n="pricing.col.15">15 людей</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr class="price-row-core"><td data-i18n="card.home.title">Головна<span class="price-mandatory" data-i18n="pricing.tabs.mandatory">обов'язково</span></td><td>40&nbsp;₴<span class="price-usd">$1</span></td><td>185&nbsp;₴<span class="price-usd">$4.5</span></td><td>345&nbsp;₴<span class="price-usd">$8.5</span></td><td>440&nbsp;₴<span class="price-usd">$10.5</span></td></tr>
+            <tr class="price-row-core"><td data-i18n="feat.products.title">Товари<span class="price-mandatory" data-i18n="pricing.tabs.mandatory">обов'язково</span></td><td>90&nbsp;₴<span class="price-usd">$2</span></td><td>480&nbsp;₴<span class="price-usd">$11.5</span></td><td>870&nbsp;₴<span class="price-usd">$21</span></td><td>1125&nbsp;₴<span class="price-usd">$27</span></td></tr>
+            <tr class="price-row-core"><td data-i18n="card.categories.title">Категорії та бренди<span class="price-mandatory" data-i18n="pricing.tabs.mandatory">обов'язково</span></td><td>60&nbsp;₴<span class="price-usd">$1.5</span></td><td>285&nbsp;₴<span class="price-usd">$7</span></td><td>525&nbsp;₴<span class="price-usd">$12.5</span></td><td>660&nbsp;₴<span class="price-usd">$16</span></td></tr>
+            <tr class="price-row-core"><td data-i18n="card.suppliers.title">Постачальники<span class="price-mandatory" data-i18n="pricing.tabs.mandatory">обов'язково</span></td><td>50&nbsp;₴<span class="price-usd">$1</span></td><td>240&nbsp;₴<span class="price-usd">$6</span></td><td>435&nbsp;₴<span class="price-usd">$10.5</span></td><td>560&nbsp;₴<span class="price-usd">$13.5</span></td></tr>
+            <tr class="price-row-core"><td data-i18n="feat.orders.title">Замовлення<span class="price-mandatory" data-i18n="pricing.tabs.mandatory">обов'язково</span></td><td>255&nbsp;₴<span class="price-usd">$6</span></td><td>1195&nbsp;₴<span class="price-usd">$29</span></td><td>2200&nbsp;₴<span class="price-usd">$53</span></td><td>2810&nbsp;₴<span class="price-usd">$67.5</span></td></tr>
+            <tr><td data-i18n="feat.payments.title">Взаєморозрахунки</td><td>295&nbsp;₴<span class="price-usd">$7</span></td><td>725&nbsp;₴<span class="price-usd">$17.5</span></td><td>1345&nbsp;₴<span class="price-usd">$32.5</span></td><td>1710&nbsp;₴<span class="price-usd">$41</span></td></tr>
+            <tr><td data-i18n="feat.cost.title">Собівартість замовлень</td><td>355&nbsp;₴<span class="price-usd">$8.5</span></td><td>870&nbsp;₴<span class="price-usd">$21</span></td><td>1600&nbsp;₴<span class="price-usd">$38.5</span></td><td>2050&nbsp;₴<span class="price-usd">$49.5</span></td></tr>
+            <tr><td data-i18n="card.packaging.title">Пакування</td><td>195&nbsp;₴<span class="price-usd">$4.5</span></td><td>480&nbsp;₴<span class="price-usd">$11.5</span></td><td>890&nbsp;₴<span class="price-usd">$21.5</span></td><td>1110&nbsp;₴<span class="price-usd">$26.5</span></td></tr>
+            <tr><td data-i18n="card.files.title">Файли</td><td>155&nbsp;₴<span class="price-usd">$3.5</span></td><td>380&nbsp;₴<span class="price-usd">$9</span></td><td>705&nbsp;₴<span class="price-usd">$17</span></td><td>905&nbsp;₴<span class="price-usd">$22</span></td></tr>
+            <tr><td data-i18n="card.coststock.title">Собівартість складу</td><td>295&nbsp;₴<span class="price-usd">$7</span></td><td>725&nbsp;₴<span class="price-usd">$17.5</span></td><td>1345&nbsp;₴<span class="price-usd">$32.5</span></td><td>1710&nbsp;₴<span class="price-usd">$41</span></td></tr>
+            <tr><td data-i18n="card.packstock.title">Склад пакування</td><td>195&nbsp;₴<span class="price-usd">$4.5</span></td><td>480&nbsp;₴<span class="price-usd">$11.5</span></td><td>890&nbsp;₴<span class="price-usd">$21.5</span></td><td>1110&nbsp;₴<span class="price-usd">$26.5</span></td></tr>
+            <tr><td data-i18n="card.mediaplan.title">Медіа План</td><td>255&nbsp;₴<span class="price-usd">$6</span></td><td>625&nbsp;₴<span class="price-usd">$15</span></td><td>1160&nbsp;₴<span class="price-usd">$28</span></td><td>1470&nbsp;₴<span class="price-usd">$35.5</span></td></tr>
+            <tr><td data-i18n="card.schedule.title">Розклад замовлень</td><td>295&nbsp;₴<span class="price-usd">$7</span></td><td>725&nbsp;₴<span class="price-usd">$17.5</span></td><td>1345&nbsp;₴<span class="price-usd">$32.5</span></td><td>1710&nbsp;₴<span class="price-usd">$41</span></td></tr>
+            <tr><td data-i18n="card.notebook.title">Блокнот</td><td>95&nbsp;₴<span class="price-usd">$2.5</span></td><td>240&nbsp;₴<span class="price-usd">$6</span></td><td>445&nbsp;₴<span class="price-usd">$10.5</span></td><td>560&nbsp;₴<span class="price-usd">$13.5</span></td></tr>
+            <tr><td data-i18n="card.calc.title">Калькулятори</td><td>95&nbsp;₴<span class="price-usd">$2.5</span></td><td>240&nbsp;₴<span class="price-usd">$6</span></td><td>445&nbsp;₴<span class="price-usd">$10.5</span></td><td>560&nbsp;₴<span class="price-usd">$13.5</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="gsm-price-card">
+        <div class="gsm-price-head">
+          <h3 data-i18n="pricing.gsm.title">GSM Parser — окреме розширення</h3>
+          <p class="price-value" style="margin:0;">4999&nbsp;₴ <span class="price-usd">/ $120</span><span data-i18n="price.permonth">/міс</span></p>
+        </div>
+        <p data-i18n-html="pricing.gsm.desc">База цін і характеристик тисяч моделей телефонів, планшетів і годинників. Це окремий продукт усередині продукту, тому він <strong>не входить у жоден тариф</strong> — включно з «Повний проект» нижче. Додається окремо, до будь-якого тарифу.</p>
+        <p style="margin-top: 10px; font-size: 13px;" data-i18n-html="pricing.gsm.activation">+ 1999&nbsp;₴ / $48 одноразово за підключення й калібрування.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 2. Per-seat pricing (by headcount) ===== -->
+  <section class="section" style="padding-top: 8px;">
+    <div class="wrap wrap-narrow">
+      <p class="eyebrow" data-i18n="pricing.seat.title">Скільки коштує один користувач</p>
+      <p class="section-lede" data-i18n="pricing.seat.lede" style="margin-bottom: 20px;">Ціна за людей у компанії — залежить від того, де зберігаються дані, і трохи дешевшає з кожною новою людиною.</p>
+
+      <div class="price-table-wrap">
+        <table class="price-table">
+          <thead>
+            <tr>
+              <th data-i18n="pricing.col.mode">Де зберігати дані</th>
+              <th data-i18n="pricing.col.1">1 людина</th>
+              <th data-i18n="pricing.col.5">5 людей</th>
+              <th data-i18n="pricing.col.10">10 людей</th>
+              <th data-i18n="pricing.col.15">15 людей</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td data-i18n="pricing.seat.local.title">Локально</td><td>104&nbsp;₴<span class="price-usd">$2.5</span></td><td>314&nbsp;₴<span class="price-usd">$7.5</span></td><td>624&nbsp;₴<span class="price-usd">$15</span></td><td>904&nbsp;₴<span class="price-usd">$22</span></td></tr>
+            <tr><td data-i18n="pricing.seat.vps.rowtitle">VPS · свій сервер</td><td>904&nbsp;₴<span class="price-usd">$22</span></td><td>3914&nbsp;₴<span class="price-usd">$94</span></td><td>7624&nbsp;₴<span class="price-usd">$184</span></td><td>10404&nbsp;₴<span class="price-usd">$251</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="tab-price-note" style="margin-top: 12px;">
+        <strong data-i18n="pricing.seat.dedicated.title">Хто надає сервер — ваш вибір</strong><br>
+        <span data-i18n-html="pricing.seat.dedicated.desc">Кожен VPS-тариф — це окремий виділений сервер тільки для вашої компанії. Ми ніколи не підключаємо кілька компаній на один спільний сервер. Є свій сервер? Платите тільки за користувачів, як вище. Потрібен сервер від CatMan? Додається хостинг — <strong>+1000&nbsp;₴ / $24 на місяць</strong> (1 людина), <strong>+1200&nbsp;₴ / $29</strong> (5 людей), <strong>+2000&nbsp;₴ / $48</strong> (10 людей) або <strong>+3000&nbsp;₴ / $72</strong> (15 людей), плюс разове підключення сервера <strong>1499&nbsp;₴ / $36</strong>.</span>
+      </p>
+    </div>
+  </section>
+
+  <!-- ===== 3. Price calculator ===== -->
+  <section class="section" style="padding-top: 8px;">
+    <div class="wrap wrap-narrow">
+      <p class="eyebrow" data-i18n="pricing.calc.title">Порахуйте свій тариф</p>
+      <p class="section-lede" data-i18n="pricing.calc.lede" style="margin-bottom: 20px;">Оберіть кількість людей, де зберігати дані, і які вкладки потрібні — калькулятор порахує суму за прайсом вище.</p>
+
+      <div class="calc-box">
+        <div class="calc-row">
+          <label for="calcPeople" data-i18n="pricing.calc.people">Кількість людей</label>
+          <select id="calcPeople">
+            <option value="1">1</option>
+            <option value="5">5</option>
+            <option value="10">10</option>
+            <option value="15">15</option>
+          </select>
+        </div>
+        <div class="calc-row">
+          <label for="calcMode" data-i18n="pricing.calc.mode">Де зберігати дані</label>
+          <select id="calcMode">
+            <option value="local" data-i18n="pricing.seat.local.title">Локально</option>
+            <option value="vpsown" data-i18n="pricing.seat.vps.rowtitle">VPS · свій сервер</option>
+            <option value="vpsours" data-i18n="pricing.calc.vpsours">VPS · сервер від CatMan</option>
+          </select>
+        </div>
+
+        <div class="calc-tabs calc-tabs-core">
+          <label class="calc-core"><input type="checkbox" checked disabled><span data-i18n="card.home.title">Головна</span></label>
+          <label class="calc-core"><input type="checkbox" checked disabled><span data-i18n="feat.products.title">Товари</span></label>
+          <label class="calc-core"><input type="checkbox" checked disabled><span data-i18n="card.categories.title">Категорії та бренди</span></label>
+          <label class="calc-core"><input type="checkbox" checked disabled><span data-i18n="card.suppliers.title">Постачальники</span></label>
+          <label class="calc-core"><input type="checkbox" checked disabled><span data-i18n="feat.orders.title">Замовлення</span></label>
+        </div>
+        <p class="calc-core-note" data-i18n="pricing.tabs.mandatory_note">Ці 5 вкладок завжди активні й уже враховані в сумі нижче.</p>
+
+        <div class="calc-tabs">
+          <label><input type="checkbox" class="calc-tab" data-key="payments"><span data-i18n="feat.payments.title">Взаєморозрахунки</span></label>
+          <label><input type="checkbox" class="calc-tab" data-key="cost"><span data-i18n="feat.cost.title">Собівартість замовлень</span></label>
+          <label><input type="checkbox" class="calc-tab" data-key="packaging"><span data-i18n="card.packaging.title">Пакування</span></label>
+          <label><input type="checkbox" class="calc-tab" data-key="files"><span data-i18n="card.files.title">Файли</span></label>
+          <label><input type="checkbox" class="calc-tab" data-key="coststock"><span data-i18n="card.coststock.title">Собівартість складу</span></label>
+          <label><input type="checkbox" class="calc-tab" data-key="packstock"><span data-i18n="card.packstock.title">Склад пакування</span></label>
+          <label><input type="checkbox" class="calc-tab" data-key="mediaplan"><span data-i18n="card.mediaplan.title">Медіа План</span></label>
+          <label><input type="checkbox" class="calc-tab" data-key="schedule"><span data-i18n="card.schedule.title">Розклад замовлень</span></label>
+          <label><input type="checkbox" class="calc-tab" data-key="notebook"><span data-i18n="card.notebook.title">Блокнот</span></label>
+          <label><input type="checkbox" class="calc-tab" data-key="calc"><span data-i18n="card.calc.title">Калькулятори</span></label>
+        </div>
+
+        <div class="calc-gsm-row">
+          <label><input type="checkbox" id="calcGsm"><span data-i18n="pricing.gsm.title">GSM Parser — окреме розширення</span></label>
+        </div>
+
+        <div class="calc-result">
+          <span data-i18n="pricing.calc.total">Разом на місяць</span>
+          <strong id="calcTotal">599 ₴ / $14</strong>
+        </div>
+        <p class="calc-once" id="calcOnce"></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 4. Personal setup service ===== -->
+  <section class="section" style="padding-top: 8px;">
+    <div class="wrap wrap-narrow">
+      <p class="eyebrow" data-i18n="pricing.setup.title">Одноразові послуги</p>
+      <p class="section-lede" data-i18n="pricing.setup.lede" style="margin-bottom: 20px;">Потрібен сервер від CatMan або підключення GSM Parser? Це можна замовити окремо, для будь-якого тарифу — і локального теж.</p>
+      <div class="tab-price-list">
+        <div class="tab-price-row"><span data-i18n="pricing.setup.vps">Підключення сервера від CatMan</span><span class="tab-price-value">1499&nbsp;₴ <span class="price-usd">/ $36</span> — <span data-i18n="pricing.setup.once">одноразово</span></span></div>
+        <div class="tab-price-row"><span data-i18n="pricing.setup.gsm">Активація GSM Parser</span><span class="tab-price-value">1999&nbsp;₴ <span class="price-usd">/ $48</span> — <span data-i18n="pricing.setup.once">одноразово</span></span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 5. Ready-made bundles ===== -->
+  <section class="section" style="padding-top: 8px;">
+    <div class="wrap">
+      <p class="eyebrow center" data-i18n="pricing.bundles.title">16 готових тарифів</p>
+      <h2 class="section-title center" data-i18n="pricing.title">Оберіть тариф під розмір команди</h2>
+      <p class="section-lede center" data-i18n="pricing.bundles.lede">Якщо не хочете збирати тариф самі — ось готові набори під різні ситуації, вигідніші за окрему покупку вкладок і людей. GSM Parser не входить у жоден з них — додається окремо.</p>
+
+      <!-- TODO: замінити всі href="#contact" нижче на https://t.me/ВАШ_БОТ_ЗАЯВОК після створення Telegram-бота -->
+      <div class="price-grid price-grid--wrap">
+        <div class="price-card">
+          <h3 data-i18n="bundle.1.name">Користувач · Локально · Старт</h3>
+          <p class="price-desc" data-i18n="bundle.1.desc">1 людина, базові вкладки, дані на вашому пристрої.</p>
+          <p class="price-value">599&nbsp;₴ <span class="price-usd">/ $14</span><span data-i18n="price.permonth">/міс</span></p>
+          <a class="btn btn-ghost btn-block" href="#contact" data-i18n="price.contact">Написати менеджеру</a>
+        </div>
+        <div class="price-card">
+          <h3 data-i18n="bundle.2.name">Користувач · Локально · Повний</h3>
+          <p class="price-desc" data-i18n="bundle.2.desc">1 людина, усі 15 вкладок (крім GSM Parser — він окремо), дані на вашому пристрої.</p>
+          <p class="price-value">2399&nbsp;₴ <span class="price-usd">/ $58</span><span data-i18n="price.permonth">/міс</span></p>
+          <a class="btn btn-ghost btn-block" href="#contact" data-i18n="price.contact">Написати менеджеру</a>
+        </div>
+        <div class="price-card">
+          <h3 data-i18n="bundle.3.name">Користувач · VPS · Старт</h3>
+          <p class="price-desc" data-i18n="bundle.3.desc">1 людина, базові вкладки, окремий сервер — свій чи від CatMan.</p>
+          <div class="price-dual">
+            <div class="price-dual-row"><span data-i18n="pricing.vps.own">Свій сервер</span><span class="price-dual-value">1399&nbsp;₴ <span class="price-usd">/ $34</span></span></div>
+            <div class="price-dual-row is-recommended"><span data-i18n="pricing.vps.ours">Сервер від CatMan*</span><span class="price-dual-value">2399&nbsp;₴ <span class="price-usd">/ $58</span></span></div>
+          </div>
+          <a class="btn btn-ghost btn-block" href="#contact" data-i18n="price.contact">Написати менеджеру</a>
+        </div>
+        <div class="price-card">
+          <h3 data-i18n="bundle.4.name">Користувач · VPS · Повний</h3>
+          <p class="price-desc" data-i18n="bundle.4.desc">1 людина, усі 15 вкладок (крім GSM Parser — він окремо), окремий сервер — свій чи від CatMan.</p>
+          <div class="price-dual">
+            <div class="price-dual-row"><span data-i18n="pricing.vps.own">Свій сервер</span><span class="price-dual-value">3099&nbsp;₴ <span class="price-usd">/ $75</span></span></div>
+            <div class="price-dual-row is-recommended"><span data-i18n="pricing.vps.ours">Сервер від CatMan*</span><span class="price-dual-value">3999&nbsp;₴ <span class="price-usd">/ $96</span></span></div>
+          </div>
+          <a class="btn btn-ghost btn-block" href="#contact" data-i18n="price.contact">Написати менеджеру</a>
+        </div>
+        <div class="price-card">
+          <h3 data-i18n="bundle.5.name">5 користувачів · Локально · Старт</h3>
+          <p class="price-desc" data-i18n="bundle.5.desc">5 людей, базові вкладки, кожен веде свій облік окремо.</p>
+          <p class="price-value">2699&nbsp;₴ <span class="price-usd">/ $65</span><span data-i18n="price.permonth">/міс</span></p>
+          <a class="btn btn-ghost btn-block" href="#contact" data-i18n="price.contact">Написати менеджеру</a>
+        </div>
+        <div class="price-card">
+          <h3 data-i18n="bundle.6.name">5 користувачів · Локально · Повний</h3>
+          <p class="price-desc" data-i18n="bundle.6.desc">5 людей, усі 15 вкладок (крім GSM Parser — він окремо), кожен веде свій облік окремо.</p>
+          <p class="price-value">6999&nbsp;₴ <span class="price-usd">/ $169</span><span data-i18n="price.permonth">/міс</span></p>
+          <a class="btn btn-ghost btn-block" href="#contact" data-i18n="price.contact">Написати менеджеру</a>
+        </div>
+        <div class="price-card">
+          <h3 data-i18n="bundle.7.name">5 користувачів · VPS · Старт</h3>
+          <p class="price-desc" data-i18n="bundle.7.desc">5 людей, базові вкладки, керівник бачить аналітику по команді. Сервер — свій чи від CatMan.</p>
+          <div class="price-dual">
+            <div class="price-dual-row"><span data-i18n="pricing.vps.own">Свій сервер</span><span class="price-dual-value">6299&nbsp;₴ <span class="price-usd">/ $152</span></span></div>
+            <div class="price-dual-row is-recommended"><span data-i18n="pricing.vps.ours">Сервер від CatMan*</span><span class="price-dual-value">7499&nbsp;₴ <span class="price-usd">/ $181</span></span></div>
+          </div>
+          <a class="btn btn-ghost btn-block" href="#contact" data-i18n="price.contact">Написати менеджеру</a>
+        </div>
+        <div class="price-card price-card--featured">
+          <p class="price-badge" data-i18n="price.popular">Популярний</p>
+          <h3 data-i18n="bundle.8.name">5 користувачів · VPS · Повний</h3>
+          <p class="price-desc" data-i18n="bundle.8.desc">5 людей, усі 15 вкладок (крім GSM Parser — він окремо), керівник бачить аналітику по команді. Сервер — свій чи від CatMan.</p>
+          <div class="price-dual">
+            <div class="price-dual-row"><span data-i18n="pricing.vps.own">Свій сервер</span><span class="price-dual-value">10099&nbsp;₴ <span class="price-usd">/ $243</span></span></div>
+            <div class="price-dual-row is-recommended"><span data-i18n="pricing.vps.ours">Сервер від CatMan*</span><span class="price-dual-value">11099&nbsp;₴ <span class="price-usd">/ $267</span></span></div>
+          </div>
+          <a class="btn btn-primary btn-block" href="#contact" data-i18n="price.contact">Написати менеджеру</a>
+        </div>
+        <div class="price-card">
+          <h3 data-i18n="bundle.9.name">10 користувачів · Локально · Старт</h3>
+          <p class="price-desc" data-i18n="bundle.9.desc">10 людей, базові вкладки, кожен веде свій облік окремо.</p>
+          <p class="price-value">4999&nbsp;₴ <span class="price-usd">/ $120</span><span data-i18n="price.permonth">/міс</span></p>
+          <a class="btn btn-ghost btn-block" href="#contact" data-i18n="price.contact">Написати менеджеру</a>
+        </div>
+        <div class="price-card">
+          <h3 data-i18n="bundle.10.name">10 користувачів · Локально · Повний</h3>
+          <p class="price-desc" data-i18n="bundle.10.desc">10 людей, усі 15 вкладок (крім GSM Parser — він окремо), кожен веде свій облік окремо.</p>
+          <p class="price-value">12999&nbsp;₴ <span class="price-usd">/ $313</span><span data-i18n="price.permonth">/міс</span></p>
+          <a class="btn btn-ghost btn-block" href="#contact" data-i18n="price.contact">Написати менеджеру</a>
+        </div>
+        <div class="price-card">
+          <h3 data-i18n="bundle.11.name">10 користувачів · VPS · Старт</h3>
+          <p class="price-desc" data-i18n="bundle.11.desc">10 людей, базові вкладки, керівник бачить аналітику по команді. Сервер — свій чи від CatMan.</p>
+          <div class="price-dual">
+            <div class="price-dual-row"><span data-i18n="pricing.vps.own">Свій сервер</span><span class="price-dual-value">11999&nbsp;₴ <span class="price-usd">/ $289</span></span></div>
+            <div class="price-dual-row is-recommended"><span data-i18n="pricing.vps.ours">Сервер від CatMan*</span><span class="price-dual-value">13999&nbsp;₴ <span class="price-usd">/ $337</span></span></div>
+          </div>
+          <a class="btn btn-ghost btn-block" href="#contact" data-i18n="price.contact">Написати менеджеру</a>
+        </div>
+        <div class="price-card">
+          <h3 data-i18n="bundle.12.name">10 користувачів · VPS · Повний</h3>
+          <p class="price-desc" data-i18n="bundle.12.desc">10 людей, усі 15 вкладок (крім GSM Parser — він окремо), керівник бачить аналітику по команді. Сервер — свій чи від CatMan.</p>
+          <div class="price-dual">
+            <div class="price-dual-row"><span data-i18n="pricing.vps.own">Свій сервер</span><span class="price-dual-value">18999&nbsp;₴ <span class="price-usd">/ $458</span></span></div>
+            <div class="price-dual-row is-recommended"><span data-i18n="pricing.vps.ours">Сервер від CatMan*</span><span class="price-dual-value">20699&nbsp;₴ <span class="price-usd">/ $499</span></span></div>
+          </div>
+          <a class="btn btn-ghost btn-block" href="#contact" data-i18n="price.contact">Написати менеджеру</a>
+        </div>
+        <div class="price-card">
+          <h3 data-i18n="bundle.13.name">15 користувачів · Локально · Старт</h3>
+          <p class="price-desc" data-i18n="bundle.13.desc">15 людей, базові вкладки, кожен веде свій облік окремо.</p>
+          <p class="price-value">6499&nbsp;₴ <span class="price-usd">/ $157</span><span data-i18n="price.permonth">/міс</span></p>
+          <a class="btn btn-ghost btn-block" href="#contact" data-i18n="price.contact">Написати менеджеру</a>
+        </div>
+        <div class="price-card">
+          <h3 data-i18n="bundle.14.name">15 користувачів · Локально · Повний</h3>
+          <p class="price-desc" data-i18n="bundle.14.desc">15 людей, усі 15 вкладок (крім GSM Parser — він окремо), кожен веде свій облік окремо.</p>
+          <p class="price-value">16599&nbsp;₴ <span class="price-usd">/ $400</span><span data-i18n="price.permonth">/міс</span></p>
+          <a class="btn btn-ghost btn-block" href="#contact" data-i18n="price.contact">Написати менеджеру</a>
+        </div>
+        <div class="price-card">
+          <h3 data-i18n="bundle.15.name">15 користувачів · VPS · Старт</h3>
+          <p class="price-desc" data-i18n="bundle.15.desc">15 людей, базові вкладки, керівник бачить аналітику по команді. Сервер — свій чи від CatMan.</p>
+          <div class="price-dual">
+            <div class="price-dual-row"><span data-i18n="pricing.vps.own">Свій сервер</span><span class="price-dual-value">15999&nbsp;₴ <span class="price-usd">/ $386</span></span></div>
+            <div class="price-dual-row is-recommended"><span data-i18n="pricing.vps.ours">Сервер від CatMan*</span><span class="price-dual-value">18999&nbsp;₴ <span class="price-usd">/ $458</span></span></div>
+          </div>
+          <a class="btn btn-ghost btn-block" href="#contact" data-i18n="price.contact">Написати менеджеру</a>
+        </div>
+        <div class="price-card">
+          <h3 data-i18n="bundle.16.name">15 користувачів · VPS · Повний</h3>
+          <p class="price-desc" data-i18n="bundle.16.desc">15 людей, усі 15 вкладок (крім GSM Parser — він окремо), керівник бачить аналітику по команді. Сервер — свій чи від CatMan.</p>
+          <div class="price-dual">
+            <div class="price-dual-row"><span data-i18n="pricing.vps.own">Свій сервер</span><span class="price-dual-value">24799&nbsp;₴ <span class="price-usd">/ $598</span></span></div>
+            <div class="price-dual-row is-recommended"><span data-i18n="pricing.vps.ours">Сервер від CatMan*</span><span class="price-dual-value">27399&nbsp;₴ <span class="price-usd">/ $660</span></span></div>
+          </div>
+          <a class="btn btn-ghost btn-block" href="#contact" data-i18n="price.contact">Написати менеджеру</a>
+        </div>
+      </div>
+
+      <p class="hero-note" style="text-align:center; margin-top: 20px;" data-i18n-html="pricing.dedicated.footnote">* Ціна «Сервер від CatMan» включає хостинг; разове підключення сервера (1499&nbsp;₴ / $36) оплачується окремо один раз при підключенні.</p>
+      <p class="hero-note" style="text-align:center; margin-top: 8px;" data-i18n="pricing.footnote">Почали з Локально — завжди можна перейти на VPS пізніше, база даних переїде разом з вами.</p>
+    </div>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap footer-row">
+    <span>© <span id="year"></span> CatMan Pro</span>
+    <a href="#" data-i18n="footer.contact">Контакти</a>
+  </div>
+</footer>
+
+<div class="lightbox-overlay" id="lightbox">
+  <div class="lightbox-box">
+    <div class="lightbox-head">
+      <h4 id="lightboxTitle"></h4>
+      <button class="lightbox-close" id="lightboxClose" data-i18n-attr="aria-label" data-i18n="lightbox.close" aria-label="Закрити">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+      </button>
+    </div>
+    <div class="lightbox-body">
+      <img id="lightboxImg" alt="">
+      <div class="shot-placeholder lightbox-placeholder" id="lightboxPlaceholder">
+        <p data-i18n="shot.label">Скріншот</p>
+        <strong id="lightboxPlaceholderTitle"></strong>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>window.ASSET_PREFIX = "../";</script>
+<script src="../js/i18n.js"></script>
+<script src="../js/main.js"></script>
+<script src="../js/pricing-calc.js"></script>
+</body>
+</html>
