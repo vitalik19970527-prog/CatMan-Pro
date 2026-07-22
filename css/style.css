@@ -875,6 +875,10 @@ h1, h2, h3 {
   font-size: 13px;
   color: var(--ink-faint);
 }
+.footer-links {
+  display: flex;
+  gap: 20px;
+}
 
 /* ---------- screenshot lightbox ---------- */
 .lightbox-overlay {
