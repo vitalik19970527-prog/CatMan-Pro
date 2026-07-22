@@ -1006,32 +1006,6 @@ h1, h2, h3 {
 }
 .tab-detail-shots .shot-placeholder { aspect-ratio: 16 / 10.5; }
 
-/* ---------- Ukraine support band ---------- */
-.ukraine-band {
-  display: flex;
-  align-items: center;
-  gap: 20px;
-  background: linear-gradient(90deg, var(--primary-soft), var(--teal-soft));
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  padding: 22px 28px;
-  margin: 0 24px 0;
-}
-.ukraine-flag {
-  flex: none;
-  width: 40px;
-  height: 40px;
-  border-radius: 10px;
-  overflow: hidden;
-  display: grid;
-  grid-template-rows: 1fr 1fr;
-  box-shadow: 0 0 0 1px var(--line-strong);
-}
-.ukraine-flag span:first-child { background: #005BBB; }
-.ukraine-flag span:last-child { background: #FFD500; }
-.ukraine-band p { margin: 0; font-size: 14.5px; color: var(--ink-soft); }
-.ukraine-band strong { color: var(--ink); }
-
 /* ---------- company/individual x vps/local choice ---------- */
 .choice-grid {
   display: grid;
@@ -1091,7 +1065,6 @@ h1, h2, h3 {
   .teaser-grid { grid-template-columns: 1fr; }
   .tab-detail-shots { grid-template-columns: 1fr; }
   .choice-grid { grid-template-columns: 1fr; }
-  .ukraine-band { margin: 0 12px; flex-wrap: wrap; }
 }
 @media (max-width: 560px) {
   .wrap { padding: 0 18px; }
