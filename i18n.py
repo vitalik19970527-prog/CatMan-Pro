@@ -1,0 +1,8523 @@
+"""
+Translation (i18n) core — mirrors the existing per-user theme system in
+views/themes.py exactly: an in-memory active-state cache keyed by
+manager_id, persisted into manager_workspace_state (payload["ui_language"]).
+
+Design:
+- Keys live in CODE. Every call site does `t("orders.title", "Замовлення")`
+  — the Ukrainian text is both the fallback value and the thing that gets
+  auto-registered into the DB key registry (public.translation_keys) the
+  first time that key is ever seen. There is no separate static key catalog
+  to maintain by hand.
+- VALUES (actual translations into EN/PL/ZH/DE/...) live in Postgres
+  (public.translation_values), edited via the superadmin "Мови" screen, and
+  migrate with the rest of the database (e.g. to a VPS) automatically.
+- Hot path is pure in-memory: per-language values are loaded into
+  `_translations_cache` once (on first use of that language) and then it's
+  just a dict lookup. New-key registration is a one-time DB write per key
+  per process lifetime (guarded by `_known_keys`), never a repeated cost.
+"""
+from __future__ import annotations
+
+import contextlib
+import threading
+
+import flet as ft
+
+DEFAULT_LANGUAGE = "UA"
+
+# Seeded once if public.translation_languages is empty — see
+# seed_default_languages_if_empty(). sort_order matches the order they
+# appear in the language-switcher menu.
+DEFAULT_LANGUAGES_SEED: list[dict] = [
+    {"code": "UA", "name": "Українська", "flag_emoji": "🇺🇦", "enabled": True},
+    {"code": "EN", "name": "English", "flag_emoji": "🇬🇧", "enabled": True},
+    {"code": "PL", "name": "Polski", "flag_emoji": "🇵🇱", "enabled": True},
+    {"code": "ZH", "name": "中文(简体)", "flag_emoji": "🇨🇳", "enabled": True},
+    {"code": "DE", "name": "Deutsch", "flag_emoji": "🇩🇪", "enabled": True},
+]
+
+_DB = None  # set via init_i18n(db) at app startup
+
+# ── Active-language state (mirrors views/themes.py's _active_themes) ──────
+_active_languages: dict[str, str] = {}  # manager_id -> lang code
+_session_language: str = DEFAULT_LANGUAGE  # pre-login fallback (auth screen)
+
+# ── Key registry cache ─────────────────────────────────────────────────────
+_known_keys: set[str] = set()
+_known_keys_loaded = False
+_known_keys_lock = threading.Lock()
+
+# ── Per-language value cache ────────────────────────────────────────────────
+_translations_cache: dict[str, dict[str, str]] = {}
+_translations_loaded_langs: set[str] = set()
+_cache_lock = threading.Lock()
+
+# ── Active-languages-list cache (for the switcher menu) ────────────────────
+_languages_list_cache: list[dict] | None = None
+_languages_list_lock = threading.Lock()
+
+
+def init_i18n(db) -> None:
+    """Call once at app startup so this module can reach the DB."""
+    global _DB
+    _DB = db
+
+
+def seed_default_languages_if_empty(db=None) -> None:
+    """Insert the 5 starter languages if none exist yet. Safe to call every
+    app start — no-ops once languages already exist."""
+    _db = db or _DB
+    if _db is None:
+        return
+    with contextlib.suppress(Exception):
+        existing = _db.get_translation_languages()
+        if not existing:
+            _db.save_translation_languages_bulk(list(DEFAULT_LANGUAGES_SEED))
+
+
+# ── Help-text translation seeds ───────────────────────────────────────────
+# UA text lives as fallbacks in t() calls; only non-UA languages go here.
+# Keys follow "view.help.*" naming. ON CONFLICT DO NOTHING — never
+# overwrites values entered by the superadmin via the Мови screen.
+_HELP_SEEDS: dict[str, dict[str, str]] = {
+    # ── GSM Parser ───────────────────────────────────────────────────────
+    "gsm.help.desc": {
+        "EN": "GSM Parser results: price and spec monitoring for smartphones from GSM Arena and E-Katalog.",
+        "PL": "Wyniki GSM Parsera: monitorowanie cen i specyfikacji smartfonów z GSM Arena i E-Katalog.",
+        "ZH": "GSM解析器结果：来自GSM Arena和E-Katalog的智能手机价格和规格监控。",
+        "DE": "GSM Parser Ergebnisse: Preis- und Spezifikationsüberwachung für Smartphones von GSM Arena und E-Katalog.",
+    },
+    "gsm.help.steps_title": {
+        "EN": "How to use",
+        "PL": "Jak korzystać",
+        "ZH": "使用方法",
+        "DE": "Verwendung",
+    },
+    "gsm.help.step1": {
+        "EN": "1. The table shows all parsed devices with current prices and statuses.",
+        "PL": "1. Tabela pokazuje wszystkie sparsowane urządzenia z aktualnymi cenami i statusami.",
+        "ZH": "1. 表格显示所有已解析设备的当前价格和状态。",
+        "DE": "1. Die Tabelle zeigt alle geparsten Geräte mit aktuellen Preisen und Status.",
+    },
+    "gsm.help.step2": {
+        "EN": "2. «Filters» — advanced filtering by brand, type, year, status, source.",
+        "PL": "2. «Filtry» — zaawansowane filtrowanie według marki, typu, roku, statusu, źródła.",
+        "ZH": "2. «过滤器»——按品牌、类型、年份、状态、来源进行高级过滤。",
+        "DE": "2. «Filter» — erweiterte Filterung nach Marke, Typ, Jahr, Status, Quelle.",
+    },
+    "gsm.help.step3": {
+        "EN": "3. Click a row to open the device detail card (specs, compatibility, price chart).",
+        "PL": "3. Kliknij wiersz, aby otworzyć kartę szczegółów urządzenia (specyfikacje, kompatybilność, wykres cen).",
+        "ZH": "3. 点击行以打开设备详情卡片（规格、兼容性、价格图表）。",
+        "DE": "3. Zeile anklicken, um die Gerätekarte zu öffnen (Spezifikationen, Kompatibilität, Preisdiagramm).",
+    },
+    "gsm.help.step4": {
+        "EN": "4. «Sync» updates the cache from the database.",
+        "PL": "4. «Synchronizacja» aktualizuje pamięć podręczną z bazy danych.",
+        "ZH": "4. «同步»从数据库更新缓存。",
+        "DE": "4. «Sync» aktualisiert den Cache aus der Datenbank.",
+    },
+    "gsm.help.step5": {
+        "EN": "5. «Run» launches the parser (full / GSM only / E-Katalog only).",
+        "PL": "5. «Uruchom» uruchamia parser (pełny / tylko GSM / tylko E-Katalog).",
+        "ZH": "5. «运行»启动解析器（完整/仅GSM/仅E-Katalog）。",
+        "DE": "5. «Starten» startet den Parser (vollständig / nur GSM / nur E-Katalog).",
+    },
+    "gsm.help.step6": {
+        "EN": "6. «Schedule launch…» in the same menu — runs the parser after a delay instead of immediately (the app must stay open).",
+        "PL": "6. «Zaplanuj uruchomienie…» w tym samym menu — uruchamia parser po opóźnieniu zamiast od razu (aplikacja musi pozostać otwarta).",
+        "ZH": "6. 同一菜单中的«计划启动…»——延迟运行解析器而不是立即运行（应用程序必须保持打开）。",
+        "DE": "6. «Start planen…» im selben Menü — startet den Parser verzögert statt sofort (die App muss geöffnet bleiben).",
+    },
+    "gsm.variants_help.step1": {
+        "EN": "1. Add rows for each regional Xiaomi model variant (region code + model suffix).",
+        "PL": "1. Dodaj wiersze dla każdego regionalnego wariantu modelu Xiaomi (kod regionu + sufiks modelu).",
+        "ZH": "1. 为每个小米地区型号变体添加行（地区代码+型号后缀）。",
+        "DE": "1. Zeilen für jede regionale Xiaomi-Modellvariante hinzufügen (Regionscode + Modellsuffix).",
+    },
+    "gsm.variants_help.step2": {
+        "EN": "2. Click «Save» to apply.",
+        "PL": "2. Kliknij «Zapisz», aby zastosować.",
+        "ZH": "2. 点击«保存»应用。",
+        "DE": "2. Auf «Speichern» klicken, um anzuwenden.",
+    },
+    "gsm.comment_help.step1": {
+        "EN": "1. Type a comment about the device. To link another device use: [Device name](device_id).",
+        "PL": "1. Wpisz komentarz o urządzeniu. Aby połączyć z innym urządzeniem użyj: [Nazwa urządzenia](device_id).",
+        "ZH": "1. 输入关于设备的评论。要链接另一个设备请使用：[设备名称](device_id)。",
+        "DE": "1. Kommentar zum Gerät eingeben. Um ein anderes Gerät zu verlinken: [Gerätename](device_id).",
+    },
+    "gsm.comment_help.step2": {
+        "EN": "2. Click «Save».",
+        "PL": "2. Kliknij «Zapisz».",
+        "ZH": "2. 点击«保存»。",
+        "DE": "2. Auf «Speichern» klicken.",
+    },
+    "gsm.filter_help.step1": {
+        "EN": "1. Enter a preset name to save the current filter settings.",
+        "PL": "1. Wprowadź nazwę presetu, aby zapisać aktualne ustawienia filtru.",
+        "ZH": "1. 输入预设名称以保存当前过滤器设置。",
+        "DE": "1. Preset-Namen eingeben, um die aktuellen Filtereinstellungen zu speichern.",
+    },
+    "gsm.filter_help.step2": {
+        "EN": "2. Click «Save» — the preset appears in the presets list.",
+        "PL": "2. Kliknij «Zapisz» — preset pojawi się na liście presetów.",
+        "ZH": "2. 点击«保存»——预设出现在预设列表中。",
+        "DE": "2. Auf «Speichern» klicken — das Preset erscheint in der Preset-Liste.",
+    },
+    "gsm.device_help.step1": {
+        "EN": "1. Switch between tabs: GSM Arena, E-Katalog, compatibility, price history.",
+        "PL": "1. Przełączaj między zakładkami: GSM Arena, E-Katalog, kompatybilność, historia cen.",
+        "ZH": "1. 在标签之间切换：GSM Arena、E-Katalog、兼容性、价格历史。",
+        "DE": "1. Zwischen Tabs wechseln: GSM Arena, E-Katalog, Kompatibilität, Preisverlauf.",
+    },
+    "gsm.device_help.step2": {
+        "EN": "2. «Edit» — add a comment or link to related models.",
+        "PL": "2. «Edytuj» — dodaj komentarz lub link do powiązanych modeli.",
+        "ZH": "2. «编辑»——添加评论或关联模型链接。",
+        "DE": "2. «Bearbeiten» — Kommentar hinzufügen oder verwandte Modelle verlinken.",
+    },
+    # ── home_view ────────────────────────────────────────────────────────
+    "home.help.title": {
+        "EN": "Help — Home",
+        "PL": "Pomoc — Strona główna",
+        "ZH": "帮助 — 主页",
+        "DE": "Hilfe — Startseite",
+    },
+    "home.help.desc": {
+        "EN": "Home is your personal action dashboard. It shows problem counters and average order metrics.",
+        "PL": "Strona główna to Twój osobisty panel akcji z licznikami problemów i średnimi wskaźnikami zamówień.",
+        "ZH": "主页是您的个人操作仪表板，显示问题计数器和订单平均指标。",
+        "DE": "Die Startseite ist Ihr persönliches Aktions-Dashboard mit Problemzählern und durchschnittlichen Bestellkennzahlen.",
+    },
+    "home.help.steps_title": {
+        "EN": "How to use",
+        "PL": "Jak używać",
+        "ZH": "使用方法",
+        "DE": "So verwenden Sie es",
+    },
+    "home.help.step1": {
+        "EN": "1. Click any card — the system opens the corresponding section with filtered data.",
+        "PL": "1. Kliknij dowolną kartę — system otworzy odpowiednią sekcję z przefiltrowanymi danymi.",
+        "ZH": "1. 点击任意卡片 — 系统将打开带有筛选数据的相应部分。",
+        "DE": "1. Klicken Sie auf eine Karte — das System öffnet den Bereich mit gefilterten Daten.",
+    },
+    "home.help.step2": {
+        "EN": "2. Card colour: 🔴 red — problem, 🟡 yellow — warning, 🟢 green — all good.",
+        "PL": "2. Kolor karty: 🔴 czerwony — problem, 🟡 żółty — ostrzeżenie, 🟢 zielony — wszystko OK.",
+        "ZH": "2. 卡片颜色：🔴 红色 — 问题，🟡 黄色 — 警告，🟢 绿色 — 一切正常。",
+        "DE": "2. Kartenfarbe: 🔴 rot — Problem, 🟡 gelb — Warnung, 🟢 grün — alles in Ordnung.",
+    },
+    "home.help.step3": {
+        "EN": "3. Scroll down to see the average metrics tables.",
+        "PL": "3. Przewiń w dół, aby zobaczyć tabele ze średnimi wskaźnikami.",
+        "ZH": "3. 向下滚动查看平均指标表格。",
+        "DE": "3. Scrollen Sie nach unten, um die Kennzahlen-Tabellen zu sehen.",
+    },
+    "home.help.counters_title": {
+        "EN": "Counters",
+        "PL": "Liczniki",
+        "ZH": "计数器",
+        "DE": "Zähler",
+    },
+    "home.help.c_overdue": {
+        "EN": "🔴 Not Ordered — tasks whose due date has passed and status is not yet 'ordered'.",
+        "PL": "🔴 Niezamówione — zadania, których termin minął, a status to jeszcze nie 'zamówiono'.",
+        "ZH": "🔴 未订购 — 截止日期已过且状态尚未为«已订购»的任务。",
+        "DE": "🔴 Nicht bestellt — Aufgaben mit überschrittenem Fälligkeitsdatum und Status nicht 'bestellt'.",
+    },
+    "home.help.c_need_order": {
+        "EN": "🟡 Need to Order — active order tasks without 'ordered' status.",
+        "PL": "🟡 Do zamówienia — aktywne zadania zamówień bez statusu 'zamówiono'.",
+        "ZH": "🟡 需要订购 — 没有«已订购»状态的活跃订单任务。",
+        "DE": "🟡 Zu bestellen — aktive Bestellaufgaben ohne Status 'bestellt'.",
+    },
+    "home.help.c_logistics": {
+        "EN": "In Transit/Warehouse/Accepted — orders in final statuses without actual logistics cost.",
+        "PL": "W drodze/Magazyn/Przyjęto — zamówienia w końcowych statusach bez kosztów logistyki.",
+        "ZH": "在途/仓库/已验收 — 处于最终状态但没有实际物流成本的订单。",
+        "DE": "Unterwegs/Lager/Angenommen — Bestellungen in Endstatus ohne tatsächliche Logistikkosten.",
+    },
+    "home.help.c_status_date": {
+        "EN": "Status Date — orders where the date for the current status is empty or in the future.",
+        "PL": "Data statusu — zamówienia, gdzie data dla bieżącego statusu jest pusta lub w przyszłości.",
+        "ZH": "状态日期 — 当前状态的日期字段为空或在未来的订单。",
+        "DE": "Statusdatum — Bestellungen, bei denen das Statusdatum leer oder in der Zukunft liegt.",
+    },
+    "home.help.c_1c": {
+        "EN": "Not in accounting — orders out of production not yet marked as entered into accounting.",
+        "PL": "Nie wprowadzono do księgowości — zamówienia po produkcji nieoznaczone jako wprowadzone do księgowości.",
+        "ZH": "未记账 — 已完成生产但尚未标记为已记账的订单。",
+        "DE": "Nicht verbucht — Bestellungen nach Produktion, noch nicht als verbucht markiert.",
+    },
+    "home.help.c_weight": {
+        "EN": "Orders without factual weight — orders missing actual weight for unpacking.",
+        "PL": "Zamówienia bez rzeczywistej wagi — bez podanej wagi do rozpakowywania.",
+        "ZH": "无实际重量的订单 — 缺少拆包实际重量的订单。",
+        "DE": "Bestellungen ohne Ist-Gewicht — ohne angegebenes tatsächliches Gewicht zur Entpackung.",
+    },
+    "home.help.c_products": {
+        "EN": "Products without data — products with unfilled required fields.",
+        "PL": "Produkty bez danych — produkty z niezawartymi wymaganymi polami.",
+        "ZH": "无数据产品 — 必填字段未完成的产品。",
+        "DE": "Produkte ohne Daten — Produkte mit nicht ausgefüllten Pflichtfeldern.",
+    },
+    "home.help.c_series": {
+        "EN": "Unfinished series — incomplete series not yet merged into the product card.",
+        "PL": "Niedokończone serie — niekompletne serie nieprzeniesione jeszcze do karty produktu.",
+        "ZH": "未完成系列 — 尚未合并到产品卡片的不完整系列。",
+        "DE": "Unfertige Serien — unvollständige Serien, noch nicht in die Produktkarte übernommen.",
+    },
+    "home.help.c_margin": {
+        "EN": "Categories without target margin — categories missing a target profitability %.",
+        "PL": "Kategorie bez docelowej marży — bez podanego % docelowej rentowności.",
+        "ZH": "无目标利润率类别 — 缺少目标利润率%的类别。",
+        "DE": "Kategorien ohne Zielmarge — ohne angegebene Zielrentabilität %.",
+    },
+    "home.help.c_supplier_debt": {
+        "EN": "Product suppliers — count with unsettled balance (🔴 we owe, 🟡 supplier owes).",
+        "PL": "Dostawcy towarów — liczba z nierozliczonym saldem (🔴 my jesteśmy winni, 🟡 dostawca jest winien).",
+        "ZH": "商品供应商 — 未结算余额数量（🔴 我们欠款，🟡 供应商欠款）。",
+        "DE": "Produktlieferanten — Anzahl mit ungeklärtem Saldo (🔴 wir schulden, 🟡 Lieferant schuldet).",
+    },
+    "home.help.c_pack_stock": {
+        "EN": "Packaging stock — items with critically low stock (🟡 < 5 000 pcs, 🔴 < 2 500 pcs).",
+        "PL": "Stan opakowań — pozycje z krytycznie niskim stanem (🟡 < 5 000 szt., 🔴 < 2 500 szt.).",
+        "ZH": "包装库存 — 库存严重不足的项目（🟡 < 5,000件，🔴 < 2,500件）。",
+        "DE": "Verpackungsbestand — Positionen mit kritisch niedrigem Bestand (🟡 < 5.000, 🔴 < 2.500 Stk.).",
+    },
+    "home.help.c_pack_debt": {
+        "EN": "Packaging suppliers — suppliers with unsettled balance.",
+        "PL": "Dostawcy opakowań — dostawcy z nierozliczonym saldem.",
+        "ZH": "包装供应商 — 有未结算余额的包装供应商。",
+        "DE": "Verpackungslieferanten — Lieferanten mit ungeklärtem Saldo.",
+    },
+    "home.help.c_suppliers_empty": {
+        "EN": "Suppliers without data — suppliers with unfilled required fields.",
+        "PL": "Dostawcy bez danych — dostawcy z niezawartymi wymaganymi polami.",
+        "ZH": "无数据供应商 — 必填字段未完成的供应商。",
+        "DE": "Lieferanten ohne Daten — mit nicht ausgefüllten Pflichtfeldern.",
+    },
+    "home.help.c_media": {
+        "EN": "Media plan — entries not updated recently (🟡 14–30 days, 🔴 30+ days).",
+        "PL": "Plan mediowy — wpisy nieaktualizowane od dłuższego czasu (🟡 14–30 dni, 🔴 30+ dni).",
+        "ZH": "媒体计划 — 长时间未更新的条目（🟡 14-30天，🔴 30+天）。",
+        "DE": "Medienplan — Einträge ohne Update (🟡 14–30 Tage, 🔴 30+ Tage).",
+    },
+    "home.help.c_media_schedule": {
+        "EN": "Media plan end — days remaining until the current media cycle ends.",
+        "PL": "Koniec planu mediowego — liczba dni do zakończenia bieżącego cyklu mediowego.",
+        "ZH": "媒体计划结束 — 当前媒体周期结束前的剩余天数。",
+        "DE": "Medienplan-Ende — verbleibende Tage bis zum Ende des aktuellen Medienzyklus.",
+    },
+    "home.help.c_totals": {
+        "EN": "Totals — total count of suppliers, categories, products, packaging and orders in the system.",
+        "PL": "Łącznie — całkowita liczba dostawców, kategorii, produktów, opakowań i zamówień.",
+        "ZH": "总计 — 系统中供应商、类别、产品、包装和订单的总数量。",
+        "DE": "Gesamt — Gesamtanzahl von Lieferanten, Kategorien, Produkten, Verpackungen und Bestellungen.",
+    },
+    "home.help.tables_title": {
+        "EN": "Average metrics tables",
+        "PL": "Tabele średnich wskaźników",
+        "ZH": "平均指标表格",
+        "DE": "Durchschnittskennzahlen-Tabellen",
+    },
+    "home.help.t_delivery": {
+        "EN": "Average delivery time — average days from dispatch to acceptance, by region.",
+        "PL": "Średni czas dostawy — średnia liczba dni od wysyłki do przyjęcia, wg regionów.",
+        "ZH": "平均配送时间 — 从发货到验收的平均天数，按地区细分。",
+        "DE": "Durchschnittliche Lieferzeit — Ø Tage vom Versand bis zur Annahme, nach Regionen.",
+    },
+    "home.help.t_tariff": {
+        "EN": "Average delivery tariff — average delivery cost per unit by region.",
+        "PL": "Średni tarif dostawy — średni koszt dostawy na jednostkę wg regionów.",
+        "ZH": "平均运费 — 按地区划分的每件产品平均配送成本。",
+        "DE": "Durchschnittlicher Liefertarif — Ø Lieferkosten pro Einheit nach Regionen.",
+    },
+    "home.help.t_shoulder": {
+        "EN": "Average shoulder — average logistics time to distributor by region.",
+        "PL": "Średnie ramię — średni czas logistyczny do dystrybutora wg regionów.",
+        "ZH": "平均输送距离 — 按地区划分的到经销商的平均物流时间。",
+        "DE": "Durchschnittliche Schulter — Ø Logistikzeit zum Distributor nach Regionen.",
+    },
+    "home.help.t_terms": {
+        "EN": "Average terms — summary of average production and logistics terms across all orders.",
+        "PL": "Średnie terminy — zestawienie średnich terminów produkcji i logistyki wszystkich zamówień.",
+        "ZH": "平均周期 — 所有订单的平均生产和物流周期汇总。",
+        "DE": "Durchschnittliche Fristen — Übersicht Ø Produktions- und Logistikfristen aller Bestellungen.",
+    },
+    "home.help.t_prod_term": {
+        "EN": "Average production time — average time from order to readiness for selected products (configurable via ⚙).",
+        "PL": "Średni czas produkcji — Ø czas od zamówienia do gotowości wybranych produktów (konfig. przez ⚙).",
+        "ZH": "平均生产周期 — 所选产品从订单到完成的平均时间（可通过⚙配置）。",
+        "DE": "Durchschnittliche Produktionszeit — Ø Zeit von Bestellung bis Fertigstellung ausgewählter Produkte (⚙).",
+    },
+    "home.help.t_weight": {
+        "EN": "Average factual weight — average actual weight of orders for selected products.",
+        "PL": "Średnia rzeczywista waga — Ø rzeczywista waga zamówień wybranych produktów.",
+        "ZH": "平均实际重量 — 所选产品订单的平均实际重量。",
+        "DE": "Durchschnittliches Ist-Gewicht — Ø tatsächliches Gewicht der Bestellungen ausgewählter Produkte.",
+    },
+    "home.help.t_cost": {
+        "EN": "Average order cost price — average total cost of one order by product.",
+        "PL": "Średnia cena kosztu zamówienia — Ø całkowity koszt jednego zamówienia wg produktu.",
+        "ZH": "平均订单成本价 — 按产品划分的每个订单的平均总成本。",
+        "DE": "Durchschnittlicher Bestellkostenpreis — Ø Gesamtkosten einer Bestellung nach Produkt.",
+    },
+    "home.help.t_stock_cost": {
+        "EN": "Average stock cost price — current average cost price of goods in stock.",
+        "PL": "Średnia cena kosztu zapasów — bieżąca Ø cena kosztu towarów w magazynie.",
+        "ZH": "平均库存成本价 — 库存商品当前的平均成本价。",
+        "DE": "Durchschnittlicher Lagerbestandskostenpreis — aktueller Ø Kostenpreis von Waren im Lager.",
+    },
+    "home.help.t_blended": {
+        "EN": "Average blended cost — combined cost price: order + stock together.",
+        "PL": "Średni koszt mieszany — łączna cena kosztu: zamówienie + zapasy razem.",
+        "ZH": "平均混合成本 — 综合成本价：订单+库存合计。",
+        "DE": "Durchschnittliche gemischte Kosten — Gesamtkostenpreis: Bestellung + Lagerbestand.",
+    },
+    # ── orders_view ──────────────────────────────────────────────────────
+    "orders.help.title": {
+        "EN": "Help — Orders",
+        "PL": "Pomoc — Zamówienia",
+        "ZH": "帮助 — 订单",
+        "DE": "Hilfe — Bestellungen",
+    },
+    "orders.help.desc": {
+        "EN": "Order table grouped by year → month → supplier. Changes are saved locally and synced to the DB every 45 sec.",
+        "PL": "Tabela zamówień pogrupowana wg rok → miesiąc → dostawca. Zmiany są zapisywane lokalnie i synchronizowane z bazą co 45 sek.",
+        "ZH": "订单表格按年份→月份→供应商分组。更改本地保存，每45秒同步到数据库。",
+        "DE": "Bestelltabelle gruppiert nach Jahr → Monat → Lieferant. Änderungen werden lokal gespeichert und alle 45 Sek. synchronisiert.",
+    },
+    "orders.help.steps_title": {
+        "EN": "How to use",
+        "PL": "Jak używać",
+        "ZH": "使用方法",
+        "DE": "So verwenden Sie es",
+    },
+    "orders.help.step1": {
+        "EN": "1. Status chips at the top — quick filter by status, payment or accounting.",
+        "PL": "1. Chipy statusów u góry — szybki filtr wg statusu, płatności lub księgowości.",
+        "ZH": "1. 顶部状态标签 — 按状态、付款或记账状态快速筛选。",
+        "DE": "1. Status-Chips oben — Schnellfilter nach Status, Zahlung oder Buchhaltung.",
+    },
+    "orders.help.step2": {
+        "EN": "2. Filter block — narrow the list by supplier, category, product or months.",
+        "PL": "2. Blok filtrów — zawęź listę wg dostawcy, kategorii, produktu lub miesięcy.",
+        "ZH": "2. 筛选块 — 按供应商、类别、产品或月份缩小列表范围。",
+        "DE": "2. Filterblock — Liste nach Lieferant, Kategorie, Produkt oder Monaten eingrenzen.",
+    },
+    "orders.help.step3": {
+        "EN": "3. Click «+» to create a new order (short form).",
+        "PL": "3. Kliknij «+» aby utworzyć nowe zamówienie (krótki formularz).",
+        "ZH": "3. 点击«+»创建新订单（简短表单）。",
+        "DE": "3. Klicken Sie auf «+», um eine neue Bestellung zu erstellen (Kurzformular).",
+    },
+    "orders.help.step4": {
+        "EN": "4. Click on an order row → full edit form opens.",
+        "PL": "4. Kliknij wiersz zamówienia → otworzy się pełny formularz edycji.",
+        "ZH": "4. 点击订单行 → 打开完整编辑表单。",
+        "DE": "4. Auf Bestellzeile klicken → vollständiges Bearbeitungsformular öffnet sich.",
+    },
+    "orders.help.step5": {
+        "EN": "5. ▶ icon expands the product detail rows of the order.",
+        "PL": "5. Ikona ▶ rozwija wiersze szczegółów produktów zamówienia.",
+        "ZH": "5. ▶ 图标展开订单的产品详情行。",
+        "DE": "5. ▶-Symbol klappt die Produktdetailzeilen der Bestellung aus.",
+    },
+    "orders.help.step6": {
+        "EN": "6. ☰ button (columns) — configure column visibility and width.",
+        "PL": "6. Przycisk ☰ (kolumny) — konfiguracja widoczności i szerokości kolumn.",
+        "ZH": "6. ☰按钮（列）— 配置列的可见性和宽度。",
+        "DE": "6. ☰-Schaltfläche (Spalten) — Sichtbarkeit und Breite der Spalten konfigurieren.",
+    },
+    "orders.help.step7": {
+        "EN": "7. 🗑 appears on hover — deletes the order after confirmation.",
+        "PL": "7. 🗑 pojawia się przy najechaniu — usuwa zamówienie po potwierdzeniu.",
+        "ZH": "7. 🗑 悬停时出现 — 确认后删除订单。",
+        "DE": "7. 🗑 erscheint beim Hover — löscht die Bestellung nach Bestätigung.",
+    },
+    "orders.attachment.invoice_label": {
+        "EN": "Invoice",
+        "PL": "Faktura",
+        "ZH": "发票",
+        "DE": "Rechnung",
+    },
+    "orders.attachment.packing_label": {
+        "EN": "Packing list",
+        "PL": "Lista pakowania",
+        "ZH": "装箱单",
+        "DE": "Packliste",
+    },
+    "orders.attachment.not_uploaded": {
+        "EN": "Not uploaded",
+        "PL": "Nie przesłano",
+        "ZH": "未上传",
+        "DE": "Nicht hochgeladen",
+    },
+    "orders.attachment.open": {
+        "EN": "Open",
+        "PL": "Otwórz",
+        "ZH": "打开",
+        "DE": "Öffnen",
+    },
+    "orders.attachment.save_pc": {
+        "EN": "Save to PC",
+        "PL": "Zapisz na dysku",
+        "ZH": "保存到电脑",
+        "DE": "Auf PC speichern",
+    },
+    "orders.attachment.upload": {
+        "EN": "Upload",
+        "PL": "Prześlij",
+        "ZH": "上传",
+        "DE": "Hochladen",
+    },
+    "orders.attachment.delete": {
+        "EN": "Delete",
+        "PL": "Usuń",
+        "ZH": "删除",
+        "DE": "Löschen",
+    },
+    "orders.attachment.replace_btn": {
+        "EN": "Replace",
+        "PL": "Zastąp",
+        "ZH": "替换",
+        "DE": "Ersetzen",
+    },
+    "orders.attachment.replace_confirm": {
+        "EN": 'Replace the existing file "{fname}"?',
+        "PL": 'Zastąpić istniejący plik "{fname}"?',
+        "ZH": '替换现有文件 "{fname}"？',
+        "DE": 'Vorhandene Datei "{fname}" ersetzen?',
+    },
+    "orders.attachment.delete_confirm": {
+        "EN": 'Delete the file "{fname}"?',
+        "PL": 'Usunąć plik "{fname}"?',
+        "ZH": '删除文件 "{fname}"？',
+        "DE": 'Datei "{fname}" löschen?',
+    },
+    "orders.attachment.pick_dialog": {
+        "EN": "Choose an xlsx file",
+        "PL": "Wybierz plik xlsx",
+        "ZH": "选择xlsx文件",
+        "DE": "xlsx-Datei auswählen",
+    },
+    "orders.attachment.save_dialog": {
+        "EN": 'Save "{fname}"',
+        "PL": 'Zapisz "{fname}"',
+        "ZH": '保存 "{fname}"',
+        "DE": '"{fname}" speichern',
+    },
+    "orders.attachment.saved": {
+        "EN": "Saved: {name}",
+        "PL": "Zapisano: {name}",
+        "ZH": "已保存：{name}",
+        "DE": "Gespeichert: {name}",
+    },
+    "orders.attachment.err_too_large": {
+        "EN": "File is too large (max {sz})",
+        "PL": "Plik jest za duży (maks. {sz})",
+        "ZH": "文件过大（最大 {sz}）",
+        "DE": "Datei ist zu groß (max. {sz})",
+    },
+    "orders.attachment.err_no_data": {
+        "EN": "Could not retrieve the file",
+        "PL": "Nie udało się pobrać pliku",
+        "ZH": "无法获取文件",
+        "DE": "Datei konnte nicht abgerufen werden",
+    },
+    "orders.help.attachment_desc": {
+        "EN": "Attach the Invoice file and the Packing list file (Excel) to this order. "
+        "Supervisors can view and download subordinates' files to their PC, but cannot add or delete them.",
+        "PL": "Załącz plik Faktury i plik Listy pakowania (Excel) do tego zamówienia. "
+        "Przełożeni mogą przeglądać i pobierać na dysk pliki podwładnych, ale nie mogą ich dodawać ani usuwać.",
+        "ZH": "为此订单附加发票文件和装箱单文件（Excel）。"
+        "主管可以查看并下载下属的文件到电脑，但不能添加或删除。",
+        "DE": "Fügen Sie dieser Bestellung die Rechnungsdatei und die Packlisten-Datei (Excel) bei. "
+        "Vorgesetzte können Dateien von Untergebenen einsehen und auf den PC herunterladen, aber nicht hinzufügen oder löschen.",
+    },
+    "orders.col_help.step1": {
+        "EN": "1. Check the columns you want to see in the table.",
+        "PL": "1. Zaznacz kolumny, które chcesz widzieć w tabeli.",
+        "ZH": "1. 勾选您想在表格中看到的列。",
+        "DE": "1. Haken Sie die Spalten an, die Sie in der Tabelle sehen möchten.",
+    },
+    "orders.col_help.step2": {
+        "EN": "2. Set row height in pixels (recommended 36–48; lower = more rows visible).",
+        "PL": "2. Ustaw wysokość wiersza w pikselach (zalecane 36–48; niżej = więcej wierszy widocznych).",
+        "ZH": "2. 以像素设置行高（建议36-48；越低=可见行越多）。",
+        "DE": "2. Zeilenhöhe in Pixeln festlegen (empfohlen 36–48; niedriger = mehr Zeilen sichtbar).",
+    },
+    "orders.col_help.step3": {
+        "EN": "3. Enable Invoice or Packing table if needed.",
+        "PL": "3. Włącz tabelę Faktur lub Pakowania jeśli potrzeba.",
+        "ZH": "3. 如需要，启用发票或装箱表格。",
+        "DE": "3. Rechnung- oder Packtisch aktivieren, wenn nötig.",
+    },
+    "orders.col_help.step4": {
+        "EN": "4. Set each column width or leave 0 for auto.",
+        "PL": "4. Ustaw szerokość każdej kolumny lub zostaw 0 dla auto.",
+        "ZH": "4. 设置每列宽度或留0表示自动。",
+        "DE": "4. Breite jeder Spalte festlegen oder 0 für automatisch lassen.",
+    },
+    "orders.col_help.step5": {
+        "EN": "5. «Save» — settings are synced across all devices.",
+        "PL": "5. «Zapisz» — ustawienia są synchronizowane na wszystkich urządzeniach.",
+        "ZH": "5. «保存» — 设置在所有设备上同步。",
+        "DE": "5. «Speichern» — Einstellungen werden auf allen Geräten synchronisiert.",
+    },
+    "orders.col_help.step6": {
+        "EN": "«Reset» — restores all column widths to default values.",
+        "PL": "«Resetuj» — przywraca wszystkie szerokości kolumn do wartości domyślnych.",
+        "ZH": "«重置» — 将所有列宽恢复为默认值。",
+        "DE": "«Zurücksetzen» — stellt alle Spaltenbreiten auf Standardwerte zurück.",
+    },
+    "orders.rate_help.desc": {
+        "EN": "Enter the rate: how many USD equals 1 unit of the given currency.",
+        "PL": "Wprowadź kurs: ile USD kosztuje 1 jednostka danej waluty.",
+        "ZH": "输入汇率：1单位指定货币等于多少美元。",
+        "DE": "Kurs eingeben: Wie viele USD entsprechen 1 Einheit der angegebenen Währung.",
+    },
+    "orders.rate_help.example": {
+        "EN": "Example CNY: if 1 USD = 7.25 CNY → enter 0.138 (= 1 ÷ 7.25).",
+        "PL": "Przykład CNY: jeśli 1 USD = 7,25 CNY → wpisz 0,138 (= 1 ÷ 7,25).",
+        "ZH": "示例CNY：如果1 USD = 7.25 CNY → 输入0.138（= 1 ÷ 7.25）。",
+        "DE": "Beispiel CNY: wenn 1 USD = 7,25 CNY → 0,138 eingeben (= 1 ÷ 7,25).",
+    },
+    "orders.rate_help.skip": {
+        "EN": "«Skip» — saves the order without USD conversion.",
+        "PL": "«Pomiń» — zapisuje zamówienie bez konwersji na USD.",
+        "ZH": "«跳过» — 保存订单而不进行USD换算。",
+        "DE": "«Überspringen» — speichert die Bestellung ohne USD-Umrechnung.",
+    },
+    "orders.qadd_help.step1": {
+        "EN": "1. Select Region from the list.",
+        "PL": "1. Wybierz Region z listy.",
+        "ZH": "1. 从列表中选择地区。",
+        "DE": "1. Region aus der Liste auswählen.",
+    },
+    "orders.qadd_help.step2": {
+        "EN": "2. Click the «Date» field and pick the order date from the calendar.",
+        "PL": "2. Kliknij pole «Data» i wybierz datę zamówienia z kalendarza.",
+        "ZH": "2. 点击«日期»字段，从日历中选择订单日期。",
+        "DE": "2. Auf das Feld «Datum» klicken und Bestelldatum im Kalender auswählen.",
+    },
+    "orders.qadd_help.step3": {
+        "EN": "3. Select order status.",
+        "PL": "3. Wybierz status zamówienia.",
+        "ZH": "3. 选择订单状态。",
+        "DE": "3. Bestellstatus auswählen.",
+    },
+    "orders.qadd_help.step4": {
+        "EN": "4. Select a Supplier from the list.",
+        "PL": "4. Wybierz Dostawcę z listy.",
+        "ZH": "4. 从列表中选择供应商。",
+        "DE": "4. Lieferant aus der Liste auswählen.",
+    },
+    "orders.qadd_help.step5": {
+        "EN": "5. Click «Create».",
+        "PL": "5. Kliknij «Utwórz».",
+        "ZH": "5. 点击«创建»。",
+        "DE": "5. Auf «Erstellen» klicken.",
+    },
+    "orders.qadd_help.note": {
+        "EN": "After creation, open the order to fill in the remaining fields.",
+        "PL": "Po utworzeniu otwórz zamówienie, aby wypełnić pozostałe pola.",
+        "ZH": "创建后，打开订单填写其余字段。",
+        "DE": "Nach dem Erstellen die Bestellung öffnen, um die restlichen Felder auszufüllen.",
+    },
+    "orders.edit_help.step1": {
+        "EN": "1. Choose mode: «1 product» or «multiple products» in one order.",
+        "PL": "1. Wybierz tryb: «1 produkt» lub «wiele produktów» w jednym zamówieniu.",
+        "ZH": "1. 选择模式：«1个产品»或«多个产品»在一个订单中。",
+        "DE": "1. Modus wählen: «1 Produkt» oder «mehrere Produkte» in einer Bestellung.",
+    },
+    "orders.edit_help.step2": {
+        "EN": "2. Set Region and Order date (📅 opens the calendar).",
+        "PL": "2. Ustaw Region i Datę zamówienia (📅 otwiera kalendarz).",
+        "ZH": "2. 设置地区和订单日期（📅打开日历）。",
+        "DE": "2. Region und Bestelldatum festlegen (📅 öffnet den Kalender).",
+    },
+    "orders.edit_help.step3": {
+        "EN": "3. Select Supplier and Delivery method.",
+        "PL": "3. Wybierz Dostawcę i Sposób dostawy.",
+        "ZH": "3. 选择供应商和配送方式。",
+        "DE": "3. Lieferant und Liefermethode auswählen.",
+    },
+    "orders.edit_help.step4": {
+        "EN": "4. Fill in product, quantity, amount, currency and exchange rate.",
+        "PL": "4. Wpisz produkt, ilość, kwotę, walutę i kurs wymiany.",
+        "ZH": "4. 填写产品、数量、金额、货币和汇率。",
+        "DE": "4. Produkt, Menge, Betrag, Währung und Wechselkurs ausfüllen.",
+    },
+    "orders.edit_help.step5": {
+        "EN": "5. Enter Invoice # and Accounting # if available.",
+        "PL": "5. Wpisz Nr Faktury i Nr księgowy jeśli dostępne.",
+        "ZH": "5. 输入发票编号和记账编号（如有）。",
+        "DE": "5. Rechnungsnr. und Buchhaltungsnr. eingeben, falls vorhanden.",
+    },
+    "orders.edit_help.step6": {
+        "EN": "6. Set Status and dates for each stage: production → dispatch → warehouse → acceptance.",
+        "PL": "6. Ustaw Status i daty każdego etapu: produkcja → wysyłka → magazyn → przyjęcie.",
+        "ZH": "6. 设置状态和每个阶段的日期：生产→发货→仓库→验收。",
+        "DE": "6. Status und Daten für jede Stufe festlegen: Produktion → Versand → Lager → Annahme.",
+    },
+    "orders.edit_help.step7": {
+        "EN": "7. Enter the actual weight for unpacking.",
+        "PL": "7. Wprowadź rzeczywistą wagę do rozpakowywania.",
+        "ZH": "7. 输入拆包的实际重量。",
+        "DE": "7. Tatsächliches Gewicht zum Auspacken eingeben.",
+    },
+    "orders.edit_help.step8": {
+        "EN": "8. Click «Save». Changes are synced in the background.",
+        "PL": "8. Kliknij «Zapisz». Zmiany są synchronizowane w tle.",
+        "ZH": "8. 点击«保存»。更改在后台同步。",
+        "DE": "8. Auf «Speichern» klicken. Änderungen werden im Hintergrund synchronisiert.",
+    },
+    # ── products_view ─────────────────────────────────────────────────────
+    "products.help.title": {
+        "EN": "Help — Products",
+        "PL": "Pomoc — Produkty",
+        "ZH": "帮助 — 产品",
+        "DE": "Hilfe — Produkte",
+    },
+    "products.help.desc": {
+        "EN": "Product catalogue: name, supplier, packaging, purchase price, weight, photos. Filter by category, brand or series.",
+        "PL": "Katalog produktów: nazwa, dostawca, opakowanie, cena zakupu, waga, zdjęcia. Filtruj wg kategorii, marki lub serii.",
+        "ZH": "产品目录：名称、供应商、包装、进价、重量、照片。按类别、品牌或系列筛选。",
+        "DE": "Produktkatalog: Name, Lieferant, Verpackung, Einkaufspreis, Gewicht, Fotos. Filter nach Kategorie, Marke oder Serie.",
+    },
+    "products.help.steps_title": {
+        "EN": "How to use",
+        "PL": "Jak używać",
+        "ZH": "使用方法",
+        "DE": "So verwenden Sie es",
+    },
+    "products.help.step1": {
+        "EN": "1. Filter by category, brand or series using the dropdowns.",
+        "PL": "1. Filtruj wg kategorii, marki lub serii przy użyciu list rozwijanych.",
+        "ZH": "1. 使用下拉菜单按类别、品牌或系列筛选。",
+        "DE": "1. Nach Kategorie, Marke oder Serie über Dropdowns filtern.",
+    },
+    "products.help.step2": {
+        "EN": "2. Click on a product card → opens view/edit.",
+        "PL": "2. Kliknij kartę produktu → otwiera podgląd/edycję.",
+        "ZH": "2. 点击产品卡片 → 打开查看/编辑。",
+        "DE": "2. Auf Produktkarte klicken → Ansicht/Bearbeitung öffnet sich.",
+    },
+    "products.help.step3": {
+        "EN": "3. «Add product» — create a new catalogue entry manually.",
+        "PL": "3. «Dodaj produkt» — utwórz nową pozycję katalogu ręcznie.",
+        "ZH": "3. «添加产品» — 手动创建新目录条目。",
+        "DE": "3. «Produkt hinzufügen» — neuen Katalogeintrag manuell erstellen.",
+    },
+    "products.help.step4": {
+        "EN": "4. «Complete series» — convert an unfinished series into a full product.",
+        "PL": "4. «Dokończ serię» — konwertuj niedokończoną serię na pełny produkt.",
+        "ZH": "4. «完成系列» — 将未完成的系列转换为完整产品。",
+        "DE": "4. «Serie fertigstellen» — unfertige Serie in volles Produkt umwandeln.",
+    },
+    "products.help.step5": {
+        "EN": "5. «Product from template» — bulk import of products via Excel file.",
+        "PL": "5. «Produkt z szablonu» — masowy import produktów przez plik Excel.",
+        "ZH": "5. «从模板添加产品» — 通过Excel文件批量导入产品。",
+        "DE": "5. «Produkt aus Vorlage» — Massenimport von Produkten per Excel-Datei.",
+    },
+    "products.help.step6": {
+        "EN": "6. In the product card: Photos / Compatibility / Sizes tabs for respective data.",
+        "PL": "6. W karcie produktu: zakładki Zdjęcia / Kompatybilność / Rozmiary.",
+        "ZH": "6. 在产品卡片中：照片/兼容性/尺寸选项卡。",
+        "DE": "6. In der Produktkarte: Tabs Fotos / Kompatibilität / Größen.",
+    },
+    "products.series_help.desc": {
+        "EN": "Converts an unfinished series into a full product in the catalogue.",
+        "PL": "Konwertuje niedokończoną serię na pełny produkt w katalogu.",
+        "ZH": "将未完成的系列转换为目录中的完整产品。",
+        "DE": "Wandelt eine unfertige Serie in ein vollständiges Produkt im Katalog um.",
+    },
+    "products.series_help.step1": {
+        "EN": "1. Find the series in the search field or select from the list.",
+        "PL": "1. Znajdź serię w polu wyszukiwania lub wybierz z listy.",
+        "ZH": "1. 在搜索字段中找到系列或从列表中选择。",
+        "DE": "1. Serie im Suchfeld finden oder aus der Liste auswählen.",
+    },
+    "products.series_help.step2": {
+        "EN": "2. Fill in product name, supplier, packaging, price.",
+        "PL": "2. Wpisz nazwę produktu, dostawcę, opakowanie, cenę.",
+        "ZH": "2. 填写产品名称、供应商、包装、价格。",
+        "DE": "2. Produktname, Lieferant, Verpackung, Preis ausfüllen.",
+    },
+    "products.series_help.step3": {
+        "EN": "3. Add photos (up to 3) if needed.",
+        "PL": "3. Dodaj zdjęcia (do 3) jeśli potrzeba.",
+        "ZH": "3. 如需要，添加照片（最多3张）。",
+        "DE": "3. Fotos hinzufügen (bis zu 3), falls nötig.",
+    },
+    "products.series_help.step4": {
+        "EN": "4. Click «Save» — the series becomes a full product.",
+        "PL": "4. Kliknij «Zapisz» — seria staje się pełnym produktem.",
+        "ZH": "4. 点击«保存» — 系列将成为完整产品。",
+        "DE": "4. Auf «Speichern» klicken — die Serie wird zum vollständigen Produkt.",
+    },
+    "products.edit_help.step1": {
+        "EN": "1. Select company, region, category.",
+        "PL": "1. Wybierz firmę, region, kategorię.",
+        "ZH": "1. 选择公司、地区、类别。",
+        "DE": "1. Unternehmen, Region, Kategorie auswählen.",
+    },
+    "products.edit_help.step2": {
+        "EN": "2. Enter product name, select supplier and packaging type.",
+        "PL": "2. Wpisz nazwę produktu, wybierz dostawcę i typ opakowania.",
+        "ZH": "2. 输入产品名称，选择供应商和包装类型。",
+        "DE": "2. Produktname eingeben, Lieferant und Verpackungstyp auswählen.",
+    },
+    "products.edit_help.step3": {
+        "EN": "3. Enter purchase price, weight, barcode.",
+        "PL": "3. Wpisz cenę zakupu, wagę, kod kreskowy.",
+        "ZH": "3. 输入进价、重量、条形码。",
+        "DE": "3. Einkaufspreis, Gewicht, Strichcode eingeben.",
+    },
+    "products.edit_help.step4": {
+        "EN": "4. Upload up to 3 photos using the «Photo» button.",
+        "PL": "4. Prześlij do 3 zdjęć przyciskiem «Zdjęcie».",
+        "ZH": "4. 使用«照片»按钮上传最多3张照片。",
+        "DE": "4. Bis zu 3 Fotos über die Schaltfläche «Foto» hochladen.",
+    },
+    "products.edit_help.step5": {
+        "EN": "5. «Compatibility» tab — link to accessories.",
+        "PL": "5. Zakładka «Kompatybilność» — powiązanie z akcesoriami.",
+        "ZH": "5. «兼容性»选项卡 — 与配件的关联。",
+        "DE": "5. Tab «Kompatibilität» — Verknüpfung mit Zubehör.",
+    },
+    "products.edit_help.step6": {
+        "EN": "6. «Sizes» tab — Xiaomi dimensions if needed.",
+        "PL": "6. Zakładka «Rozmiary» — wymiary Xiaomi jeśli potrzeba.",
+        "ZH": "6. «尺寸»选项卡 — 如需要，小米尺寸。",
+        "DE": "6. Tab «Größen» — Xiaomi-Abmessungen falls benötigt.",
+    },
+    "products.edit_help.step7": {
+        "EN": "7. Click «Save».",
+        "PL": "7. Kliknij «Zapisz».",
+        "ZH": "7. 点击«保存»。",
+        "DE": "7. Auf «Speichern» klicken.",
+    },
+    # ── Categories & Brands ─────────────────────────────────────────────
+    "categories.help.desc": {
+        "EN": "Manage the product hierarchy: categories, subcategories, series, brands and their relationships.",
+        "PL": "Zarządzaj hierarchią produktów: kategoriami, podkategoriami, seriami, markami i ich powiązaniami.",
+        "ZH": "管理产品层次结构：类别、子类别、系列、品牌及其关系。",
+        "DE": "Produkthierarchie verwalten: Kategorien, Unterkategorien, Serien, Marken und deren Beziehungen.",
+    },
+    "categories.help.steps_title": {
+        "EN": "How to use",
+        "PL": "Jak korzystać",
+        "ZH": "使用方法",
+        "DE": "Verwendung",
+    },
+    "categories.help.step1": {
+        "EN": "1. Use the «Categories» tab to create and manage the category tree.",
+        "PL": "1. Użyj zakładki «Kategorie», aby tworzyć drzewo kategorii.",
+        "ZH": "1. 使用«类别»选项卡创建和管理类别树。",
+        "DE": "1. Verwenden Sie den Tab «Kategorien», um den Kategoriebaum zu erstellen.",
+    },
+    "categories.help.step2": {
+        "EN": "2. Add subcategories and series inside each category.",
+        "PL": "2. Dodawaj podkategorie i serie wewnątrz każdej kategorii.",
+        "ZH": "2. 在每个类别中添加子类别和系列。",
+        "DE": "2. Fügen Sie Unterkategorien und Serien in jede Kategorie hinzu.",
+    },
+    "categories.help.step3": {
+        "EN": "3. Use the «Brands» tab to create brands and link them to categories/series.",
+        "PL": "3. Użyj zakładki «Marki», aby tworzyć marki i łączyć je z kategoriami/seriami.",
+        "ZH": "3. 使用«品牌»选项卡创建品牌并将其与类别/系列关联。",
+        "DE": "3. Verwenden Sie den Tab «Marken», um Marken zu erstellen und mit Kategorien/Serien zu verknüpfen.",
+    },
+    "categories.help.step4": {
+        "EN": "4. Click the pencil icon to edit any item in the list.",
+        "PL": "4. Kliknij ikonę ołówka, aby edytować dowolny element listy.",
+        "ZH": "4. 点击铅笔图标编辑列表中的任何项目。",
+        "DE": "4. Klicken Sie auf das Stiftsymbol, um ein Element in der Liste zu bearbeiten.",
+    },
+    "categories.help.step5": {
+        "EN": "5. Use the trash icon to delete items (hierarchy will be removed).",
+        "PL": "5. Użyj ikony kosza, aby usuwać elementy (hierarchia zostanie usunięta).",
+        "ZH": "5. 使用垃圾桶图标删除项目（层次结构将被移除）。",
+        "DE": "5. Verwenden Sie das Papierkorbsymbol zum Löschen von Elementen (Hierarchie wird entfernt).",
+    },
+    "categories.help.step6": {
+        "EN": "6. Changes take effect immediately for all products linked to this category.",
+        "PL": "6. Zmiany obowiązują natychmiast dla wszystkich produktów powiązanych z tą kategorią.",
+        "ZH": "6. 更改立即对与此类别关联的所有产品生效。",
+        "DE": "6. Änderungen gelten sofort für alle mit dieser Kategorie verknüpften Produkte.",
+    },
+    # Category dialog
+    "categories.cat_help.step1": {
+        "EN": "1. Enter the category name.",
+        "PL": "1. Wprowadź nazwę kategorii.",
+        "ZH": "1. 输入类别名称。",
+        "DE": "1. Kategoriename eingeben.",
+    },
+    "categories.cat_help.step2": {
+        "EN": "2. Specify the category code (used in reports).",
+        "PL": "2. Podaj kod kategorii (używany w raportach).",
+        "ZH": "2. 指定类别代码（用于报表）。",
+        "DE": "2. Kategoriencode angeben (wird in Berichten verwendet).",
+    },
+    "categories.cat_help.step3": {
+        "EN": "3. Set the sort order if needed.",
+        "PL": "3. Ustaw kolejność sortowania, jeśli potrzeba.",
+        "ZH": "3. 如需要，设置排序顺序。",
+        "DE": "3. Sortierreihenfolge festlegen, falls benötigt.",
+    },
+    "categories.cat_help.step4": {
+        "EN": "4. Click «Save» to confirm.",
+        "PL": "4. Kliknij «Zapisz», aby potwierdzić.",
+        "ZH": "4. 点击«保存»确认。",
+        "DE": "4. Klicken Sie auf «Speichern», um zu bestätigen.",
+    },
+    # Brand edit dialog
+    "categories.brand_help.step1": {
+        "EN": "1. Enter the brand name.",
+        "PL": "1. Wprowadź nazwę marki.",
+        "ZH": "1. 输入品牌名称。",
+        "DE": "1. Markenname eingeben.",
+    },
+    "categories.brand_help.step2": {
+        "EN": "2. Select the trademark type.",
+        "PL": "2. Wybierz typ znaku towarowego.",
+        "ZH": "2. 选择商标类型。",
+        "DE": "2. Markentyp auswählen.",
+    },
+    "categories.brand_help.step3": {
+        "EN": "3. Update links to categories and series as needed.",
+        "PL": "3. Zaktualizuj powiązania z kategoriami i seriami według potrzeb.",
+        "ZH": "3. 根据需要更新与类别和系列的链接。",
+        "DE": "3. Links zu Kategorien und Serien nach Bedarf aktualisieren.",
+    },
+    "categories.brand_help.step4": {
+        "EN": "4. Click «Save» to apply changes.",
+        "PL": "4. Kliknij «Zapisz», aby zastosować zmiany.",
+        "ZH": "4. 点击«保存»应用更改。",
+        "DE": "4. Klicken Sie auf «Speichern», um Änderungen zu übernehmen.",
+    },
+    # New brand dialog
+    "categories.new_brand_help.step1": {
+        "EN": "1. Select the category and subcategory.",
+        "PL": "1. Wybierz kategorię i podkategorię.",
+        "ZH": "1. 选择类别和子类别。",
+        "DE": "1. Kategorie und Unterkategorie auswählen.",
+    },
+    "categories.new_brand_help.step2": {
+        "EN": "2. Select the series (if applicable).",
+        "PL": "2. Wybierz serię (jeśli dotyczy).",
+        "ZH": "2. 选择系列（如适用）。",
+        "DE": "2. Serie auswählen (falls zutreffend).",
+    },
+    "categories.new_brand_help.step3": {
+        "EN": "3. Enter the brand name.",
+        "PL": "3. Wprowadź nazwę marki.",
+        "ZH": "3. 输入品牌名称。",
+        "DE": "3. Markenname eingeben.",
+    },
+    "categories.new_brand_help.step4": {
+        "EN": "4. Specify the trademark type.",
+        "PL": "4. Określ typ znaku towarowego.",
+        "ZH": "4. 指定商标类型。",
+        "DE": "4. Markentyp angeben.",
+    },
+    "categories.new_brand_help.step5": {
+        "EN": "5. Click «Save».",
+        "PL": "5. Kliknij «Zapisz».",
+        "ZH": "5. 点击«保存»。",
+        "DE": "5. Auf «Speichern» klicken.",
+    },
+    # Level dialog
+    "categories.level_help.step1": {
+        "EN": "1. Enter the hierarchy level name.",
+        "PL": "1. Wprowadź nazwę poziomu hierarchii.",
+        "ZH": "1. 输入层次级别名称。",
+        "DE": "1. Name der Hierarchieebene eingeben.",
+    },
+    "categories.level_help.step2": {
+        "EN": "2. Click «Save».",
+        "PL": "2. Kliknij «Zapisz».",
+        "ZH": "2. 点击«保存»。",
+        "DE": "2. Auf «Speichern» klicken.",
+    },
+    # Subcategory dialog
+    "categories.subcat_help.step1": {
+        "EN": "1. Enter the subcategory name.",
+        "PL": "1. Wprowadź nazwę podkategorii.",
+        "ZH": "1. 输入子类别名称。",
+        "DE": "1. Unterkategoriename eingeben.",
+    },
+    "categories.subcat_help.step2": {
+        "EN": "2. Or select from the list for quick fill.",
+        "PL": "2. Lub wybierz z listy, aby szybko wypełnić.",
+        "ZH": "2. 或从列表中选择以快速填写。",
+        "DE": "2. Oder aus der Liste auswählen für schnelles Ausfüllen.",
+    },
+    "categories.subcat_help.step3": {
+        "EN": "3. Click «Save».",
+        "PL": "3. Kliknij «Zapisz».",
+        "ZH": "3. 点击«保存»。",
+        "DE": "3. Auf «Speichern» klicken.",
+    },
+    # Series dialog
+    "categories.series_dlg_help.step1": {
+        "EN": "1. Enter the series name.",
+        "PL": "1. Wprowadź nazwę serii.",
+        "ZH": "1. 输入系列名称。",
+        "DE": "1. Serienname eingeben.",
+    },
+    "categories.series_dlg_help.step2": {
+        "EN": "2. Click «Save».",
+        "PL": "2. Kliknij «Zapisz».",
+        "ZH": "2. 点击«保存»。",
+        "DE": "2. Auf «Speichern» klicken.",
+    },
+    # ── Order Schedule ────────────────────────────────────────────────────
+    "schedule.help.desc": {
+        "EN": "Purchase schedule: plan order volumes and budgets by month for each product.",
+        "PL": "Harmonogram zakupów: planuj wolumeny zamówień i budżety według miesiąca dla każdego produktu.",
+        "ZH": "采购计划：按月为每个产品规划订单量和预算。",
+        "DE": "Einkaufsplan: Bestellmengen und Budgets je Monat für jedes Produkt planen.",
+    },
+    "schedule.help.steps_title": {
+        "EN": "How to use",
+        "PL": "Jak korzystać",
+        "ZH": "使用方法",
+        "DE": "Verwendung",
+    },
+    "schedule.help.step1": {
+        "EN": "1. Rows are products, columns are months.",
+        "PL": "1. Wiersze to produkty, kolumny to miesiące.",
+        "ZH": "1. 行是产品，列是月份。",
+        "DE": "1. Zeilen sind Produkte, Spalten sind Monate.",
+    },
+    "schedule.help.step2": {
+        "EN": "2. Click a cell to enter the planned order quantity.",
+        "PL": "2. Kliknij komórkę, aby wprowadzić planowaną ilość zamówienia.",
+        "ZH": "2. 点击单元格输入计划订单数量。",
+        "DE": "2. Klicken Sie auf eine Zelle, um die geplante Bestellmenge einzugeben.",
+    },
+    "schedule.help.step3": {
+        "EN": "3. «Budget» — view the planned budget by months and categories.",
+        "PL": "3. «Budżet» — przeglądaj planowany budżet według miesięcy i kategorii.",
+        "ZH": "3. «预算» — 按月份和类别查看计划预算。",
+        "DE": "3. «Budget» — geplantes Budget nach Monaten und Kategorien anzeigen.",
+    },
+    "schedule.help.step4": {
+        "EN": "4. «Table» — configure visible columns and their sizes.",
+        "PL": "4. «Tabela» — konfiguruj widoczne kolumny i ich rozmiary.",
+        "ZH": "4. «表格» — 配置可见列及其大小。",
+        "DE": "4. «Tabelle» — sichtbare Spalten und deren Größen konfigurieren.",
+    },
+    "schedule.help.step5": {
+        "EN": "5. «+Note» — add a planned position or note to the schedule.",
+        "PL": "5. «+Notatka» — dodaj planowaną pozycję lub notatkę do harmonogramu.",
+        "ZH": "5. «+备注» — 向计划中添加计划位置或备注。",
+        "DE": "5. «+Notiz» — eine geplante Position oder Notiz zum Plan hinzufügen.",
+    },
+    "schedule.help.step6": {
+        "EN": "6. Product rows can be merged and split.",
+        "PL": "6. Wiersze produktów można łączyć i dzielić.",
+        "ZH": "6. 产品行可以合并和拆分。",
+        "DE": "6. Produktzeilen können zusammengeführt und aufgeteilt werden.",
+    },
+    "schedule.help.step7": {
+        "EN": "7. Archive months are kept for viewing in the «Archive» column.",
+        "PL": "7. Archiwalne miesiące są przechowywane do wglądu w kolumnie «Archiwum».",
+        "ZH": "7. 存档月份保存在«存档»列中供查看。",
+        "DE": "7. Archivmonate werden zur Ansicht in der «Archiv»-Spalte gespeichert.",
+    },
+    "schedule.tbl_help.step1": {
+        "EN": "1. «Columns» — enable/disable columns.",
+        "PL": "1. «Kolumny» — włącz/wyłącz kolumny.",
+        "ZH": "1. «列» — 启用/禁用列。",
+        "DE": "1. «Spalten» — Spalten aktivieren/deaktivieren.",
+    },
+    "schedule.tbl_help.step2": {
+        "EN": "2. «Sizes» — configure column widths and row heights.",
+        "PL": "2. «Rozmiary» — konfiguruj szerokości kolumn i wysokości wierszy.",
+        "ZH": "2. «尺寸» — 配置列宽和行高。",
+        "DE": "2. «Größen» — Spaltenbreiten und Zeilenhöhen konfigurieren.",
+    },
+    "schedule.tbl_help.step3": {
+        "EN": "3. Click «Close».",
+        "PL": "3. Kliknij «Zamknij».",
+        "ZH": "3. 点击«关闭»。",
+        "DE": "3. Auf «Schließen» klicken.",
+    },
+    "schedule.budget_help.step1": {
+        "EN": "1. Select grouping mode (category/level/name).",
+        "PL": "1. Wybierz tryb grupowania (kategoria/poziom/nazwa).",
+        "ZH": "1. 选择分组模式（类别/级别/名称）。",
+        "DE": "1. Gruppierungsmodus auswählen (Kategorie/Ebene/Name).",
+    },
+    "schedule.budget_help.step2": {
+        "EN": "2. Select the currency for calculation.",
+        "PL": "2. Wybierz walutę do obliczeń.",
+        "ZH": "2. 选择计算货币。",
+        "DE": "2. Währung für die Berechnung auswählen.",
+    },
+    "schedule.budget_help.step3": {
+        "EN": "3. The table shows planned amounts by month for each group.",
+        "PL": "3. Tabela pokazuje planowane kwoty według miesięcy dla każdej grupy.",
+        "ZH": "3. 表格显示每组按月份的计划金额。",
+        "DE": "3. Die Tabelle zeigt geplante Beträge nach Monat für jede Gruppe.",
+    },
+    "schedule.cols_help.step1": {
+        "EN": "1. Enable/disable the Archive column display.",
+        "PL": "1. Włącz/wyłącz wyświetlanie kolumny Archiwum.",
+        "ZH": "1. 启用/禁用存档列显示。",
+        "DE": "1. Anzeige der Archivspalte aktivieren/deaktivieren.",
+    },
+    "schedule.cols_help.step2": {
+        "EN": "2. Select the right block order (Archive → Months or vice versa).",
+        "PL": "2. Wybierz kolejność prawego bloku (Archiwum → Miesiące lub odwrotnie).",
+        "ZH": "2. 选择右侧区块顺序（存档→月份或相反）。",
+        "DE": "2. Reihenfolge des rechten Blocks wählen (Archiv → Monate oder umgekehrt).",
+    },
+    "schedule.cols_help.step3": {
+        "EN": "3. Set the number of visible months.",
+        "PL": "3. Ustaw liczbę widocznych miesięcy.",
+        "ZH": "3. 设置可见月份数量。",
+        "DE": "3. Anzahl sichtbarer Monate festlegen.",
+    },
+    "schedule.cols_help.step4": {
+        "EN": "4. Click «Save».",
+        "PL": "4. Kliknij «Zapisz».",
+        "ZH": "4. 点击«保存»。",
+        "DE": "4. Auf «Speichern» klicken.",
+    },
+    "schedule.sizes_help.step1": {
+        "EN": "1. Enter the width (px) for each column.",
+        "PL": "1. Wprowadź szerokość (px) dla każdej kolumny.",
+        "ZH": "1. 输入每列的宽度（px）。",
+        "DE": "1. Breite (px) für jede Spalte eingeben.",
+    },
+    "schedule.sizes_help.step2": {
+        "EN": "2. Set the row height and card height.",
+        "PL": "2. Ustaw wysokość wiersza i kartki.",
+        "ZH": "2. 设置行高和卡片高度。",
+        "DE": "2. Zeilenhöhe und Kartenhöhe festlegen.",
+    },
+    "schedule.sizes_help.step3": {
+        "EN": "3. Configure text size and line wrapping.",
+        "PL": "3. Konfiguruj rozmiar tekstu i zawijanie wierszy.",
+        "ZH": "3. 配置文本大小和自动换行。",
+        "DE": "3. Textgröße und Zeilenumbruch konfigurieren.",
+    },
+    "schedule.sizes_help.step4": {
+        "EN": "4. Click «Save».",
+        "PL": "4. Kliknij «Zapisz».",
+        "ZH": "4. 点击«保存»。",
+        "DE": "4. Auf «Speichern» klicken.",
+    },
+    "schedule.custom_name_help.step1": {
+        "EN": "1. Enter a custom name for the row.",
+        "PL": "1. Wprowadź własną nazwę wiersza.",
+        "ZH": "1. 输入行的自定义名称。",
+        "DE": "1. Benutzerdefinierten Namen für die Zeile eingeben.",
+    },
+    "schedule.custom_name_help.step2": {
+        "EN": "2. «Reset» to restore the automatic name.",
+        "PL": "2. «Resetuj», aby przywrócić automatyczną nazwę.",
+        "ZH": "2. «重置»恢复自动名称。",
+        "DE": "2. «Zurücksetzen», um den automatischen Namen wiederherzustellen.",
+    },
+    "schedule.custom_name_help.step3": {
+        "EN": "3. Click «Save».",
+        "PL": "3. Kliknij «Zapisz».",
+        "ZH": "3. 点击«保存»。",
+        "DE": "3. Auf «Speichern» klicken.",
+    },
+    "schedule.note_help.step1": {
+        "EN": "1. Enter the position or note name.",
+        "PL": "1. Wprowadź nazwę pozycji lub notatki.",
+        "ZH": "1. 输入位置或备注名称。",
+        "DE": "1. Positions- oder Notizname eingeben.",
+    },
+    "schedule.note_help.step2": {
+        "EN": "2. Select a category.",
+        "PL": "2. Wybierz kategorię.",
+        "ZH": "2. 选择类别。",
+        "DE": "2. Kategorie auswählen.",
+    },
+    "schedule.note_help.step3": {
+        "EN": "3. Enter the production term in days (if known).",
+        "PL": "3. Podaj termin produkcji (dni), jeśli znany.",
+        "ZH": "3. 输入生产周期（天）（如已知）。",
+        "DE": "3. Produktionsdauer in Tagen eingeben (falls bekannt).",
+    },
+    "schedule.note_help.step4": {
+        "EN": "4. Add price and currency (optional).",
+        "PL": "4. Dodaj cenę i walutę (opcjonalnie).",
+        "ZH": "4. 添加价格和货币（可选）。",
+        "DE": "4. Preis und Währung hinzufügen (optional).",
+    },
+    "schedule.note_help.step5": {
+        "EN": "5. Select hierarchy levels (subcategory, series, etc.).",
+        "PL": "5. Wybierz poziomy hierarchii (podkategoria, seria itp.).",
+        "ZH": "5. 选择层次级别（子类别、系列等）。",
+        "DE": "5. Hierarchieebenen auswählen (Unterkategorie, Serie usw.).",
+    },
+    "schedule.note_help.step6": {
+        "EN": "6. Click «Save».",
+        "PL": "6. Kliknij «Zapisz».",
+        "ZH": "6. 点击«保存»。",
+        "DE": "6. Auf «Speichern» klicken.",
+    },
+    # ── Settings ─────────────────────────────────────────────────────────
+    "settings.help.desc": {
+        "EN": "Profile, company, appearance and access settings.",
+        "PL": "Ustawienia profilu, firmy, wyglądu i dostępów.",
+        "ZH": "个人资料、公司、外观和访问设置。",
+        "DE": "Einstellungen für Profil, Unternehmen, Erscheinungsbild und Zugänge.",
+    },
+    "settings.help.steps_title": {
+        "EN": "Company setup (first)",
+        "PL": "Konfiguracja firmy (najpierw)",
+        "ZH": "公司设置（首先）",
+        "DE": "Unternehmenseinrichtung (zuerst)",
+    },
+    "settings.help.step1": {
+        "EN": "1. «Regions» — create the regions your company operates in. This is the foundation: everything below is tied to a region.",
+        "PL": "1. «Regiony» — utwórz regiony, w których działa firma. To podstawa: wszystko poniżej jest powiązane z regionem.",
+        "ZH": "1. «地区» — 创建公司经营所在的地区。这是基础：以下所有内容都与地区相关联。",
+        "DE": "1. «Regionen» — Erstellen Sie die Regionen, in denen das Unternehmen tätig ist. Das ist die Grundlage: Alles Weitere ist mit einer Region verknüpft.",
+    },
+    "settings.help.step2": {
+        "EN": "2. «Default levels by region» — configure the category hierarchy for each region.",
+        "PL": "2. «Domyślne poziomy według regionów» — skonfiguruj hierarchię kategorii dla każdego regionu.",
+        "ZH": "2. «各地区默认层级» — 为每个地区配置类别层次结构。",
+        "DE": "2. «Standardebenen nach Regionen» — konfigurieren Sie die Kategoriehierarchie für jede Region.",
+    },
+    "settings.help.step3": {
+        "EN": "3. «Price segmentation» — set price tiers (e.g. retail/wholesale) for each region.",
+        "PL": "3. «Segmentacja cen» — ustaw poziomy cen (np. detal/hurt) dla każdego regionu.",
+        "ZH": "3. «价格分级» — 为每个地区设置价格等级(例如零售/批发)。",
+        "DE": "3. «Preissegmentierung» — legen Sie Preisstufen (z. B. Einzel-/Großhandel) für jede Region fest.",
+    },
+    "settings.help.step4": {
+        "EN": "4. «Company delivery methods» — add delivery methods and base tariffs.",
+        "PL": "4. «Metody dostawy firmy» — dodaj metody dostawy i podstawowe taryfy.",
+        "ZH": "4. «公司配送方式» — 添加配送方式和基础运费。",
+        "DE": "4. «Unternehmens-Liefermethoden» — Liefermethoden und Basistarife hinzufügen.",
+    },
+    "settings.help.step5": {
+        "EN": "5. «Supplier payment fields (company)» — define which payment fields can be used for suppliers.",
+        "PL": "5. «Pola płatności dostawców (firma)» — określ, jakich pól płatności można używać u dostawców.",
+        "ZH": "5. «供应商付款字段(公司)» — 定义供应商可使用哪些付款字段。",
+        "DE": "5. «Lieferanten-Zahlungsfelder (Unternehmen)» — legen Sie fest, welche Zahlungsfelder bei Lieferanten verwendet werden können.",
+    },
+    "settings.help.step6": {
+        "EN": "6. «Company users» — create employee accounts and immediately assign them the regions and catalog sections they can access.",
+        "PL": "6. «Użytkownicy firmy» — twórz konta pracowników i od razu przypisuj im dostępne regiony i sekcje katalogu.",
+        "ZH": "6. «公司用户» — 创建员工账户，并立即为其分配可访问的地区和目录板块。",
+        "DE": "6. «Unternehmensbenutzer» — Erstellen Sie Mitarbeiterkonten und weisen Sie ihnen sofort die zugänglichen Regionen und Katalogbereiche zu.",
+    },
+    "settings.help.personal_title": {
+        "EN": "Personal settings (anytime)",
+        "PL": "Ustawienia osobiste (w dowolnym momencie)",
+        "ZH": "个人设置(随时)",
+        "DE": "Persönliche Einstellungen (jederzeit)",
+    },
+    "settings.help.step7": {
+        "EN": "7. «Personal data», «My delivery methods», «Supplier payment fields», GSM Parser, «Theme», «Personal background» — these apply only to your own account, configure them whenever you like.",
+        "PL": "7. «Dane osobowe», «Moje metody dostawy», «Pola płatności dostawców», GSM Parser, «Motyw», «Tło osobiste» — dotyczą tylko Twojego konta, skonfiguruj je w dowolnym momencie.",
+        "ZH": "7. «个人资料»、«我的配送方式»、«供应商付款字段»、GSM 采集器、«主题»、«个人背景» — 仅影响您自己的账户，可随时进行设置。",
+        "DE": "7. «Persönliche Daten», «Meine Liefermethoden», «Lieferanten-Zahlungsfelder», GSM Parser, «Design», «Persönlicher Hintergrund» — betreffen nur Ihr eigenes Konto, konfigurieren Sie sie jederzeit.",
+    },
+    "settings.help.step8": {
+        "EN": "8. Click «SAVE ALL CHANGES» at the bottom of the page to apply the changes in these blocks.",
+        "PL": "8. Kliknij «ZAPISZ WSZYSTKIE ZMIANY» na dole strony, aby zastosować zmiany w tych blokach.",
+        "ZH": "8. 点击页面底部的«保存所有更改»以应用这些区块中的更改。",
+        "DE": "8. Klicken Sie unten auf der Seite auf «ALLE ÄNDERUNGEN SPEICHERN», um die Änderungen in diesen Blöcken zu übernehmen.",
+    },
+    "settings.cols_help.step1": {
+        "EN": "1. Enable/disable columns for the delivery table.",
+        "PL": "1. Włącz/wyłącz kolumny tabeli dostaw.",
+        "ZH": "1. 启用/禁用交货表的列。",
+        "DE": "1. Spalten für die Liefertabelle aktivieren/deaktivieren.",
+    },
+    "settings.cols_help.step2": {
+        "EN": "2. Click «Save».",
+        "PL": "2. Kliknij «Zapisz».",
+        "ZH": "2. 点击«保存»。",
+        "DE": "2. Auf «Speichern» klicken.",
+    },
+    "settings.sizes_help.step1": {
+        "EN": "1. Enter the width (px) for each column of the delivery table.",
+        "PL": "1. Wprowadź szerokość (px) dla każdej kolumny tabeli dostaw.",
+        "ZH": "1. 输入交货表每列的宽度（px）。",
+        "DE": "1. Breite (px) für jede Spalte der Liefertabelle eingeben.",
+    },
+    "settings.sizes_help.step2": {
+        "EN": "2. Set the row height.",
+        "PL": "2. Ustaw wysokość wiersza.",
+        "ZH": "2. 设置行高。",
+        "DE": "2. Zeilenhöhe festlegen.",
+    },
+    "settings.sizes_help.step3": {
+        "EN": "3. Click «Save».",
+        "PL": "3. Kliknij «Zapisz».",
+        "ZH": "3. 点击«保存»。",
+        "DE": "3. Auf «Speichern» klicken.",
+    },
+    "settings.pf_help.step1": {
+        "EN": "1. Enter a field name (e.g. SWIFT, Alipay).",
+        "PL": "1. Wprowadź nazwę pola (np. SWIFT, Alipay).",
+        "ZH": "1. 输入字段名称（例如SWIFT、支付宝）。",
+        "DE": "1. Feldname eingeben (z.B. SWIFT, Alipay).",
+    },
+    "settings.pf_help.step2": {
+        "EN": "2. Add fields with the «Add field» button.",
+        "PL": "2. Dodaj pola przyciskiem «Dodaj pole».",
+        "ZH": "2. 用«添加字段»按钮添加字段。",
+        "DE": "2. Felder mit der Schaltfläche «Feld hinzufügen» hinzufügen.",
+    },
+    "settings.pf_help.step3": {
+        "EN": "3. Delete an unwanted field with the trash icon.",
+        "PL": "3. Usuń niechciane pole ikoną kosza.",
+        "ZH": "3. 用垃圾桶图标删除不需要的字段。",
+        "DE": "3. Unerwünschtes Feld mit dem Papierkorbsymbol löschen.",
+    },
+    "settings.pf_help.step4": {
+        "EN": "4. Click «Save».",
+        "PL": "4. Kliknij «Zapisz».",
+        "ZH": "4. 点击«保存»。",
+        "DE": "4. Auf «Speichern» klicken.",
+    },
+    "settings.rename_region_help.step1": {
+        "EN": "1. Enter the new region name.",
+        "PL": "1. Wprowadź nową nazwę regionu.",
+        "ZH": "1. 输入新的地区名称。",
+        "DE": "1. Neuen Regionsnamen eingeben.",
+    },
+    "settings.rename_region_help.step2": {
+        "EN": "2. Click «Save».",
+        "PL": "2. Kliknij «Zapisz».",
+        "ZH": "2. 点击«保存»。",
+        "DE": "2. Auf «Speichern» klicken.",
+    },
+    "settings.price_tiers_help.step1": {
+        "EN": "1. Enter the price tier name and select the currency.",
+        "PL": "1. Wprowadź nazwę poziomu cen i wybierz walutę.",
+        "ZH": "1. 输入价格等级名称并选择货币。",
+        "DE": "1. Name der Preisstufe eingeben und Währung auswählen.",
+    },
+    "settings.price_tiers_help.step2": {
+        "EN": "2. Add tiers with the «Add price tier» button.",
+        "PL": "2. Dodaj poziomy przyciskiem «Dodaj poziom cen».",
+        "ZH": "2. 用«添加价格等级»按钮添加等级。",
+        "DE": "2. Stufen mit «Preisstufe hinzufügen» hinzufügen.",
+    },
+    "settings.price_tiers_help.step3": {
+        "EN": "3. Delete an unwanted tier with the trash icon.",
+        "PL": "3. Usuń niechciany poziom ikoną kosza.",
+        "ZH": "3. 用垃圾桶图标删除不需要的等级。",
+        "DE": "3. Unerwünschte Stufe mit dem Papierkorbsymbol löschen.",
+    },
+    "settings.price_tiers_help.step4": {
+        "EN": "4. Click «Save».",
+        "PL": "4. Kliknij «Zapisz».",
+        "ZH": "4. 点击«保存»。",
+        "DE": "4. Auf «Speichern» klicken.",
+    },
+    "settings.hierarchy_help.step1": {
+        "EN": "1. Enter the hierarchy level names (up to 6 levels).",
+        "PL": "1. Wprowadź nazwy poziomów hierarchii (do 6 poziomów).",
+        "ZH": "1. 输入层次级别名称（最多6个级别）。",
+        "DE": "1. Namen der Hierarchieebenen eingeben (bis zu 6 Ebenen).",
+    },
+    "settings.hierarchy_help.step2": {
+        "EN": "2. These levels are automatically applied when creating a new category.",
+        "PL": "2. Te poziomy są automatycznie stosowane przy tworzeniu nowej kategorii.",
+        "ZH": "2. 创建新类别时会自动应用这些级别。",
+        "DE": "2. Diese Ebenen werden beim Erstellen einer neuen Kategorie automatisch angewendet.",
+    },
+    "settings.hierarchy_help.step3": {
+        "EN": "3. Click «Save».",
+        "PL": "3. Kliknij «Zapisz».",
+        "ZH": "3. 点击«保存»。",
+        "DE": "3. Auf «Speichern» klicken.",
+    },
+    "settings.regions_access_help.step1": {
+        "EN": "1. Check the regions this user will have access to.",
+        "PL": "1. Zaznacz regiony, do których ten użytkownik będzie miał dostęp.",
+        "ZH": "1. 勾选此用户将有权访问的地区。",
+        "DE": "1. Regionen markieren, auf die dieser Benutzer Zugriff haben soll.",
+    },
+    "settings.regions_access_help.step2": {
+        "EN": "2. Click «Save».",
+        "PL": "2. Kliknij «Zapisz».",
+        "ZH": "2. 点击«保存»。",
+        "DE": "2. Auf «Speichern» klicken.",
+    },
+    "settings.catalog_access_help.step1": {
+        "EN": "1. Check the catalog categories/levels this user will have access to.",
+        "PL": "1. Zaznacz kategorie/poziomy katalogu, do których użytkownik będzie miał dostęp.",
+        "ZH": "1. 勾选此用户将有权访问的目录类别/级别。",
+        "DE": "1. Katalogkategorien/-ebenen markieren, auf die der Benutzer Zugriff haben soll.",
+    },
+    "settings.catalog_access_help.step2": {
+        "EN": "2. Child nodes inherit access automatically.",
+        "PL": "2. Węzły potomne automatycznie dziedziczą dostęp.",
+        "ZH": "2. 子节点自动继承访问权限。",
+        "DE": "2. Untergeordnete Knoten erben den Zugriff automatisch.",
+    },
+    "settings.catalog_access_help.step3": {
+        "EN": "3. Click «Save».",
+        "PL": "3. Kliknij «Zapisz».",
+        "ZH": "3. 点击«保存»。",
+        "DE": "3. Auf «Speichern» klicken.",
+    },
+    # ── Media Plan ───────────────────────────────────────────────────────
+    "media.help.desc": {
+        "EN": "Publication schedule planning for products in social media.",
+        "PL": "Planowanie harmonogramu publikacji produktów w mediach społecznościowych.",
+        "ZH": "社交媒体产品发布时间表规划。",
+        "DE": "Planung des Veröffentlichungsplans für Produkte in sozialen Medien.",
+    },
+    "media.help.steps_title": {
+        "EN": "How to use",
+        "PL": "Jak korzystać",
+        "ZH": "使用方法",
+        "DE": "Verwendung",
+    },
+    "media.help.step1": {
+        "EN": "1. Rows are products, columns are days of the months.",
+        "PL": "1. Wiersze to produkty, kolumny to dni miesięcy.",
+        "ZH": "1. 行是产品，列是月份的天数。",
+        "DE": "1. Zeilen sind Produkte, Spalten sind Tage der Monate.",
+    },
+    "media.help.step2": {
+        "EN": "2. Click a cell to add or remove a publication date.",
+        "PL": "2. Kliknij komórkę, aby dodać lub usunąć datę publikacji.",
+        "ZH": "2. 点击单元格以添加或删除发布日期。",
+        "DE": "2. Klicken Sie auf eine Zelle, um ein Veröffentlichungsdatum hinzuzufügen oder zu entfernen.",
+    },
+    "media.help.step3": {
+        "EN": "3. The «Table» button configures visible columns and their sizes.",
+        "PL": "3. Przycisk «Tabela» konfiguruje widoczne kolumny i ich rozmiary.",
+        "ZH": "3. «表格»按钮配置可见列及其大小。",
+        "DE": "3. Die Schaltfläche «Tabelle» konfiguriert sichtbare Spalten und deren Größen.",
+    },
+    "media.help.step4": {
+        "EN": "4. You can merge product rows into one post or add additional posts.",
+        "PL": "4. Możesz łączyć wiersze produktów w jeden post lub dodawać dodatkowe posty.",
+        "ZH": "4. 可以将产品行合并为一个帖子或添加额外的帖子。",
+        "DE": "4. Produktzeilen können zu einem Beitrag zusammengeführt oder zusätzliche Beiträge hinzugefügt werden.",
+    },
+    "media.help.step5": {
+        "EN": "5. Filters select products that need attention (>14 days without publication).",
+        "PL": "5. Filtry wybierają produkty wymagające uwagi (>14 dni bez publikacji).",
+        "ZH": "5. 过滤器选择需要关注的产品（>14天未发布）。",
+        "DE": "5. Filter wählen Produkte aus, die Aufmerksamkeit erfordern (>14 Tage ohne Veröffentlichung).",
+    },
+    "media.help.step6": {
+        "EN": "6. «Open month from archive» — view publications from past months.",
+        "PL": "6. «Otwórz miesiąc z archiwum» — przeglądaj publikacje z poprzednich miesięcy.",
+        "ZH": "6. «从档案中打开月份» — 查看过去几个月的发布内容。",
+        "DE": "6. «Monat aus dem Archiv öffnen» — Veröffentlichungen aus vergangenen Monaten anzeigen.",
+    },
+    "media.cols_help.step1": {
+        "EN": "1. Enable/disable the required columns.",
+        "PL": "1. Włącz/wyłącz wymagane kolumny.",
+        "ZH": "1. 启用/禁用所需列。",
+        "DE": "1. Benötigte Spalten aktivieren/deaktivieren.",
+    },
+    "media.cols_help.step2": {
+        "EN": "2. Set the number of visible months.",
+        "PL": "2. Ustaw liczbę widocznych miesięcy.",
+        "ZH": "2. 设置可见月份数量。",
+        "DE": "2. Anzahl der sichtbaren Monate festlegen.",
+    },
+    "media.cols_help.step3": {
+        "EN": "3. Configure the display order of categories.",
+        "PL": "3. Skonfiguruj kolejność wyświetlania kategorii.",
+        "ZH": "3. 配置类别的显示顺序。",
+        "DE": "3. Anzeigereihenfolge der Kategorien konfigurieren.",
+    },
+    "media.cols_help.step4": {
+        "EN": "4. Click «Save».",
+        "PL": "4. Kliknij «Zapisz».",
+        "ZH": "4. 点击«保存»。",
+        "DE": "4. Auf «Speichern» klicken.",
+    },
+    "media.sizes_help.step1": {
+        "EN": "1. Enter the width (px) for each column.",
+        "PL": "1. Wprowadź szerokość (px) dla każdej kolumny.",
+        "ZH": "1. 输入每列的宽度（px）。",
+        "DE": "1. Breite (px) für jede Spalte eingeben.",
+    },
+    "media.sizes_help.step2": {
+        "EN": "2. Set the row height and text size.",
+        "PL": "2. Ustaw wysokość wiersza i rozmiar tekstu.",
+        "ZH": "2. 设置行高和文本大小。",
+        "DE": "2. Zeilenhöhe und Textgröße festlegen.",
+    },
+    "media.sizes_help.step3": {
+        "EN": "3. Click «Save».",
+        "PL": "3. Kliknij «Zapisz».",
+        "ZH": "3. 点击«保存»。",
+        "DE": "3. Auf «Speichern» klicken.",
+    },
+    "media.tbl_help.step1": {
+        "EN": "1. In the «Columns» section enable/disable the required columns.",
+        "PL": "1. W sekcji «Kolumny» włącz/wyłącz wymagane kolumny.",
+        "ZH": "1. 在«列»部分启用/禁用所需列。",
+        "DE": "1. Im Abschnitt «Spalten» benötigte Spalten aktivieren/deaktivieren.",
+    },
+    "media.tbl_help.step2": {
+        "EN": "2. In the «Sizes» section configure column widths and row heights.",
+        "PL": "2. W sekcji «Rozmiary» skonfiguruj szerokości kolumn i wysokości wierszy.",
+        "ZH": "2. 在«尺寸»部分配置列宽和行高。",
+        "DE": "2. Im Abschnitt «Größen» Spaltenbreiten und Zeilenhöhen konfigurieren.",
+    },
+    "media.tbl_help.step3": {
+        "EN": "3. Click «Close» to apply.",
+        "PL": "3. Kliknij «Zamknij», aby zastosować.",
+        "ZH": "3. 点击«关闭»应用。",
+        "DE": "3. Klicken Sie auf «Schließen», um anzuwenden.",
+    },
+    "media.custom_name_help.step1": {
+        "EN": "1. Enter a custom name for the merged product row.",
+        "PL": "1. Wprowadź własną nazwę dla scalonego wiersza produktów.",
+        "ZH": "1. 输入合并产品行的自定义名称。",
+        "DE": "1. Benutzerdefinierten Namen für die zusammengeführte Produktzeile eingeben.",
+    },
+    "media.custom_name_help.step2": {
+        "EN": "2. «Reset» removes the custom name and restores the automatic one.",
+        "PL": "2. «Resetuj» usuwa własną nazwę i przywraca automatyczną.",
+        "ZH": "2. «重置»删除自定义名称并恢复自动名称。",
+        "DE": "2. «Zurücksetzen» entfernt den benutzerdefinierten Namen und stellt den automatischen wieder her.",
+    },
+    "media.custom_name_help.step3": {
+        "EN": "3. Click «Save».",
+        "PL": "3. Kliknij «Zapisz».",
+        "ZH": "3. 点击«保存»。",
+        "DE": "3. Auf «Speichern» klicken.",
+    },
+    "media.extra_post_help.step1": {
+        "EN": "1. Enter the post name (e.g. «TikTok Ad Post»).",
+        "PL": "1. Wprowadź nazwę posta (np. «Post reklamowy TikTok»).",
+        "ZH": "1. 输入帖子名称（例如«TikTok广告帖»）。",
+        "DE": "1. Postname eingeben (z.B. «TikTok-Werbebeitrag»).",
+    },
+    "media.extra_post_help.step2": {
+        "EN": "2. Add a comment (optional).",
+        "PL": "2. Dodaj komentarz (opcjonalnie).",
+        "ZH": "2. 添加注释（可选）。",
+        "DE": "2. Kommentar hinzufügen (optional).",
+    },
+    "media.extra_post_help.step3": {
+        "EN": "3. Click «Create».",
+        "PL": "3. Kliknij «Utwórz».",
+        "ZH": "3. 点击«创建»。",
+        "DE": "3. Auf «Erstellen» klicken.",
+    },
+    "media.archive_help.step1": {
+        "EN": "1. Select the month and year.",
+        "PL": "1. Wybierz miesiąc i rok.",
+        "ZH": "1. 选择月份和年份。",
+        "DE": "1. Monat und Jahr auswählen.",
+    },
+    "media.archive_help.step2": {
+        "EN": "2. Click «Open» — the month will appear in the table.",
+        "PL": "2. Kliknij «Otwórz» — miesiąc pojawi się w tabeli.",
+        "ZH": "2. 点击«打开» — 月份将出现在表格中。",
+        "DE": "2. Klicken Sie auf «Öffnen» — der Monat erscheint in der Tabelle.",
+    },
+    # ── Packaging ────────────────────────────────────────────────────────
+    "packaging.help.desc": {
+        "EN": "Catalog of packaging materials: name, size, price, supplier, photos.",
+        "PL": "Katalog materiałów opakowaniowych: nazwa, rozmiar, cena, dostawca, zdjęcia.",
+        "ZH": "包装材料目录：名称、尺寸、价格、供应商、照片。",
+        "DE": "Katalog der Verpackungsmaterialien: Name, Größe, Preis, Lieferant, Fotos.",
+    },
+    "packaging.help.steps_title": {
+        "EN": "How to use",
+        "PL": "Jak korzystać",
+        "ZH": "使用方法",
+        "DE": "Verwendung",
+    },
+    "packaging.help.step1": {
+        "EN": "1. Click «Add Packaging» to create a new record.",
+        "PL": "1. Kliknij «Dodaj opakowanie», aby utworzyć nowy rekord.",
+        "ZH": "1. 点击«添加包装»创建新记录。",
+        "DE": "1. Klicken Sie auf «Verpackung hinzufügen», um einen neuen Eintrag zu erstellen.",
+    },
+    "packaging.help.step2": {
+        "EN": "2. Fill in the name, size, price and select supplier and region.",
+        "PL": "2. Wypełnij nazwę, rozmiar, cenę i wybierz dostawcę i region.",
+        "ZH": "2. 填写名称、尺寸、价格并选择供应商和地区。",
+        "DE": "2. Name, Größe, Preis ausfüllen und Lieferant und Region auswählen.",
+    },
+    "packaging.help.step3": {
+        "EN": "3. Upload up to 3 photos of the packaging.",
+        "PL": "3. Prześlij do 3 zdjęć opakowania.",
+        "ZH": "3. 上传最多3张包装照片。",
+        "DE": "3. Bis zu 3 Fotos der Verpackung hochladen.",
+    },
+    "packaging.help.step4": {
+        "EN": "4. «View» shows the detail card without editing.",
+        "PL": "4. «Podgląd» pokazuje kartę szczegółową bez edycji.",
+        "ZH": "4. «查看»显示详细卡片，不可编辑。",
+        "DE": "4. «Anzeigen» zeigt die Detailkarte ohne Bearbeitung.",
+    },
+    "packaging.help.step5": {
+        "EN": "5. «Edit» opens the full form with all fields.",
+        "PL": "5. «Edytuj» otwiera pełny formularz ze wszystkimi polami.",
+        "ZH": "5. «编辑»打开包含所有字段的完整表单。",
+        "DE": "5. «Bearbeiten» öffnet das vollständige Formular mit allen Feldern.",
+    },
+    "packaging.help.step6": {
+        "EN": "6. Records assigned to another manager are read-only.",
+        "PL": "6. Rekordy przypisane do innego menedżera są tylko do odczytu.",
+        "ZH": "6. 分配给其他经理的记录只能查看。",
+        "DE": "6. Datensätze, die einem anderen Manager zugewiesen sind, sind schreibgeschützt.",
+    },
+    "packaging.view_help.title": {
+        "EN": "Packaging details",
+        "PL": "Szczegóły opakowania",
+        "ZH": "包装详情",
+        "DE": "Verpackungsdetails",
+    },
+    "packaging.view_help.step1": {
+        "EN": "1. All packaging data is displayed here.",
+        "PL": "1. Tutaj wyświetlane są wszystkie dane opakowania.",
+        "ZH": "1. 此处显示所有包装数据。",
+        "DE": "1. Hier werden alle Verpackungsdaten angezeigt.",
+    },
+    "packaging.view_help.step2": {
+        "EN": "2. Photos can be viewed full size.",
+        "PL": "2. Zdjęcia można wyświetlić w pełnym rozmiarze.",
+        "ZH": "2. 可以全尺寸查看照片。",
+        "DE": "2. Fotos können in voller Größe angezeigt werden.",
+    },
+    "packaging.view_help.step3": {
+        "EN": "3. Click «Close» to return to the list.",
+        "PL": "3. Kliknij «Zamknij», aby wrócić do listy.",
+        "ZH": "3. 点击«关闭»返回列表。",
+        "DE": "3. Klicken Sie auf «Schließen», um zur Liste zurückzukehren.",
+    },
+    "packaging.edit_help.step1": {
+        "EN": "1. Enter the packaging name.",
+        "PL": "1. Wprowadź nazwę opakowania.",
+        "ZH": "1. 输入包装名称。",
+        "DE": "1. Verpackungsname eingeben.",
+    },
+    "packaging.edit_help.step2": {
+        "EN": "2. Enter the size and price.",
+        "PL": "2. Podaj rozmiar i cenę.",
+        "ZH": "2. 输入尺寸和价格。",
+        "DE": "2. Größe und Preis eingeben.",
+    },
+    "packaging.edit_help.step3": {
+        "EN": "3. Select the region and supplier.",
+        "PL": "3. Wybierz region i dostawcę.",
+        "ZH": "3. 选择地区和供应商。",
+        "DE": "3. Region und Lieferant auswählen.",
+    },
+    "packaging.edit_help.step4": {
+        "EN": "4. Assign a responsible manager (if needed).",
+        "PL": "4. Przypisz odpowiedzialnego menedżera (jeśli potrzeba).",
+        "ZH": "4. 分配负责经理（如需要）。",
+        "DE": "4. Verantwortlichen Manager zuweisen (falls benötigt).",
+    },
+    "packaging.edit_help.step5": {
+        "EN": "5. Upload up to 3 photos via the upload icons.",
+        "PL": "5. Prześlij do 3 zdjęć za pomocą ikon przesyłania.",
+        "ZH": "5. 通过上传图标上传最多3张照片。",
+        "DE": "5. Bis zu 3 Fotos über die Upload-Symbole hochladen.",
+    },
+    "packaging.edit_help.step6": {
+        "EN": "6. Click «Save».",
+        "PL": "6. Kliknij «Zapisz».",
+        "ZH": "6. 点击«保存»。",
+        "DE": "6. Auf «Speichern» klicken.",
+    },
+    # ── Packaging Stock ───────────────────────────────────────────────────
+    "pack_stock.help.desc": {
+        "EN": "Purchase log for packaging materials: orders, quantities, statuses.",
+        "PL": "Dziennik zakupów materiałów opakowaniowych: zamówienia, ilości, statusy.",
+        "ZH": "包装材料采购日志：订单、数量、状态。",
+        "DE": "Kaufprotokoll für Verpackungsmaterialien: Bestellungen, Mengen, Status.",
+    },
+    "pack_stock.help.steps_title": {
+        "EN": "How to use",
+        "PL": "Jak korzystać",
+        "ZH": "使用方法",
+        "DE": "Verwendung",
+    },
+    "pack_stock.help.step1": {
+        "EN": "1. The tree is grouped by packaging suppliers — click to expand positions.",
+        "PL": "1. Drzewo jest pogrupowane według dostawców opakowań — kliknij, aby rozwinąć pozycje.",
+        "ZH": "1. 树形结构按包装供应商分组——点击展开各项目。",
+        "DE": "1. Der Baum ist nach Verpackungslieferanten gruppiert — Klicken zum Aufklappen.",
+    },
+    "pack_stock.help.step2": {
+        "EN": "2. «Order» — opens a new packaging order form.",
+        "PL": "2. «Zamów» — otwiera formularz nowego zamówienia opakowania.",
+        "ZH": "2. «订购» — 打开新包装订单表单。",
+        "DE": "2. «Bestellen» — öffnet ein neues Verpackungsbestellformular.",
+    },
+    "pack_stock.help.step3": {
+        "EN": "3. «Opening Balance» — enter the starting stock balance.",
+        "PL": "3. «Saldo otwarcia» — wprowadź początkowe saldo magazynowe.",
+        "ZH": "3. «期初余额» — 输入初始库存余额。",
+        "DE": "3. «Anfangsbestand» — Startbestand eingeben.",
+    },
+    "pack_stock.help.step4": {
+        "EN": "4. «Write-off» — record packaging consumption from stock.",
+        "PL": "4. «Odpisanie» — zarejestruj zużycie opakowania ze stanu.",
+        "ZH": "4. «核销» — 记录库存包装消耗。",
+        "DE": "4. «Abschreiben» — Verpackungsverbrauch aus dem Bestand erfassen.",
+    },
+    "pack_stock.help.step5": {
+        "EN": "5. The table icon configures visible columns.",
+        "PL": "5. Ikona tabeli konfiguruje widoczne kolumny.",
+        "ZH": "5. 表格图标配置可见列。",
+        "DE": "5. Das Tabellensymbol konfiguriert sichtbare Spalten.",
+    },
+    "pack_stock.help.step6": {
+        "EN": "6. The sync indicator shows the status of local changes.",
+        "PL": "6. Wskaźnik synchronizacji pokazuje stan lokalnych zmian.",
+        "ZH": "6. 同步指示器显示本地更改的状态。",
+        "DE": "6. Der Sync-Indikator zeigt den Status lokaler Änderungen.",
+    },
+    "pack_stock.supply_help.step1": {
+        "EN": "1. Select the order date.",
+        "PL": "1. Wybierz datę zamówienia.",
+        "ZH": "1. 选择订单日期。",
+        "DE": "1. Bestelldatum auswählen.",
+    },
+    "pack_stock.supply_help.step2": {
+        "EN": "2. Enter the quantity and cost.",
+        "PL": "2. Podaj ilość i koszt.",
+        "ZH": "2. 输入数量和成本。",
+        "DE": "2. Menge und Kosten eingeben.",
+    },
+    "pack_stock.supply_help.step3": {
+        "EN": "3. Select the order status.",
+        "PL": "3. Wybierz status zamówienia.",
+        "ZH": "3. 选择订单状态。",
+        "DE": "3. Bestellstatus auswählen.",
+    },
+    "pack_stock.supply_help.step4": {
+        "EN": "4. Enter the payment amount if applicable.",
+        "PL": "4. Wprowadź kwotę płatności, jeśli dotyczy.",
+        "ZH": "4. 如适用，输入付款金额。",
+        "DE": "4. Zahlungsbetrag eingeben, falls zutreffend.",
+    },
+    "pack_stock.supply_help.step5": {
+        "EN": "5. Fill in the invoice number and comment (if needed).",
+        "PL": "5. Wypełnij numer faktury i komentarz (jeśli potrzeba).",
+        "ZH": "5. 填写发票号和注释（如需要）。",
+        "DE": "5. Rechnungsnummer und Kommentar ausfüllen (falls benötigt).",
+    },
+    "pack_stock.supply_help.step6": {
+        "EN": "6. Click «Save».",
+        "PL": "6. Kliknij «Zapisz».",
+        "ZH": "6. 点击«保存»。",
+        "DE": "6. Auf «Speichern» klicken.",
+    },
+    "pack_stock.opening_help.step1": {
+        "EN": "1. Enter the packaging balance at the packaging supplier's warehouse (pcs).",
+        "PL": "1. Wprowadź saldo opakowań w magazynie dostawcy opakowań (szt.).",
+        "ZH": "1. 输入包装供应商仓库的包装余额（件）。",
+        "DE": "1. Verpackungsbestand im Lager des Verpackungslieferanten eingeben (Stk.).",
+    },
+    "pack_stock.opening_help.step2": {
+        "EN": "2. Enter the balance at the goods supplier's warehouse (pcs).",
+        "PL": "2. Wprowadź saldo w magazynie dostawcy towarów (szt.).",
+        "ZH": "2. 输入货物供应商仓库的余额（件）。",
+        "DE": "2. Bestand im Lager des Warenlieferanten eingeben (Stk.).",
+    },
+    "pack_stock.opening_help.step3": {
+        "EN": "3. Add a comment (if needed).",
+        "PL": "3. Dodaj komentarz (jeśli potrzeba).",
+        "ZH": "3. 添加注释（如需要）。",
+        "DE": "3. Kommentar hinzufügen (falls benötigt).",
+    },
+    "pack_stock.opening_help.step4": {
+        "EN": "4. Click «Save».",
+        "PL": "4. Kliknij «Zapisz».",
+        "ZH": "4. 点击«保存»。",
+        "DE": "4. Auf «Speichern» klicken.",
+    },
+    "pack_stock.writeoff_help.step1": {
+        "EN": "1. Select the write-off date.",
+        "PL": "1. Wybierz datę odpisania.",
+        "ZH": "1. 选择核销日期。",
+        "DE": "1. Abschreibungsdatum auswählen.",
+    },
+    "pack_stock.writeoff_help.step2": {
+        "EN": "2. Enter the quantity from the packaging supplier's warehouse.",
+        "PL": "2. Podaj ilość z magazynu dostawcy opakowań.",
+        "ZH": "2. 输入包装供应商仓库的数量。",
+        "DE": "2. Menge aus dem Lager des Verpackungslieferanten eingeben.",
+    },
+    "pack_stock.writeoff_help.step3": {
+        "EN": "3. Enter the quantity from the goods supplier's warehouse.",
+        "PL": "3. Podaj ilość z magazynu dostawcy towarów.",
+        "ZH": "3. 输入货物供应商仓库的数量。",
+        "DE": "3. Menge aus dem Lager des Warenlieferanten eingeben.",
+    },
+    "pack_stock.writeoff_help.step4": {
+        "EN": "4. Add a comment.",
+        "PL": "4. Dodaj komentarz.",
+        "ZH": "4. 添加注释。",
+        "DE": "4. Kommentar hinzufügen.",
+    },
+    "pack_stock.writeoff_help.step5": {
+        "EN": "5. Click «Write off».",
+        "PL": "5. Kliknij «Odpisz».",
+        "ZH": "5. 点击«核销»。",
+        "DE": "5. Auf «Abschreiben» klicken.",
+    },
+    # ── Payments ─────────────────────────────────────────────────────────
+    "payments.help.desc": {
+        "EN": "Settlement balances with suppliers: debts, advances, compensations.",
+        "PL": "Salda rozliczeń z dostawcami: długi, zaliczki, kompensaty.",
+        "ZH": "与供应商的结算余额：债务、预付款、补偿。",
+        "DE": "Abrechnungssalden mit Lieferanten: Schulden, Anzahlungen, Kompensationen.",
+    },
+    "payments.help.steps_title": {
+        "EN": "How to use",
+        "PL": "Jak korzystać",
+        "ZH": "使用方法",
+        "DE": "Verwendung",
+    },
+    "payments.help.step1": {
+        "EN": "1. Chips at the top filter orders by payment status.",
+        "PL": "1. Chipy u góry filtrują zamówienia według statusu płatności.",
+        "ZH": "1. 顶部的标签按付款状态筛选订单。",
+        "DE": "1. Chips oben filtern Bestellungen nach Zahlungsstatus.",
+    },
+    "payments.help.step2": {
+        "EN": "2. The list is grouped by suppliers — click to expand orders.",
+        "PL": "2. Lista jest pogrupowana według dostawców — kliknij, aby rozwinąć zamówienia.",
+        "ZH": "2. 列表按供应商分组——点击展开订单。",
+        "DE": "2. Die Liste ist nach Lieferanten gruppiert — Klicken zum Aufklappen.",
+    },
+    "payments.help.step3": {
+        "EN": "3. The table icon lets you configure visible columns and their widths.",
+        "PL": "3. Ikona tabeli umożliwia konfigurację widocznych kolumn i ich szerokości.",
+        "ZH": "3. 表格图标允许配置可见列及其宽度。",
+        "DE": "3. Das Tabellensymbol ermöglicht die Konfiguration sichtbarer Spalten und ihrer Breiten.",
+    },
+    "payments.help.step4": {
+        "EN": "4. «Compensation» — add an adjustment to the supplier balance.",
+        "PL": "4. «Kompensata» — dodaj korektę salda dostawcy.",
+        "ZH": "4. «补偿» — 添加对供应商余额的调整。",
+        "DE": "4. «Kompensation» — Saldoanpassung für den Lieferanten hinzufügen.",
+    },
+    "payments.help.step5": {
+        "EN": "5. «Opening balance» — manually set the starting debt.",
+        "PL": "5. «Saldo otwarcia» — ręcznie ustaw dług startowy.",
+        "ZH": "5. «期初余额» — 手动设置初始债务。",
+        "DE": "5. «Anfangssaldo» — Startschuld manuell festlegen.",
+    },
+    "payments.help.step6": {
+        "EN": "6. Switch between managers using the filter at the top.",
+        "PL": "6. Przełączaj między menedżerami za pomocą filtru u góry.",
+        "ZH": "6. 使用顶部筛选器在经理之间切换。",
+        "DE": "6. Mit dem Filter oben zwischen Managern wechseln.",
+    },
+    "payments.balance_help.step1": {
+        "EN": "1. Enter the opening balance amount (positive = we owe the supplier, negative = supplier owes us).",
+        "PL": "1. Wprowadź kwotę salda otwarcia (dodatnia = jesteśmy dłużni dostawcy, ujemna = dostawca jest nam dłużny).",
+        "ZH": "1. 输入期初余额金额（正数=我们欠供应商，负数=供应商欠我们）。",
+        "DE": "1. Anfangssaldo eingeben (positiv = wir schulden dem Lieferanten, negativ = Lieferant schuldet uns).",
+    },
+    "payments.balance_help.step2": {
+        "EN": "2. Add a comment to explain the balance.",
+        "PL": "2. Dodaj komentarz wyjaśniający saldo.",
+        "ZH": "2. 添加注释说明余额。",
+        "DE": "2. Kommentar zur Erläuterung des Saldos hinzufügen.",
+    },
+    "payments.balance_help.step3": {
+        "EN": "3. Click «Save».",
+        "PL": "3. Kliknij «Zapisz».",
+        "ZH": "3. 点击«保存»。",
+        "DE": "3. Auf «Speichern» klicken.",
+    },
+    "payments.comp_help.step1": {
+        "EN": "1. Select a product and invoice.",
+        "PL": "1. Wybierz produkt i fakturę.",
+        "ZH": "1. 选择产品和发票。",
+        "DE": "1. Produkt und Rechnung auswählen.",
+    },
+    "payments.comp_help.step2": {
+        "EN": "2. Select or manually enter the payment number.",
+        "PL": "Wybierz lub ręcznie wprowadź numer płatności.",
+        "ZH": "2. 选择或手动输入付款编号。",
+        "DE": "2. Zahlungsnummer auswählen oder manuell eingeben.",
+    },
+    "payments.comp_help.step3": {
+        "EN": "3. Enter a comment and the compensation amount.",
+        "PL": "3. Wprowadź komentarz i kwotę kompensaty.",
+        "ZH": "3. 输入注释和补偿金额。",
+        "DE": "3. Kommentar und Kompensationsbetrag eingeben.",
+    },
+    "payments.comp_help.step4": {
+        "EN": "4. Click «Add» / «Save».",
+        "PL": "4. Kliknij «Dodaj» / «Zapisz».",
+        "ZH": "4. 点击«添加»/«保存»。",
+        "DE": "4. Auf «Hinzufügen» / «Speichern» klicken.",
+    },
+    # ── Suppliers ────────────────────────────────────────────────────────
+    "suppliers.help.desc": {
+        "EN": "Supplier catalog: contacts, payment details, regions, currency.",
+        "PL": "Katalog dostawców: kontakty, dane płatności, regiony, waluta.",
+        "ZH": "供应商目录：联系方式、付款详情、地区、货币。",
+        "DE": "Lieferantenkatalog: Kontakte, Zahlungsdaten, Regionen, Währung.",
+    },
+    "suppliers.help.steps_title": {
+        "EN": "How to use",
+        "PL": "Jak korzystać",
+        "ZH": "使用方法",
+        "DE": "Verwendung",
+    },
+    "suppliers.help.step1": {
+        "EN": "1. Click «Add Supplier» to create a new record.",
+        "PL": "1. Kliknij «Dodaj dostawcę», aby utworzyć nowy rekord.",
+        "ZH": "1. 点击«添加供应商»创建新记录。",
+        "DE": "1. Klicken Sie auf «Lieferant hinzufügen», um einen neuen Eintrag zu erstellen.",
+    },
+    "suppliers.help.step2": {
+        "EN": "2. Fill in the name, phone, region and currency.",
+        "PL": "2. Wypełnij nazwę, telefon, region i walutę.",
+        "ZH": "2. 填写名称、电话、地区和货币。",
+        "DE": "2. Name, Telefon, Region und Währung ausfüllen.",
+    },
+    "suppliers.help.step3": {
+        "EN": "3. In the «Payment» section fill in the fields configured for your company and add QR codes.",
+        "PL": "3. W sekcji «Płatność» uzupełnij pola skonfigurowane dla Twojej firmy i dodaj kody QR.",
+        "ZH": "3. 在«付款»部分填写为贵公司配置的字段并添加二维码。",
+        "DE": "3. Im Abschnitt «Zahlung» die für Ihr Unternehmen konfigurierten Felder ausfüllen und QR-Codes hinzufügen.",
+    },
+    "suppliers.help.step4": {
+        "EN": "4. «View» shows details without editing; «Edit» opens the full form.",
+        "PL": "4. «Podgląd» pokazuje szczegóły bez edycji; «Edytuj» otwiera pełny formularz.",
+        "ZH": "4. «查看»显示详情但不可编辑；«编辑»打开完整表单。",
+        "DE": "4. «Anzeigen» zeigt Details ohne Bearbeitung; «Bearbeiten» öffnet das vollständige Formular.",
+    },
+    "suppliers.help.step5": {
+        "EN": "5. Suppliers assigned to another manager are read-only.",
+        "PL": "5. Dostawcy przypisani do innego menedżera są tylko do odczytu.",
+        "ZH": "5. 分配给其他经理的供应商只能查看。",
+        "DE": "5. Lieferanten, die einem anderen Manager zugewiesen sind, sind schreibgeschützt.",
+    },
+    "suppliers.help.step6": {
+        "EN": "6. The trash icon deletes a supplier (confirmation required).",
+        "PL": "6. Ikona kosza usuwa dostawcę (wymagane potwierdzenie).",
+        "ZH": "6. 垃圾桶图标删除供应商（需要确认）。",
+        "DE": "6. Das Papierkorbsymbol löscht einen Lieferanten (Bestätigung erforderlich).",
+    },
+    "suppliers.view_help.title": {
+        "EN": "Supplier details",
+        "PL": "Szczegóły dostawcy",
+        "ZH": "供应商详情",
+        "DE": "Lieferantendetails",
+    },
+    "suppliers.view_help.step1": {
+        "EN": "1. All supplier data is displayed here.",
+        "PL": "1. Tutaj wyświetlane są wszystkie dane dostawcy.",
+        "ZH": "1. 此处显示所有供应商数据。",
+        "DE": "1. Hier werden alle Lieferantendaten angezeigt.",
+    },
+    "suppliers.view_help.step2": {
+        "EN": "2. QR codes can be enlarged by clicking on them.",
+        "PL": "2. Kody QR można powiększyć, klikając je.",
+        "ZH": "2. 点击二维码可以放大查看。",
+        "DE": "2. QR-Codes können durch Anklicken vergrößert werden.",
+    },
+    "suppliers.view_help.step3": {
+        "EN": "3. Click «Close» to return to the list.",
+        "PL": "3. Kliknij «Zamknij», aby wrócić do listy.",
+        "ZH": "3. 点击«关闭»返回列表。",
+        "DE": "3. Klicken Sie auf «Schließen», um zur Liste zurückzukehren.",
+    },
+    "suppliers.save_photo": {
+        "EN": "Save",
+        "PL": "Zapisz",
+        "ZH": "保存",
+        "DE": "Speichern",
+    },
+    "suppliers.save_photo_dialog": {
+        "EN": 'Save "{fname}"',
+        "PL": 'Zapisz "{fname}"',
+        "ZH": '保存 "{fname}"',
+        "DE": '"{fname}" speichern',
+    },
+    "suppliers.photo_saved": {
+        "EN": "Saved: {name}",
+        "PL": "Zapisano: {name}",
+        "ZH": "已保存：{name}",
+        "DE": "Gespeichert: {name}",
+    },
+    "suppliers.err.read_file": {
+        "EN": "Error reading file: {err}",
+        "PL": "Błąd odczytu pliku: {err}",
+        "ZH": "读取文件错误：{err}",
+        "DE": "Fehler beim Lesen der Datei: {err}",
+    },
+    "suppliers.err.save_file": {
+        "EN": "Error saving file: {err}",
+        "PL": "Błąd zapisu pliku: {err}",
+        "ZH": "保存文件错误：{err}",
+        "DE": "Fehler beim Speichern der Datei: {err}",
+    },
+    "suppliers.edit_help.title": {
+        "EN": "Supplier",
+        "PL": "Dostawca",
+        "ZH": "供应商",
+        "DE": "Lieferant",
+    },
+    "suppliers.edit_help.step1": {
+        "EN": "1. Enter the supplier name.",
+        "PL": "1. Wprowadź nazwę dostawcy.",
+        "ZH": "1. 输入供应商名称。",
+        "DE": "1. Lieferantenname eingeben.",
+    },
+    "suppliers.edit_help.step2": {
+        "EN": "2. Enter the phone and select the region and currency.",
+        "PL": "2. Podaj telefon i wybierz region oraz walutę.",
+        "ZH": "2. 输入电话并选择地区和货币。",
+        "DE": "2. Telefon eingeben und Region und Währung auswählen.",
+    },
+    "suppliers.edit_help.step3": {
+        "EN": "3. Assign a responsible manager (if needed).",
+        "PL": "3. Przypisz odpowiedzialnego menedżera (jeśli potrzeba).",
+        "ZH": "3. 分配负责经理（如需要）。",
+        "DE": "3. Verantwortlichen Manager zuweisen (falls benötigt).",
+    },
+    "suppliers.edit_help.step4": {
+        "EN": "4. In the «Payment» section fill in the fields configured for your company.",
+        "PL": "4. W sekcji «Płatność» uzupełnij pola skonfigurowane dla Twojej firmy.",
+        "ZH": "4. 在«付款»部分填写为贵公司配置的字段。",
+        "DE": "4. Im Abschnitt «Zahlung» die für Ihr Unternehmen konfigurierten Felder ausfüllen.",
+    },
+    "suppliers.edit_help.step5": {
+        "EN": "5. Add a QR code via the upload icon.",
+        "PL": "5. Dodaj kod QR przez ikonę przesyłania.",
+        "ZH": "5. 通过上传图标添加二维码。",
+        "DE": "5. QR-Code über das Upload-Symbol hinzufügen.",
+    },
+    "suppliers.edit_help.step6": {
+        "EN": "6. Click «Save».",
+        "PL": "6. Kliknij «Zapisz».",
+        "ZH": "6. 点击«保存»。",
+        "DE": "6. Auf «Speichern» klicken.",
+    },
+    # Subgroup dialog
+    "categories.subgroup_help.step1": {
+        "EN": "1. Select the category.",
+        "PL": "1. Wybierz kategorię.",
+        "ZH": "1. 选择类别。",
+        "DE": "1. Kategorie auswählen.",
+    },
+    "categories.subgroup_help.step2": {
+        "EN": "2. Enter the subgroup name.",
+        "PL": "2. Wprowadź nazwę podgrupy.",
+        "ZH": "2. 输入子组名称。",
+        "DE": "2. Untergruppenname eingeben.",
+    },
+    "categories.subgroup_help.step3": {
+        "EN": "3. Click «Save».",
+        "PL": "3. Kliknij «Zapisz».",
+        "ZH": "3. 点击«保存»。",
+        "DE": "3. Auf «Speichern» klicken.",
+    },
+    # ── Home display-selection dialogs ───────────────────────────────────
+    "home.display_help.step1": {
+        "EN": "1. Check the metrics you want to display in the table.",
+        "PL": "1. Zaznacz wskaźniki, które chcesz wyświetlać w tabeli.",
+        "ZH": "1. 勾选要在表格中显示的指标。",
+        "DE": "1. Die Kennzahlen markieren, die in der Tabelle angezeigt werden sollen.",
+    },
+    "home.display_help.step2": {
+        "EN": "2. Click «Save».",
+        "PL": "2. Kliknij «Zapisz».",
+        "ZH": "2. 点击«保存»。",
+        "DE": "2. Auf «Speichern» klicken.",
+    },
+    # ── Cost/Stock ────────────────────────────────────────────────────────
+    "cost_stock.help.desc": {
+        "EN": "Stock balances of goods: quantity, value, cost price, profitability.",
+        "PL": "Stany magazynowe towarów: ilość, wartość, koszt własny, rentowność.",
+        "ZH": "商品库存余额：数量、价值、成本价、盈利能力。",
+        "DE": "Lagerbestände der Waren: Menge, Wert, Selbstkostenpreis, Rentabilität.",
+    },
+    "cost_stock.help.steps_title": {
+        "EN": "How to use",
+        "PL": "Jak korzystać",
+        "ZH": "使用方法",
+        "DE": "Verwendung",
+    },
+    "cost_stock.help.step1": {
+        "EN": "1. Chips at the top filter goods by quantity or value availability.",
+        "PL": "1. Chipy u góry filtrują towary według dostępności ilości lub wartości.",
+        "ZH": "1. 顶部的标签按数量或价值的可用性筛选商品。",
+        "DE": "1. Chips oben filtern Waren nach Verfügbarkeit von Menge oder Wert.",
+    },
+    "cost_stock.help.step2": {
+        "EN": "2. «Table» configures visible columns and their widths.",
+        "PL": "2. «Tabela» konfiguruje widoczne kolumny i ich szerokości.",
+        "ZH": "2. «表格»配置可见列及其宽度。",
+        "DE": "2. «Tabelle» konfiguriert sichtbare Spalten und deren Breiten.",
+    },
+    "cost_stock.help.step3": {
+        "EN": "3. Dropdowns above the table switch the currency for logistics, new price, cost price.",
+        "PL": "3. Listy rozwijane nad tabelą przełączają walutę dla logistyki, nowej ceny, kosztu własnego.",
+        "ZH": "3. 表格上方的下拉菜单切换物流、新价格、成本价的货币。",
+        "DE": "3. Dropdowns über der Tabelle wechseln die Währung für Logistik, neuen Preis, Selbstkosten.",
+    },
+    "cost_stock.help.step4": {
+        "EN": "4. «Price visibility» — choose which price tiers to display.",
+        "PL": "4. «Widoczność cen» — wybierz, które poziomy cen wyświetlać.",
+        "ZH": "4. «价格可见性» — 选择要显示的价格等级。",
+        "DE": "4. «Preissichtbarkeit» — wählen, welche Preisstufen angezeigt werden.",
+    },
+    "cost_stock.help.step5": {
+        "EN": "5. The copy icon in a row — copies the product data.",
+        "PL": "5. Ikona kopiowania w wierszu — kopiuje dane produktu.",
+        "ZH": "5. 行中的复制图标——复制商品数据。",
+        "DE": "5. Das Kopiersymbol in einer Zeile — kopiert die Produktdaten.",
+    },
+    "cost_stock.prices_help.step1": {
+        "EN": "1. Check the price tiers you want to display in the table.",
+        "PL": "1. Zaznacz poziomy cen, które chcesz wyświetlać w tabeli.",
+        "ZH": "1. 勾选要在表格中显示的价格等级。",
+        "DE": "1. Preisstufen markieren, die in der Tabelle angezeigt werden sollen.",
+    },
+    "cost_stock.prices_help.step2": {
+        "EN": "2. Click «Apply».",
+        "PL": "2. Kliknij «Zastosuj».",
+        "ZH": "2. 点击«应用»。",
+        "DE": "2. Auf «Anwenden» klicken.",
+    },
+    # ── Extensions ───────────────────────────────────────────────────────
+    "extensions.help.desc": {
+        "EN": "Additional app modules: GSM Parser for monitoring smartphone prices and specs.",
+        "PL": "Dodatkowe moduły aplikacji: GSM Parser do monitorowania cen i specyfikacji smartfonów.",
+        "ZH": "附加应用模块：GSM解析器，用于监控智能手机价格和规格。",
+        "DE": "Zusätzliche App-Module: GSM Parser zur Überwachung von Smartphone-Preisen und -Spezifikationen.",
+    },
+    "extensions.help.steps_title": {
+        "EN": "How to use",
+        "PL": "Jak korzystać",
+        "ZH": "使用方法",
+        "DE": "Verwendung",
+    },
+    "extensions.help.step1": {
+        "EN": "1. Superadmin enables/disables the parser per company.",
+        "PL": "1. Superadmin włącza/wyłącza parser dla każdej firmy.",
+        "ZH": "1. 超级管理员为每个公司启用/禁用解析器。",
+        "DE": "1. Superadmin aktiviert/deaktiviert den Parser pro Unternehmen.",
+    },
+    "extensions.help.step2": {
+        "EN": "2. Admin can toggle within the superadmin-permitted limit.",
+        "PL": "2. Admin może przełączać w granicach dozwolonych przez superadmina.",
+        "ZH": "2. 管理员可以在超级管理员允许的范围内切换。",
+        "DE": "2. Admin kann innerhalb des vom Superadmin erlaubten Rahmens umschalten.",
+    },
+    "extensions.help.step3": {
+        "EN": "3. Click «Open» to access results and parser settings.",
+        "PL": "3. Kliknij «Otwórz», aby uzyskać dostęp do wyników i ustawień parsera.",
+        "ZH": "3. 点击«打开»访问结果和解析器设置。",
+        "DE": "3. Klicken Sie auf «Öffnen», um auf Ergebnisse und Parser-Einstellungen zuzugreifen.",
+    },
+    "extensions.help.step4": {
+        "EN": "4. In settings: configure brands, URLs, delays and Telegram reports.",
+        "PL": "4. W ustawieniach: skonfiguruj marki, URL-e, opóźnienia i raporty Telegram.",
+        "ZH": "4. 在设置中：配置品牌、URL、延迟和Telegram报告。",
+        "DE": "4. In den Einstellungen: Marken, URLs, Verzögerungen und Telegram-Berichte konfigurieren.",
+    },
+    "extensions.crontab_help.step1": {
+        "EN": "1. Copy the crontab lines and paste them on the VPS server.",
+        "PL": "1. Skopiuj linie crontab i wklej je na serwerze VPS.",
+        "ZH": "1. 复制crontab行并粘贴到VPS服务器上。",
+        "DE": "1. Crontab-Zeilen kopieren und auf dem VPS-Server einfügen.",
+    },
+    "extensions.crontab_help.step2": {
+        "EN": "2. Edit the path to the Python executable and app directory if needed.",
+        "PL": "2. W razie potrzeby edytuj ścieżkę do Pythona i katalogu aplikacji.",
+        "ZH": "2. 如有需要，编辑Python可执行文件和应用目录的路径。",
+        "DE": "2. Den Pfad zur Python-Executable und zum App-Verzeichnis bei Bedarf anpassen.",
+    },
+    # ── Notebook ─────────────────────────────────────────────────────────
+    "notebook.help.desc": {
+        "EN": "Personal notes: free-form text organised in a tree of sections.",
+        "PL": "Notatki osobiste: dowolny tekst zorganizowany w drzewo sekcji.",
+        "ZH": "个人笔记：以章节树状形式组织的自由文本。",
+        "DE": "Persönliche Notizen: freier Text in einer Baumstruktur von Abschnitten.",
+    },
+    "notebook.help.steps_title": {
+        "EN": "How to use",
+        "PL": "Jak korzystać",
+        "ZH": "使用方法",
+        "DE": "Verwendung",
+    },
+    "notebook.help.step1": {
+        "EN": "1. On the left — a tree of sections; click to select, click «+» to add a child.",
+        "PL": "1. Po lewej — drzewo sekcji; kliknij, aby wybrać, «+», aby dodać podsekcję.",
+        "ZH": "1. 左侧——章节树；点击选择，点击«+»添加子节。",
+        "DE": "1. Links — ein Abschnittsbaum; Klicken zum Auswählen, «+» zum Hinzufügen eines Kindes.",
+    },
+    "notebook.help.step2": {
+        "EN": "2. On the right — the text editor; type your notes and click «Save».",
+        "PL": "2. Po prawej — edytor tekstu; wpisz notatki i kliknij «Zapisz».",
+        "ZH": "2. 右侧——文本编辑器；输入笔记并点击«保存»。",
+        "DE": "2. Rechts — der Text-Editor; Notizen eingeben und «Speichern» klicken.",
+    },
+    "notebook.help.step3": {
+        "EN": "3. The notebook is personal — other users cannot see your notes.",
+        "PL": "3. Notatnik jest osobisty — inni użytkownicy nie widzą Twoich notatek.",
+        "ZH": "3. 笔记本是私人的——其他用户看不到您的笔记。",
+        "DE": "3. Das Notizbuch ist persönlich — andere Benutzer sehen Ihre Notizen nicht.",
+    },
+    # ── Files ─────────────────────────────────────────────────────────────
+    "files.help.desc": {
+        "EN": "File storage organised in folders per region.",
+        "PL": "Przechowywanie plików zorganizowane w foldery według regionów.",
+        "ZH": "按地区组织在文件夹中的文件存储。",
+        "DE": "Dateispeicher in Ordnern nach Regionen organisiert.",
+    },
+    "files.help.steps_title": {
+        "EN": "How to use",
+        "PL": "Jak korzystać",
+        "ZH": "使用方法",
+        "DE": "Verwendung",
+    },
+    "files.help.step1": {
+        "EN": "1. On the left — folder tree. Click «New folder» to create a root folder.",
+        "PL": "1. Po lewej — drzewo folderów. Kliknij «Nowy folder», aby utworzyć folder główny.",
+        "ZH": "1. 左侧——文件夹树。点击«新建文件夹»创建根文件夹。",
+        "DE": "1. Links — Ordnerbaum. «Neuer Ordner» klicken, um einen Stammordner zu erstellen.",
+    },
+    "files.help.step2": {
+        "EN": "2. To create a subfolder — select a folder and click the folder+ icon next to it.",
+        "PL": "2. Aby utworzyć podfolder — wybierz folder i kliknij ikonę folder+ obok niego.",
+        "ZH": "2. 要创建子文件夹——选择一个文件夹并点击旁边的文件夹+图标。",
+        "DE": "2. Unterordner erstellen — Ordner auswählen und das Ordner+-Symbol daneben anklicken.",
+    },
+    "files.help.step3": {
+        "EN": "3. Click a folder — files in it appear on the right. «Upload file» adds a file (max 50 MB).",
+        "PL": "3. Kliknij folder — pliki w nim pojawią się po prawej. «Prześlij plik» dodaje plik (maks. 50 MB).",
+        "ZH": "3. 点击文件夹——右侧显示其中的文件。«上传文件»添加文件（最大50 MB）。",
+        "DE": "3. Ordner anklicken — Dateien erscheinen rechts. «Datei hochladen» fügt eine Datei hinzu (max. 50 MB).",
+    },
+    "files.help.step4": {
+        "EN": "4. Each file has actions: open (link), download, move, delete. Other users' files are read-only.",
+        "PL": "4. Każdy plik ma akcje: otwórz (link), pobierz, przenieś, usuń. Pliki innych użytkowników są tylko do odczytu.",
+        "ZH": "4. 每个文件都有操作：打开（链接）、下载、移动、删除。其他用户的文件只能查看。",
+        "DE": "4. Jede Datei hat Aktionen: öffnen (Link), herunterladen, verschieben, löschen. Dateien anderer Benutzer sind schreibgeschützt.",
+    },
+    # ── Languages ─────────────────────────────────────────────────────────
+    "languages.help.desc": {
+        "EN": "Interface translation table: fill in translations for each language.",
+        "PL": "Tabela tłumaczeń interfejsu: wypełnij tłumaczenia dla każdego języka.",
+        "ZH": "界面翻译表：为每种语言填写翻译。",
+        "DE": "Übersetzungstabelle der Benutzeroberfläche: Übersetzungen für jede Sprache ausfüllen.",
+    },
+    "languages.help.steps_title": {
+        "EN": "How to use",
+        "PL": "Jak korzystać",
+        "ZH": "使用方法",
+        "DE": "Verwendung",
+    },
+    "languages.help.step1": {
+        "EN": "1. Base texts are in Ukrainian — fill in the translation cells for other languages.",
+        "PL": "1. Teksty bazowe są po ukraińsku — wypełnij komórki tłumaczeń dla innych języków.",
+        "ZH": "1. 基础文本为乌克兰语——为其他语言填写翻译单元格。",
+        "DE": "1. Basistexte sind auf Ukrainisch — Übersetzungszellen für andere Sprachen ausfüllen.",
+    },
+    "languages.help.step2": {
+        "EN": "2. The clipboard icon next to a language name — paste a column of translations from the clipboard.",
+        "PL": "2. Ikona schowka obok nazwy języka — wklej kolumnę tłumaczeń ze schowka.",
+        "ZH": "2. 语言名称旁的剪贴板图标——从剪贴板粘贴一列翻译。",
+        "DE": "2. Das Zwischenablagesymbol neben dem Sprachnamen — eine Spalte mit Übersetzungen aus der Zwischenablage einfügen.",
+    },
+    "languages.help.step3": {
+        "EN": "3. You can also export to Excel, fill it in and import back.",
+        "PL": "3. Możesz też wyeksportować do Excela, wypełnić i zaimportować z powrotem.",
+        "ZH": "3. 也可以导出到Excel，填写后再导入。",
+        "DE": "3. Sie können auch nach Excel exportieren, ausfüllen und wieder importieren.",
+    },
+    "languages.help.step4": {
+        "EN": "4. Click «Save» to apply the changes.",
+        "PL": "4. Kliknij «Zapisz», aby zastosować zmiany.",
+        "ZH": "4. 点击«保存»应用更改。",
+        "DE": "4. Auf «Speichern» klicken, um die Änderungen anzuwenden.",
+    },
+    "languages.paste_help.step1": {
+        "EN": "1. Copy a column of translations from Excel or another source (one value per line).",
+        "PL": "1. Skopiuj kolumnę tłumaczeń z Excela lub innego źródła (jedna wartość na wiersz).",
+        "ZH": "1. 从Excel或其他来源复制一列翻译（每行一个值）。",
+        "DE": "1. Eine Übersetzungsspalte aus Excel oder einer anderen Quelle kopieren (ein Wert pro Zeile).",
+    },
+    "languages.paste_help.step2": {
+        "EN": "2. Paste into the text area and click «Apply» — values are filled in order of rows.",
+        "PL": "2. Wklej do pola tekstowego i kliknij «Zastosuj» — wartości są wypełniane w kolejności wierszy.",
+        "ZH": "2. 粘贴到文本区域并点击«应用»——值按行顺序填写。",
+        "DE": "2. In das Textfeld einfügen und «Anwenden» klicken — Werte werden in Zeilenreihenfolge ausgefüllt.",
+    },
+    "languages.add_lang_help.step1": {
+        "EN": "1. Enter the language name and its code (e.g. FR, ES).",
+        "PL": "1. Wprowadź nazwę języka i jego kod (np. FR, ES).",
+        "ZH": "1. 输入语言名称及其代码（例如FR、ES）。",
+        "DE": "1. Sprachname und Sprachcode eingeben (z.B. FR, ES).",
+    },
+    "languages.add_lang_help.step2": {
+        "EN": "2. Select the flag emoji and click «Add».",
+        "PL": "2. Wybierz emoji flagi i kliknij «Dodaj».",
+        "ZH": "2. 选择旗帜表情符号并点击«添加»。",
+        "DE": "2. Flaggen-Emoji auswählen und «Hinzufügen» klicken.",
+    },
+    # ── Calculators ───────────────────────────────────────────────────────
+    "calc.save_help.step1": {
+        "EN": "1. Enter a name for the calculation.",
+        "PL": "1. Wprowadź nazwę dla obliczenia.",
+        "ZH": "1. 为计算输入名称。",
+        "DE": "1. Einen Namen für die Berechnung eingeben.",
+    },
+    "calc.save_help.step2": {
+        "EN": "2. Click «Save» — the calculation is added to «Saved».",
+        "PL": "2. Kliknij «Zapisz» — obliczenie zostanie dodane do «Zapisane».",
+        "ZH": "2. 点击«保存»——计算被添加到«已保存»。",
+        "DE": "2. Auf «Speichern» klicken — die Berechnung wird zu «Gespeichert» hinzugefügt.",
+    },
+    "calc.picker_help.step1": {
+        "EN": "1. Select the calculator type you need.",
+        "PL": "1. Wybierz potrzebny typ kalkulatora.",
+        "ZH": "1. 选择您需要的计算器类型。",
+        "DE": "1. Den benötigten Rechnertyp auswählen.",
+    },
+    "calc.picker_help.step2": {
+        "EN": "2. The selected calculator opens immediately.",
+        "PL": "2. Wybrany kalkulator otwiera się natychmiast.",
+        "ZH": "2. 所选计算器立即打开。",
+        "DE": "2. Der ausgewählte Rechner öffnet sich sofort.",
+    },
+    # ── Copy Setup ────────────────────────────────────────────────────────
+    "copy.help.desc": {
+        "EN": "Copy product setup between managers and regions: packaging, suppliers.",
+        "PL": "Kopiowanie ustawień produktów między menedżerami i regionami: opakowania, dostawcy.",
+        "ZH": "在经理和地区之间复制产品设置：包装、供应商。",
+        "DE": "Produktkonfiguration zwischen Managern und Regionen kopieren: Verpackung, Lieferanten.",
+    },
+    "copy.help.steps_title": {
+        "EN": "How to use",
+        "PL": "Jak korzystać",
+        "ZH": "使用方法",
+        "DE": "Verwendung",
+    },
+    "copy.help.step1": {
+        "EN": "1. Select the source manager and region, then the product.",
+        "PL": "1. Wybierz źródłowego menedżera i region, a następnie produkt.",
+        "ZH": "1. 选择源经理和地区，然后选择产品。",
+        "DE": "1. Quell-Manager und -Region auswählen, dann das Produkt.",
+    },
+    "copy.help.step2": {
+        "EN": "2. Select the destination manager and region.",
+        "PL": "2. Wybierz docelowego menedżera i region.",
+        "ZH": "2. 选择目标经理和地区。",
+        "DE": "2. Ziel-Manager und -Region auswählen.",
+    },
+    "copy.help.step3": {
+        "EN": "3. Click «Copy» to copy with current data, or «Copy with edits» to adjust before copying.",
+        "PL": "3. Kliknij «Kopiuj», aby skopiować z aktualnymi danymi, lub «Kopiuj z poprawkami», aby dostosować przed kopiowaniem.",
+        "ZH": "3. 点击«复制»使用当前数据复制，或点击«编辑后复制»在复制前进行调整。",
+        "DE": "3. «Kopieren» für direktes Kopieren, «Mit Bearbeitungen kopieren» zum Anpassen vor dem Kopieren.",
+    },
+    "copy.help.step4": {
+        "EN": "4. The copy appears in the destination manager's list.",
+        "PL": "4. Kopia pojawia się na liście docelowego menedżera.",
+        "ZH": "4. 副本出现在目标经理的列表中。",
+        "DE": "4. Die Kopie erscheint in der Liste des Ziel-Managers.",
+    },
+    "copy.pack_edit_help.step1": {
+        "EN": "1. Edit the packaging fields before copying: name, size, price, supplier, image, notes.",
+        "PL": "1. Edytuj pola opakowania przed kopiowaniem: nazwa, rozmiar, cena, dostawca, obraz, uwagi.",
+        "ZH": "1. 复制前编辑包装字段：名称、尺寸、价格、供应商、图片、备注。",
+        "DE": "1. Verpackungsfelder vor dem Kopieren bearbeiten: Name, Größe, Preis, Lieferant, Bild, Anmerkungen.",
+    },
+    "copy.pack_edit_help.step2": {
+        "EN": "2. Click «Copy with edits» to save the modified copy.",
+        "PL": "2. Kliknij «Kopiuj z poprawkami», aby zapisać zmodyfikowaną kopię.",
+        "ZH": "2. 点击«编辑后复制»保存修改后的副本。",
+        "DE": "2. Auf «Mit Bearbeitungen kopieren» klicken, um die geänderte Kopie zu speichern.",
+    },
+    "copy.sup_edit_help.step1": {
+        "EN": "1. Edit the supplier fields before copying: name, contact, region, currency, payment details.",
+        "PL": "1. Edytuj pola dostawcy przed kopiowaniem: nazwa, kontakt, region, waluta, dane płatności.",
+        "ZH": "1. 复制前编辑供应商字段：名称、联系方式、地区、货币、付款详情。",
+        "DE": "1. Lieferantenfelder vor dem Kopieren bearbeiten: Name, Kontakt, Region, Währung, Zahlungsdaten.",
+    },
+    "copy.sup_edit_help.step2": {
+        "EN": "2. Click «Copy with edits» to save the modified copy.",
+        "PL": "2. Kliknij «Kopiuj z poprawkami», aby zapisać zmodyfikowaną kopię.",
+        "ZH": "2. 点击«编辑后复制»保存修改后的副本。",
+        "DE": "2. Auf «Mit Bearbeitungen kopieren» klicken, um die geänderte Kopie zu speichern.",
+    },
+    "auth.help.login_body": {
+        "EN": "This is the CatMan Pro login screen. Enter your company name (not needed for SuperAdmin only), your name, e-mail, phone and password, then click «LOG IN». If you've logged in before, pick your account from the «Account» list — the fields will fill in automatically. You can change the interface language with the button in the top-right corner. No account yet — click «Create new account (Registration)».",
+        "PL": "To ekran logowania do CatMan Pro. Wprowadź nazwę firmy (niepotrzebne tylko dla SuperAdmina), swoje imię, e-mail, telefon i hasło, a następnie kliknij «ZALOGUJ SIĘ». Jeśli logowałeś się wcześniej, wybierz swoje konto z listy «Konto» — pola wypełnią się automatycznie. Język interfejsu można zmienić przyciskiem w prawym górnym rogu. Nie masz konta — kliknij «Utwórz nowe konto (Rejestracja)».",
+        "ZH": "这是CatMan Pro的登录界面。输入公司名称（仅超级管理员无需填写）、您的姓名、电子邮件、电话和密码，然后点击«登录»。如果您之前登录过，可从«账户»列表中选择您的账户 — 字段将自动填充。可通过右上角的按钮更改界面语言。没有账户 — 点击«创建新账户（注册）»。",
+        "DE": "Dies ist der Anmeldebildschirm von CatMan Pro. Geben Sie den Firmennamen ein (nur für SuperAdmin nicht erforderlich), Ihren Namen, E-Mail, Telefon und Passwort, und klicken Sie dann auf «ANMELDEN». Wenn Sie sich bereits angemeldet haben, wählen Sie Ihr Konto aus der Liste «Konto» — die Felder werden automatisch ausgefüllt. Die Oberflächensprache können Sie über die Schaltfläche oben rechts ändern. Kein Konto vorhanden — klicken Sie auf «Neues Konto erstellen (Registrierung)».",
+    },
+    "auth.help.register_body": {
+        "EN": "This is where a request for a new account is created. Fill in your profile (name, e-mail, phone, position, company name, password of 4-8 characters) and, if needed, select access regions — if none are selected, access will be granted to all company regions. After clicking «REGISTER», an administrator must approve the request before you can log in.",
+        "PL": "Tutaj tworzy się wniosek o nowe konto. Wypełnij profil (imię, e-mail, telefon, stanowisko, nazwę firmy, hasło 4-8 znaków) i w razie potrzeby wybierz regiony dostępu — jeśli żaden nie zostanie wybrany, dostęp będzie do wszystkich regionów firmy. Po kliknięciu «ZAREJESTRUJ SIĘ» wniosek musi zatwierdzić administrator, zanim będziesz mógł się zalogować.",
+        "ZH": "此处用于创建新账户申请。请填写个人资料（姓名、电子邮件、电话、职位、公司名称、4-8位密码），并根据需要选择访问区域 — 如果不选择任何区域，则可访问公司的所有区域。点击«注册»后，需由管理员批准申请，您才能登录。",
+        "DE": "Hier wird ein Antrag für ein neues Konto erstellt. Füllen Sie Ihr Profil aus (Name, E-Mail, Telefon, Position, Firmenname, Passwort mit 4-8 Zeichen) und wählen Sie bei Bedarf Zugriffsregionen aus — wird keine ausgewählt, erhalten Sie Zugriff auf alle Regionen des Unternehmens. Nach dem Klicken auf «REGISTRIEREN» muss ein Administrator den Antrag bestätigen, bevor Sie sich anmelden können.",
+    },
+    "categories.help.title": {
+        "EN": "Help — Categories & Brands",
+        "PL": "Pomoc — Kategorie i Marki",
+        "ZH": "帮助 — 类别与品牌",
+        "DE": "Hilfe — Kategorien & Marken",
+    },
+    "cost_orders.help.title": {
+        "EN": "Help — Cost Price / Profitability",
+        "PL": "Pomoc — Cena kosztowa / Rentowność",
+        "ZH": "帮助 — 成本价 / 盈利能力",
+        "DE": "Hilfe — Selbstkosten / Rentabilität",
+    },
+    "cost_orders.help.body": {
+        "EN": "This is where the cost price and profitability of each order are calculated: logistics, weight, tariff and tiered prices. The chips at the top filter by order status. The «Table» button configures visible columns; the «Calculator» button gives a quick cost-price calculation without tying it to a specific order. You can select several orders and merge them into one.",
+        "PL": "Tutaj obliczana jest cena kosztowa i rentowność każdego zamówienia: logistyka, waga, taryfa i ceny warstwowe. Chipy u góry filtrują według statusu zamówienia. Przycisk «Tabela» — konfiguracja widocznych kolumn; przycisk «Kalkulator» — szybkie obliczenie ceny kosztowej bez przypisania do konkretnego zamówienia. Można wybrać kilka zamówień i połączyć je w jedno.",
+        "ZH": "此处计算每个订单的成本价和盈利能力：物流、重量、运费和分级价格。顶部的筹码按订单状态筛选。«表格»按钮用于配置可见列；«计算器»按钮可快速计算成本价，而无需关联到具体订单。可以选择多个订单并将它们合并为一个。",
+        "DE": "Hier werden Selbstkosten und Rentabilität jeder Bestellung berechnet: Logistik, Gewicht, Tarif und Preisstufen. Die Chips oben filtern nach Bestellstatus. Die Schaltfläche «Tabelle» konfiguriert die sichtbaren Spalten; die Schaltfläche «Rechner» ermöglicht eine schnelle Selbstkostenberechnung ohne Bezug zu einer bestimmten Bestellung. Mehrere Bestellungen können ausgewählt und zu einer zusammengeführt werden.",
+    },
+    "categories.dlg.help_title": {
+        "EN": "Category",
+        "PL": "Kategoria",
+        "ZH": "类别",
+        "DE": "Kategorie",
+    },
+}
+
+
+def seed_help_translations_if_new(db=None) -> None:
+    """Seed non-UA help translations into the DB (DO NOTHING on conflict).
+    Safe to call every app start — never overwrites admin edits."""
+    _db = db or _DB
+    if _db is None or not hasattr(_db, "seed_translation_values_bulk_if_new"):
+        return
+    with contextlib.suppress(Exception):
+        by_lang: dict[str, dict[str, str]] = {}
+        for key, lang_map in _HELP_SEEDS.items():
+            for lang, value in lang_map.items():
+                by_lang.setdefault(lang, {})[key] = value
+        for lang_code, values in by_lang.items():
+            _db.seed_translation_values_bulk_if_new(lang_code, values)
+
+
+_UI_SEEDS: dict[str, dict[str, str]] = {
+    # в”Ђв”Ђ async в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "async.error_title": {
+        "EN": "Tab loading error",
+        "PL": "Błąd ładowania zakładki",
+        "ZH": "标签加载错误",
+        "DE": "Fehler beim Laden des Tabs",
+    },
+    "async.loading": {
+        "EN": "Loading...",
+        "PL": "Ładowanie...",
+        "ZH": "加载中...",
+        "DE": "Laden...",
+    },
+    "async.retry_btn": {
+        "EN": "Retry",
+        "PL": "Ponów",
+        "ZH": "重试",
+        "DE": "Wiederholen",
+    },
+    "async.timeout_body": {
+        "EN": "Server did not respond in time. Please try again.",
+        "PL": "Serwer nie odpowiedział na czas. Spróbuj ponownie.",
+        "ZH": "服务器未及时响应，请重试。",
+        "DE": "Der Server hat nicht rechtzeitig geantwortet. Bitte erneut versuchen.",
+    },
+    "async.timeout_title": {
+        "EN": "Loading timed out",
+        "PL": "Przekroczono czas ładowania",
+        "ZH": "加载超时",
+        "DE": "Ladezeit überschritten",
+    },
+    # в”Ђв”Ђ app в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "app.error.return_to_login": {
+        "EN": "Error returning to login: {exc}",
+        "PL": "Błąd powrotu do logowania: {exc}",
+        "ZH": "返回登录时出错：{exc}",
+        "DE": "Fehler beim Zurückkehren zur Anmeldung: {exc}",
+    },
+    "app.offline.reconnected": {
+        "EN": "Connection restored",
+        "PL": "Połączenie przywrócone",
+        "ZH": "连接已恢复",
+        "DE": "Verbindung wiederhergestellt",
+    },
+    "app.offline.title": {
+        "EN": "No network connection",
+        "PL": "Brak połączenia z siecią",
+        "ZH": "无网络连接",
+        "DE": "Keine Netzwerkverbindung",
+    },
+    "app.parser_bar.running": {
+        "EN": "Parsing...",
+        "PL": "Parsowanie...",
+        "ZH": "解析中...",
+        "DE": "Wird geparst...",
+    },
+    "app.update.blocked_notice": {
+        "EN": "Login is blocked without the update.",
+        "PL": "Logowanie jest zablokowane bez aktualizacji.",
+        "ZH": "不更新将无法登录。",
+        "DE": "Ohne Update ist die Anmeldung gesperrt.",
+    },
+    "app.update.download_button": {
+        "EN": "Download and install update",
+        "PL": "Pobierz i zainstaluj aktualizację",
+        "ZH": "下载并安装更新",
+        "DE": "Update herunterladen und installieren",
+    },
+    "app.update.downloaded_amount": {
+        "EN": "Downloaded: {amount}",
+        "PL": "Pobrano: {amount}",
+        "ZH": "已下载：{amount}",
+        "DE": "Heruntergeladen: {amount}",
+    },
+    "app.update.downloading": {
+        "EN": "Downloading update...",
+        "PL": "Pobieranie aktualizacji...",
+        "ZH": "正在下载更新...",
+        "DE": "Update wird heruntergeladen...",
+    },
+    "app.update.err_generic": {
+        "EN": "Update error: {exc}",
+        "PL": "Błąd aktualizacji: {exc}",
+        "ZH": "更新错误：{exc}",
+        "DE": "Update-Fehler: {exc}",
+    },
+    "app.update.err_http": {
+        "EN": "HTTP error {status}: {exc}",
+        "PL": "Błąd HTTP {status}: {exc}",
+        "ZH": "HTTP 错误 {status}：{exc}",
+        "DE": "HTTP-Fehler {status}: {exc}",
+    },
+    "app.update.err_install_failed": {
+        "EN": "Failed to install update",
+        "PL": "Nie udało się zainstalować aktualizacji",
+        "ZH": "更新安装失败",
+        "DE": "Update konnte nicht installiert werden",
+    },
+    "app.update.err_no_link": {
+        "EN": "Update link is missing",
+        "PL": "Brak linku do aktualizacji",
+        "ZH": "缺少更新链接",
+        "DE": "Update-Link fehlt",
+    },
+    "app.update.installing": {
+        "EN": "Starting installation...",
+        "PL": "Uruchamianie instalacji...",
+        "ZH": "正在启动安装...",
+        "DE": "Installation wird gestartet...",
+    },
+    "app.update.preparing": {
+        "EN": "Preparing download...",
+        "PL": "Przygotowanie do pobierania...",
+        "ZH": "准备下载...",
+        "DE": "Download wird vorbereitet...",
+    },
+    "app.update.searching": {
+        "EN": "Searching for update file...",
+        "PL": "Wyszukiwanie pliku aktualizacji...",
+        "ZH": "正在搜索更新文件...",
+        "DE": "Update-Datei wird gesucht...",
+    },
+    "app.update.title": {
+        "EN": "Application update required",
+        "PL": "Wymagana aktualizacja aplikacji",
+        "ZH": "需要应用程序更新",
+        "DE": "Anwendungsupdate erforderlich",
+    },
+    # в”Ђв”Ђ auth в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "auth.common.back": {
+        "EN": "Back",
+        "PL": "Wstecz",
+        "ZH": "返回",
+        "DE": "Zurück",
+    },
+    "auth.common.company_label": {
+        "EN": "Company name",
+        "PL": "Nazwa firmy",
+        "ZH": "公司名称",
+        "DE": "Firmenname",
+    },
+    "auth.common.email_label": {
+        "EN": "E-mail",
+        "PL": "E-mail",
+        "ZH": "电子邮件",
+        "DE": "E-Mail",
+    },
+    "auth.common.name_label": {
+        "EN": "Your name",
+        "PL": "Twoje imię",
+        "ZH": "您的姓名",
+        "DE": "Ihr Name",
+    },
+    "auth.common.password_label": {
+        "EN": "Password",
+        "PL": "Hasło",
+        "ZH": "密码",
+        "DE": "Passwort",
+    },
+    "auth.common.phone_label": {
+        "EN": "Phone number +380",
+        "PL": "Numer telefonu +380",
+        "ZH": "电话号码 +380",
+        "DE": "Telefonnummer +380",
+    },
+    "auth.err.missing_email": {
+        "EN": "Missing: E-mail",
+        "PL": "Brak: E-mail",
+        "ZH": "缺少：电子邮件",
+        "DE": "Fehlt: E-Mail",
+    },
+    "auth.err.missing_name": {
+        "EN": "Missing: Name",
+        "PL": "Brak: Imię",
+        "ZH": "缺少：姓名",
+        "DE": "Fehlt: Name",
+    },
+    "auth.err.missing_password": {
+        "EN": "Missing: Password",
+        "PL": "Brak: Hasło",
+        "ZH": "缺少：密码",
+        "DE": "Fehlt: Passwort",
+    },
+    "auth.err.missing_phone": {
+        "EN": "Missing: Phone",
+        "PL": "Brak: Telefon",
+        "ZH": "缺少：电话",
+        "DE": "Fehlt: Telefon",
+    },
+    "auth.help.login_title": {
+        "EN": "Help — login",
+        "PL": "Pomoc — logowanie",
+        "ZH": "帮助 — 登录",
+        "DE": "Hilfe — Anmeldung",
+    },
+    "auth.help.register_title": {
+        "EN": "Help — registration",
+        "PL": "Pomoc — rejestracja",
+        "ZH": "帮助 — 注册",
+        "DE": "Hilfe — Registrierung",
+    },
+    "auth.help.tooltip": {
+        "EN": "Help",
+        "PL": "Pomoc",
+        "ZH": "帮助",
+        "DE": "Hilfe",
+    },
+    "auth.login.account_label": {
+        "EN": "Account",
+        "PL": "Konto",
+        "ZH": "账户",
+        "DE": "Konto",
+    },
+    "auth.login.clear_quick_accounts": {
+        "EN": "Clear saved accounts",
+        "PL": "Wyczyść zapisane konta",
+        "ZH": "清除已保存的账户",
+        "DE": "Gespeicherte Konten löschen",
+    },
+    "auth.login.default_user": {
+        "EN": "User",
+        "PL": "Użytkownik",
+        "ZH": "用户",
+        "DE": "Benutzer",
+    },
+    "auth.login.err_check_fields": {
+        "EN": "Please check the empty fields",
+        "PL": "Sprawdź niezapełnione pola",
+        "ZH": "请检查空白字段",
+        "DE": "Bitte leere Felder prüfen",
+    },
+    "auth.login.no_company": {
+        "EN": "— no company —",
+        "PL": "— bez firmy —",
+        "ZH": "— 无公司 —",
+        "DE": "— ohne Firma —",
+    },
+    "auth.login.no_role": {
+        "EN": "No position",
+        "PL": "Brak stanowiska",
+        "ZH": "无职位",
+        "DE": "Keine Position",
+    },
+    "auth.login.submit": {
+        "EN": "LOG IN",
+        "PL": "ZALOGUJ SIĘ",
+        "ZH": "登录",
+        "DE": "ANMELDEN",
+    },
+    "auth.login.subtitle": {
+        "EN": "Login",
+        "PL": "Logowanie",
+        "ZH": "登录",
+        "DE": "Anmeldung",
+    },
+    "auth.register.choice_kind_subtitle": {
+        "EN": "Choose how you will use the app",
+        "PL": "Wybierz, jak będziesz korzystać z programu",
+        "ZH": "请选择您将如何使用该程序",
+        "DE": "Wählen Sie, wie Sie die Anwendung nutzen möchten",
+    },
+    "auth.register.choice_storage_title": {
+        "EN": "Where to store the data?",
+        "PL": "Gdzie przechowywać dane?",
+        "ZH": "数据存储在哪里？",
+        "DE": "Wo sollen die Daten gespeichert werden?",
+    },
+    "auth.register.enter_company_first": {
+        "EN": "Enter company name first",
+        "PL": "Najpierw wpisz nazwę firmy",
+        "ZH": "请先输入公司名称",
+        "DE": "Zuerst Firmenname eingeben",
+    },
+    "auth.register.failed": {
+        "EN": "Registration error",
+        "PL": "Błąd rejestracji",
+        "ZH": "注册错误",
+        "DE": "Registrierungsfehler",
+    },
+    "auth.register.go_login": {
+        "EN": "Already have an account? Log in",
+        "PL": "Masz już konto? Zaloguj się",
+        "ZH": "已有账户？登录",
+        "DE": "Bereits ein Konto? Anmelden",
+    },
+    "auth.register.individual_note": {
+        "EN": "You will become the administrator of your own account and set up regions, categories and currencies yourself after logging in.",
+        "PL": "Zostaniesz administratorem swojego konta i samodzielnie skonfigurujesz regiony, kategorie i waluty po zalogowaniu.",
+        "ZH": "您将成为自己账户的管理员，登录后可自行设置地区、类别和货币。",
+        "DE": "Sie werden Administrator Ihres eigenen Kontos und richten nach der Anmeldung selbst Regionen, Kategorien und Währungen ein.",
+    },
+    "auth.register.kind_company": {
+        "EN": "Company",
+        "PL": "Firma",
+        "ZH": "公司",
+        "DE": "Unternehmen",
+    },
+    "auth.register.kind_company_desc": {
+        "EN": "For a team with multiple users. The admin manages users, regions and categories.",
+        "PL": "Dla zespołu z wieloma użytkownikami. Administrator zarządza użytkownikami, regionami i kategoriami.",
+        "ZH": "适用于拥有多个用户的团队。管理员负责管理用户、地区和类别。",
+        "DE": "Für ein Team mit mehreren Benutzern. Der Administrator verwaltet Benutzer, Regionen und Kategorien.",
+    },
+    "auth.register.kind_individual": {
+        "EN": "Individual",
+        "PL": "Indywidualny",
+        "ZH": "个人",
+        "DE": "Einzelperson",
+    },
+    "auth.register.kind_individual_desc": {
+        "EN": "For a single user. You are both the admin and the user — you configure everything yourself.",
+        "PL": "Dla jednego użytkownika. Jesteś jednocześnie administratorem i użytkownikiem — wszystkie ustawienia konfigurujesz sam.",
+        "ZH": "适用于单个用户。您既是管理员也是用户——所有设置均由您自行配置。",
+        "DE": "Für einen einzelnen Benutzer. Sie sind gleichzeitig Administrator und Benutzer — alle Einstellungen nehmen Sie selbst vor.",
+    },
+    "auth.register.no_regions": {
+        "EN": "The company has no regions yet",
+        "PL": "Firma nie ma jeszcze regionów",
+        "ZH": "该公司尚无地区",
+        "DE": "Das Unternehmen hat noch keine Regionen",
+    },
+    "auth.register.password_label": {
+        "EN": "Password (4–8 characters)",
+        "PL": "Hasło (4–8 znaków)",
+        "ZH": "密码（4–8个字符）",
+        "DE": "Passwort (4–8 Zeichen)",
+    },
+    "auth.register.profile": {
+        "EN": "Profile",
+        "PL": "Profil",
+        "ZH": "个人资料",
+        "DE": "Profil",
+    },
+    "auth.register.region_fallback": {
+        "EN": "Region",
+        "PL": "Region",
+        "ZH": "地区",
+        "DE": "Region",
+    },
+    "auth.register.regions_hint": {
+        "EN": "Select access regions (multiple allowed)",
+        "PL": "Wybierz regiony dostępu (można kilka)",
+        "ZH": "选择访问地区（可多选）",
+        "DE": "Zugriffsregionen auswählen (mehrere möglich)",
+    },
+    "auth.register.role_label": {
+        "EN": "Position",
+        "PL": "Stanowisko",
+        "ZH": "职位",
+        "DE": "Position",
+    },
+    "auth.register.storage_local": {
+        "EN": "Locally",
+        "PL": "Lokalnie",
+        "ZH": "本地",
+        "DE": "Lokal",
+    },
+    "auth.register.storage_local_desc": {
+        "EN": "Data is stored only on this computer. Cheaper, works without internet. Access only from this device — you can move the data to another device or switch to the Cloud later in settings.",
+        "PL": "Dane są przechowywane wyłącznie na tym komputerze. Taniej, działa bez internetu. Dostęp tylko z tego urządzenia — dane można później przenieść na inne urządzenie lub przejść do Chmury w ustawieniach.",
+        "ZH": "数据仅存储在此电脑上。更便宜，无需联网即可使用。仅可从此设备访问——之后可在设置中将数据迁移到其他设备或切换到云端。",
+        "DE": "Die Daten werden nur auf diesem Computer gespeichert. Günstiger, funktioniert ohne Internet. Zugriff nur von diesem Gerät aus — die Daten können später in den Einstellungen auf ein anderes Gerät übertragen oder in die Cloud verschoben werden.",
+    },
+    "auth.register.storage_vps": {
+        "EN": "Cloud (VPS)",
+        "PL": "Chmura (VPS)",
+        "ZH": "云端 (VPS)",
+        "DE": "Cloud (VPS)",
+    },
+    "auth.register.storage_vps_desc": {
+        "EN": "Data is stored on our servers. Access from any device, data is always synchronized.",
+        "PL": "Dane są przechowywane na naszych serwerach. Dostęp z dowolnego urządzenia, dane są zawsze zsynchronizowane.",
+        "ZH": "数据存储在我们的服务器上。可从任何设备访问，数据始终保持同步。",
+        "DE": "Die Daten werden auf unseren Servern gespeichert. Zugriff von jedem Gerät aus, die Daten sind immer synchronisiert.",
+    },
+    "auth.register.submit": {
+        "EN": "REGISTER",
+        "PL": "ZAREJESTRUJ SIĘ",
+        "ZH": "注册",
+        "DE": "REGISTRIEREN",
+    },
+    "auth.register.submitted": {
+        "EN": "Registration request sent!",
+        "PL": "Wniosek o rejestrację wysłany!",
+        "ZH": "注册申请已发送！",
+        "DE": "Registrierungsantrag gesendet!",
+    },
+    # в”Ђв”Ђ categories в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "categories.add_btn": {
+        "EN": "Category",
+        "PL": "Kategoria",
+        "ZH": "类别",
+        "DE": "Kategorie",
+    },
+    "categories.brand_deleted": {
+        "EN": "Brand deleted",
+        "PL": "Marka usunięta",
+        "ZH": "品牌已删除",
+        "DE": "Marke gelöscht",
+    },
+    "categories.brand_saved": {
+        "EN": "Brand saved",
+        "PL": "Marka zapisana",
+        "ZH": "品牌已保存",
+        "DE": "Marke gespeichert",
+    },
+    "categories.category_deleted": {
+        "EN": "Category deleted",
+        "PL": "Kategoria usunięta",
+        "ZH": "类别已删除",
+        "DE": "Kategorie gelöscht",
+    },
+    "categories.category_saved": {
+        "EN": "Category saved",
+        "PL": "Kategoria zapisana",
+        "ZH": "类别已保存",
+        "DE": "Kategorie gespeichert",
+    },
+    "categories.create_btn": {
+        "EN": "Create category",
+        "PL": "Utwórz kategorię",
+        "ZH": "创建类别",
+        "DE": "Kategorie erstellen",
+    },
+    "categories.dlg.edit_title": {
+        "EN": "Category",
+        "PL": "Kategoria",
+        "ZH": "类别",
+        "DE": "Kategorie",
+    },
+    "categories.dlg.series": {
+        "EN": "Series",
+        "PL": "Seria",
+        "ZH": "系列",
+        "DE": "Serie",
+    },
+    "categories.dlg.subcategory": {
+        "EN": "Subcategory",
+        "PL": "Podkategoria",
+        "ZH": "子类别",
+        "DE": "Unterkategorie",
+    },
+    "categories.empty_state": {
+        "EN": "No categories available in the selected context",
+        "PL": "Brak dostępnych kategorii w wybranym kontekście",
+        "ZH": "所选上下文中没有可用类别",
+        "DE": "Keine Kategorien im gewählten Kontext verfügbar",
+    },
+    "categories.err.enter_name": {
+        "EN": "Enter a name",
+        "PL": "Wprowadź nazwę",
+        "ZH": "请输入名称",
+        "DE": "Name eingeben",
+    },
+    "categories.err.save": {
+        "EN": "Failed to save",
+        "PL": "Nie udało się zapisać",
+        "ZH": "保存失败",
+        "DE": "Speichern fehlgeschlagen",
+    },
+    "categories.err.save_brand": {
+        "EN": "Error saving brand",
+        "PL": "Błąd zapisu marki",
+        "ZH": "保存品牌出错",
+        "DE": "Fehler beim Speichern der Marke",
+    },
+    "categories.err.save_category": {
+        "EN": "Error saving category",
+        "PL": "Błąd zapisu kategorii",
+        "ZH": "保存类别出错",
+        "DE": "Fehler beim Speichern der Kategorie",
+    },
+    "categories.field.brand_name": {
+        "EN": "Brand name",
+        "PL": "Nazwa marki",
+        "ZH": "品牌名称",
+        "DE": "Markenname",
+    },
+    "categories.field.category_name": {
+        "EN": "Category name",
+        "PL": "Nazwa kategorii",
+        "ZH": "类别名称",
+        "DE": "Kategoriename",
+    },
+    "categories.field.series_name": {
+        "EN": "Series name",
+        "PL": "Nazwa serii",
+        "ZH": "系列名称",
+        "DE": "Serienname",
+    },
+    "categories.field.subcategory_name": {
+        "EN": "Subcategory name",
+        "PL": "Nazwa podkategorii",
+        "ZH": "子类别名称",
+        "DE": "Name der Unterkategorie",
+    },
+    "categories.field.target_margin": {
+        "EN": "Target margin (%)",
+        "PL": "Docelowa marża (%)",
+        "ZH": "目标利润率（%）",
+        "DE": "Ziel-Marge (%)",
+    },
+    "categories.loading": {
+        "EN": "Loading categories...",
+        "PL": "Ładowanie kategorii...",
+        "ZH": "加载类别...",
+        "DE": "Kategorien werden geladen...",
+    },
+    "categories.search_hint": {
+        "EN": "Search categories and hierarchy levels",
+        "PL": "Szukaj kategorii i poziomów hierarchii",
+        "ZH": "搜索类别和层级",
+        "DE": "Kategorien und Hierarchieebenen suchen",
+    },
+    "categories.series_deleted": {
+        "EN": "Series deleted",
+        "PL": "Seria usunięta",
+        "ZH": "系列已删除",
+        "DE": "Serie gelöscht",
+    },
+    "categories.subcategory_deleted": {
+        "EN": "Subcategory deleted",
+        "PL": "Podkategoria usunięta",
+        "ZH": "子类别已删除",
+        "DE": "Unterkategorie gelöscht",
+    },
+    "categories.title": {
+        "EN": "Categories",
+        "PL": "Kategorie",
+        "ZH": "类别",
+        "DE": "Kategorien",
+    },
+    # в”Ђв”Ђ common в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "common.add": {
+        "EN": "Add",
+        "PL": "Dodaj",
+        "ZH": "添加",
+        "DE": "Hinzufügen",
+    },
+    "common.all": {
+        "EN": "All",
+        "PL": "Wszystkie",
+        "ZH": "全部",
+        "DE": "Alle",
+    },
+    "common.cancel": {
+        "EN": "Cancel",
+        "PL": "Anuluj",
+        "ZH": "取消",
+        "DE": "Abbrechen",
+    },
+    "common.confirm": {
+        "EN": "Confirmation",
+        "PL": "Potwierdzenie",
+        "ZH": "确认",
+        "DE": "Bestätigung",
+    },
+    "common.create": {
+        "EN": "Create",
+        "PL": "Utwórz",
+        "ZH": "创建",
+        "DE": "Erstellen",
+    },
+    "common.delete": {
+        "EN": "Delete",
+        "PL": "Usuń",
+        "ZH": "删除",
+        "DE": "Löschen",
+    },
+    "common.disabled": {
+        "EN": "Disabled",
+        "PL": "Wyłączono",
+        "ZH": "已禁用",
+        "DE": "Deaktiviert",
+    },
+    "common.enabled": {
+        "EN": "Enabled",
+        "PL": "Włączono",
+        "ZH": "已启用",
+        "DE": "Aktiviert",
+    },
+    "common.help.close": {
+        "EN": "Got it",
+        "PL": "Rozumiem",
+        "ZH": "明白了",
+        "DE": "Verstanden",
+    },
+    "common.help.tooltip": {
+        "EN": "Help",
+        "PL": "Pomoc",
+        "ZH": "帮助",
+        "DE": "Hilfe",
+    },
+    "common.irreversible": {
+        "EN": "This action cannot be undone.",
+        "PL": "Tej akcji nie można cofnąć.",
+        "ZH": "此操作无法撤销。",
+        "DE": "Diese Aktion kann nicht rückgängig gemacht werden.",
+    },
+    "common.no": {
+        "EN": "No",
+        "PL": "Nie",
+        "ZH": "否",
+        "DE": "Nein",
+    },
+    "common.reset": {
+        "EN": "Reset",
+        "PL": "Resetuj",
+        "ZH": "重置",
+        "DE": "Zurücksetzen",
+    },
+    "common.save": {
+        "EN": "Save",
+        "PL": "Zapisz",
+        "ZH": "保存",
+        "DE": "Speichern",
+    },
+    "common.yes": {
+        "EN": "Yes",
+        "PL": "Tak",
+        "ZH": "是",
+        "DE": "Ja",
+    },
+    # в”Ђв”Ђ copy в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "copy.access_denied": {
+        "EN": "Only Admin or SuperAdmin has access to the copy tab",
+        "PL": "Dostęp do zakładki kopiowania ma tylko Admin lub SuperAdmin",
+        "ZH": "只有管理员或超级管理员才能访问复制选项卡",
+        "DE": "Nur Admin oder SuperAdmin hat Zugriff auf den Kopier-Tab",
+    },
+    "copy.category_copy_done": {
+        "EN": "Category copy complete",
+        "PL": "Kopiowanie kategorii zakończone",
+        "ZH": "类别复制完成",
+        "DE": "Kategoriekopie abgeschlossen",
+    },
+    "copy.clear_all": {
+        "EN": "Clear",
+        "PL": "Wyczyść",
+        "ZH": "清除",
+        "DE": "Löschen",
+    },
+    "copy.copy_category_btn": {
+        "EN": "Copy category",
+        "PL": "Kopiuj kategorię",
+        "ZH": "复制类别",
+        "DE": "Kategorie kopieren",
+    },
+    "copy.copy_with_edits": {
+        "EN": "Copy with edits",
+        "PL": "Kopiuj ze zmianami",
+        "ZH": "带编辑复制",
+        "DE": "Mit Änderungen kopieren",
+    },
+    "copy.from_label": {
+        "EN": "From",
+        "PL": "Skąd",
+        "ZH": "来源",
+        "DE": "Von",
+    },
+    "copy.help.title": {
+        "EN": "Help — Copy",
+        "PL": "Pomoc — Kopiowanie",
+        "ZH": "帮助 — 复制",
+        "DE": "Hilfe — Kopieren",
+    },
+    "copy.mode.full": {
+        "EN": "Copy completely",
+        "PL": "Kopiuj w całości",
+        "ZH": "完整复制",
+        "DE": "Vollständig kopieren",
+    },
+    "copy.mode.partial": {
+        "EN": "Copy partially",
+        "PL": "Kopiuj częściowo",
+        "ZH": "部分复制",
+        "DE": "Teilweise kopieren",
+    },
+    "copy.need_regions": {
+        "EN": "At least 1 region in the company is required for copying",
+        "PL": "Do kopiowania potrzebny jest co najmniej 1 region w firmie",
+        "ZH": "复制需要公司中至少1个地区",
+        "DE": "Zum Kopieren wird mindestens 1 Region im Unternehmen benötigt",
+    },
+    "copy.need_users": {
+        "EN": "Users in the company are required for copying",
+        "PL": "Do kopiowania potrzebni są użytkownicy w firmie",
+        "ZH": "复制需要公司中有用户",
+        "DE": "Für das Kopieren werden Benutzer im Unternehmen benötigt",
+    },
+    "copy.no_items": {
+        "EN": "No items",
+        "PL": "Brak elementów",
+        "ZH": "没有项目",
+        "DE": "Keine Einträge",
+    },
+    "copy.open_categories_btn": {
+        "EN": "Open Categories",
+        "PL": "Otwórz Kategorie",
+        "ZH": "打开类别",
+        "DE": "Kategorien öffnen",
+    },
+    "copy.select_all": {
+        "EN": "All",
+        "PL": "Wszystko",
+        "ZH": "全部",
+        "DE": "Alle",
+    },
+    "copy.select_company_hint": {
+        "EN": "Select a specific company above. Copying between companies is not allowed.",
+        "PL": "Wybierz konkretną firmę powyżej. Kopiowanie między firmami jest zabronione.",
+        "ZH": "请在上方选择特定公司。不允许跨公司复制。",
+        "DE": "Oben ein bestimmtes Unternehmen auswählen. Kopieren zwischen Unternehmen ist nicht erlaubt.",
+    },
+    "copy.select_levels_hint": {
+        "EN": "Select what to transfer for each level:",
+        "PL": "Wybierz, co przenosimy na każdym poziomie:",
+        "ZH": "选择每个级别要转移的内容：",
+        "DE": "Auswählen, was für jede Ebene übertragen werden soll:",
+    },
+    "copy.select_source_dest": {
+        "EN": "Select source and destination",
+        "PL": "Wybierz źródło i cel",
+        "ZH": "选择来源和目标",
+        "DE": "Quelle und Ziel auswählen",
+    },
+    "copy.source_category_not_found": {
+        "EN": "Source category not found",
+        "PL": "Nie znaleziono kategorii-źródła",
+        "ZH": "找不到来源类别",
+        "DE": "Quellkategorie nicht gefunden",
+    },
+    "copy.title": {
+        "EN": "Copy",
+        "PL": "Kopiowanie",
+        "ZH": "复制",
+        "DE": "Kopieren",
+    },
+    "copy.to_label": {
+        "EN": "Copy to",
+        "PL": "Kopiujemy do",
+        "ZH": "复制到",
+        "DE": "Kopieren nach",
+    },
+    # в”Ђв”Ђ cost_orders в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "cost_orders.calculator": {
+        "EN": "Calculator",
+        "PL": "Kalkulator",
+        "ZH": "计算器",
+        "DE": "Rechner",
+    },
+    "cost_orders.default_manager": {
+        "EN": "Manager",
+        "PL": "Menedżer",
+        "ZH": "经理",
+        "DE": "Manager",
+    },
+    "cost_orders.err.table_settings": {
+        "EN": "Table settings error",
+        "PL": "Błąd ustawień tabeli",
+        "ZH": "表格设置错误",
+        "DE": "Fehler bei Tabelleneinstellungen",
+    },
+    "cost_orders.readonly_notice": {
+        "EN": "View mode — editing disabled",
+        "PL": "Tryb podglądu — edycja wyłączona",
+        "ZH": "查看模式 — 禁止编辑",
+        "DE": "Ansichtsmodus — Bearbeitung deaktiviert",
+    },
+    "cost_orders.sync.error_tip": {
+        "EN": "Workspace state could not be sent to DB. Click to retry.",
+        "PL": "Stan workspace nie mógł zostać przesłany do bazy danych. Kliknij, aby ponowić.",
+        "ZH": "工作区状态无法发送到数据库。点击重试。",
+        "DE": "Workspace-Status konnte nicht an die DB übertragen werden. Zum Wiederholen klicken.",
+    },
+    "cost_orders.sync.pending_tip": {
+        "EN": "Workspace state saved locally and not yet sent to DB. Click to sync.",
+        "PL": "Stan workspace zapisany lokalnie i jeszcze nie przesłany do bazy. Kliknij, aby zsynchronizować.",
+        "ZH": "工作区状态已本地保存，尚未发送到数据库。点击同步。",
+        "DE": "Workspace-Status lokal gespeichert und noch nicht an die DB übertragen. Zum Synchronisieren klicken.",
+    },
+    "cost_orders.sync.synced_tip": {
+        "EN": "Workspace state is in DB. Click to force sync.",
+        "PL": "Stan workspace jest w bazie. Kliknij, aby wymusić synchronizację.",
+        "ZH": "工作区状态已在数据库中。点击强制同步。",
+        "DE": "Workspace-Status ist in der DB. Zum erzwungenen Synchronisieren klicken.",
+    },
+    "cost_orders.sync.syncing_tip": {
+        "EN": "Sending workspace state to DB.",
+        "PL": "Przesyłanie stanu workspace do bazy danych.",
+        "ZH": "正在将工作区状态发送到数据库。",
+        "DE": "Workspace-Status wird an die DB übertragen.",
+    },
+    # в”Ђв”Ђ cost_stock в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "cost_stock.currency_updated": {
+        "EN": "Warehouse currency updated",
+        "PL": "Waluta magazynu zaktualizowana",
+        "ZH": "仓库货币已更新",
+        "DE": "Lagerwährung aktualisiert",
+    },
+    "cost_stock.help.title": {
+        "EN": "COGS Warehouse",
+        "PL": "KW Magazyn",
+        "ZH": "销货成本 仓库",
+        "DE": "EK Lager",
+    },
+    "cost_stock.order_cost_currency_updated": {
+        "EN": "Order COGS currency updated",
+        "PL": "Waluta KW zamówień zaktualizowana",
+        "ZH": "订单销货成本货币已更新",
+        "DE": "Bestell-COGS-Währung aktualisiert",
+    },
+    "cost_stock.title": {
+        "EN": "Cost price / Profitability • Warehouse",
+        "PL": "Koszt własny / Rentowność • Magazyn",
+        "ZH": "成本价格/盈利能力 • 仓库",
+        "DE": "Selbstkostenpreis / Rentabilität • Lager",
+    },
+    # в”Ђв”Ђ extensions в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "extensions.access_updated": {
+        "EN": "Access updated",
+        "PL": "Dostęp zaktualizowany",
+        "ZH": "访问权限已更新",
+        "DE": "Zugriff aktualisiert",
+    },
+    "extensions.add_message": {
+        "EN": "Add message",
+        "PL": "Dodaj wiadomość",
+        "ZH": "添加消息",
+        "DE": "Nachricht hinzufügen",
+    },
+    "extensions.automation_subtitle": {
+        "EN": "Set how many times per day to run the GSM Parser and at what exact time.",
+        "PL": "Ustaw, ile razy dziennie uruchamiać GSM Parser i o jakiej dokładnie godzinie.",
+        "ZH": "设置每天运行GSM解析器的次数和确切时间。",
+        "DE": "Festlegen, wie oft pro Tag der GSM-Parser laufen soll und zu welcher genauen Uhrzeit.",
+    },
+    "extensions.automation_title": {
+        "EN": "Automation",
+        "PL": "Automatyzacja",
+        "ZH": "自动化",
+        "DE": "Automatisierung",
+    },
+    "extensions.back_to_list": {
+        "EN": "Back to extensions",
+        "PL": "Powrót do rozszerzeń",
+        "ZH": "返回扩展列表",
+        "DE": "Zurück zu den Erweiterungen",
+    },
+    "extensions.blocked_by_sa": {
+        "EN": " (blocked by superadmin)",
+        "PL": " (zablokowane przez superadmina)",
+        "ZH": "（已被超级管理员封锁）",
+        "DE": " (vom Superadmin gesperrt)",
+    },
+    "extensions.brands_saved": {
+        "EN": "Brands saved",
+        "PL": "Marki zapisane",
+        "ZH": "品牌已保存",
+        "DE": "Marken gespeichert",
+    },
+    "extensions.brands_subtitle": {
+        "EN": "Configure brands for parsing: GSM Arena URL, last known device and E-Katalog link.",
+        "PL": "Skonfiguruj marki do parsowania: URL GSM Arena, ostatnie znane urządzenie i link do E-Katalog.",
+        "ZH": "配置解析品牌：GSM Arena URL、最后已知设备和E-Katalog链接。",
+        "DE": "Marken für das Parsen konfigurieren: GSM Arena URL, zuletzt bekanntes Gerät und E-Katalog-Link.",
+    },
+    "extensions.brands_title": {
+        "EN": "Brands and links",
+        "PL": "Marki i linki",
+        "ZH": "品牌和链接",
+        "DE": "Marken und Links",
+    },
+    "extensions.devices_tile": {
+        "EN": "Devices",
+        "PL": "Urządzenia",
+        "ZH": "设备",
+        "DE": "Geräte",
+    },
+    "extensions.disable": {
+        "EN": "Disable",
+        "PL": "Wyłącz",
+        "ZH": "禁用",
+        "DE": "Deaktivieren",
+    },
+    "extensions.enable": {
+        "EN": "Enable",
+        "PL": "Włącz",
+        "ZH": "启用",
+        "DE": "Aktivieren",
+    },
+    "extensions.err.logo_load": {
+        "EN": "Failed to load logo",
+        "PL": "Nie udało się załadować logo",
+        "ZH": "加载徽标失败",
+        "DE": "Logo konnte nicht geladen werden",
+    },
+    "extensions.err.save": {
+        "EN": "Save error",
+        "PL": "Błąd zapisu",
+        "ZH": "保存错误",
+        "DE": "Speicherfehler",
+    },
+    "extensions.err.save_brands": {
+        "EN": "Failed to save brands",
+        "PL": "Nie udało się zapisać marek",
+        "ZH": "保存品牌失败",
+        "DE": "Marken konnten nicht gespeichert werden",
+    },
+    "extensions.err.save_settings": {
+        "EN": "Failed to save settings",
+        "PL": "Nie udało się zapisać ustawień",
+        "ZH": "保存设置失败",
+        "DE": "Einstellungen konnten nicht gespeichert werden",
+    },
+    "extensions.err.state_update": {
+        "EN": "Failed to update state",
+        "PL": "Nie udało się zaktualizować stanu",
+        "ZH": "更新状态失败",
+        "DE": "Status konnte nicht aktualisiert werden",
+    },
+    "extensions.gsm_disabled": {
+        "EN": "GSM Parser is disabled for this company",
+        "PL": "GSM Parser jest wyłączony dla tej firmy",
+        "ZH": "此公司的GSM解析器已禁用",
+        "DE": "GSM Parser ist für dieses Unternehmen deaktiviert",
+    },
+    "extensions.gsm_state_updated": {
+        "EN": "GSM Parser state updated",
+        "PL": "Stan GSM Parser zaktualizowany",
+        "ZH": "GSM解析器状态已更新",
+        "DE": "GSM-Parser-Status aktualisiert",
+    },
+    "extensions.help.title": {
+        "EN": "Help — Extensions",
+        "PL": "Pomoc — Rozszerzenia",
+        "ZH": "帮助 — 扩展",
+        "DE": "Hilfe — Erweiterungen",
+    },
+    "extensions.launch_subtitle": {
+        "EN": "Test run without schedule: full or separately GSM/E-Katalog.",
+        "PL": "Testowy uruchomienie bez harmonogramu: pełny lub oddzielnie GSM/E-Katalog.",
+        "ZH": "无计划测试运行：完整或分别运行GSM/E-Katalog。",
+        "DE": "Testlauf ohne Zeitplan: vollständig oder getrennt GSM/E-Katalog.",
+    },
+    "extensions.launch_title": {
+        "EN": "Launch",
+        "PL": "Uruchomienie",
+        "ZH": "启动",
+        "DE": "Start",
+    },
+    "extensions.logo_loaded": {
+        "EN": "Logo loaded",
+        "PL": "Logo załadowane",
+        "ZH": "徽标已加载",
+        "DE": "Logo geladen",
+    },
+    "extensions.messages_subtitle": {
+        "EN": "Edit message texts, add new scenarios or remove unnecessary ones without editing code.",
+        "PL": "Edytuj teksty wiadomości, dodaj nowe scenariusze lub usuń zbędne bez edycji kodu.",
+        "ZH": "编辑消息文本，添加新场景或删除不必要的内容，无需编辑代码。",
+        "DE": "Nachrichtentexte bearbeiten, neue Szenarien hinzufügen oder unnötige entfernen, ohne Code zu bearbeiten.",
+    },
+    "extensions.messages_title": {
+        "EN": "Messages",
+        "PL": "Wiadomości",
+        "ZH": "消息",
+        "DE": "Nachrichten",
+    },
+    "extensions.open": {
+        "EN": "Open",
+        "PL": "Otwórz",
+        "ZH": "打开",
+        "DE": "Öffnen",
+    },
+    "extensions.parser_settings_subtitle": {
+        "EN": "Base for future parser rebuild: brands, links, latest devices and anti-ban pauses.",
+        "PL": "Podstawa do przyszłej przebudowy parsera: marki, linki, najnowsze urządzenia i przerwy anty-ban.",
+        "ZH": "未来解析器重建的基础：品牌、链接、最新设备和防封禁暂停。",
+        "DE": "Grundlage für zukünftigen Parser-Umbau: Marken, Links, neueste Geräte und Anti-Ban-Pausen.",
+    },
+    "extensions.parser_settings_title": {
+        "EN": "Parse settings",
+        "PL": "Ustawienia parsowania",
+        "ZH": "解析设置",
+        "DE": "Parse-Einstellungen",
+    },
+    "extensions.select_hint": {
+        "EN": "Select an extension to configure.",
+        "PL": "Wybierz rozszerzenie do konfiguracji.",
+        "ZH": "选择要配置的扩展。",
+        "DE": "Eine Erweiterung zur Konfiguration auswählen.",
+    },
+    "extensions.settings_saved": {
+        "EN": "GSM Parser settings saved",
+        "PL": "Ustawienia GSM Parser zapisane",
+        "ZH": "GSM解析器设置已保存",
+        "DE": "GSM-Parser-Einstellungen gespeichert",
+    },
+    "extensions.status_label": {
+        "EN": "Status: ",
+        "PL": "Status: ",
+        "ZH": "状态：",
+        "DE": "Status: ",
+    },
+    "extensions.tab.logs": {
+        "EN": "Logs",
+        "PL": "Logi",
+        "ZH": "日志",
+        "DE": "Protokolle",
+    },
+    "extensions.tab.permissions": {
+        "EN": "Permissions",
+        "PL": "Uprawnienia",
+        "ZH": "权限",
+        "DE": "Berechtigungen",
+    },
+    "extensions.tab.results": {
+        "EN": "View Results",
+        "PL": "Wyświetl Wyniki",
+        "ZH": "查看结果",
+        "DE": "Ergebnisse anzeigen",
+    },
+    "extensions.tg_report_subtitle": {
+        "EN": "Everything that can change in reports is moved to the app: chat, bot, link, send time and logos.",
+        "PL": "Wszystko, co może się zmieniać w raportach, przenosimy do aplikacji: czat, bot, link, czas wysyłki i loga.",
+        "ZH": "报告中所有可能变化的内容都移至应用程序：聊天、机器人、链接、发送时间和徽标。",
+        "DE": "Alles, was sich in Berichten ändern kann, wird in die App verschoben: Chat, Bot, Link, Sendezeit und Logos.",
+    },
+    "extensions.tg_report_title": {
+        "EN": "Telegram report",
+        "PL": "Raport Telegram",
+        "ZH": "Telegram报告",
+        "DE": "Telegram-Bericht",
+    },
+    "extensions.title": {
+        "EN": "Extensions",
+        "PL": "Rozszerzenia",
+        "ZH": "扩展",
+        "DE": "Erweiterungen",
+    },
+    "extensions.total_results": {
+        "EN": "Total results: {n}",
+        "PL": "Łączne wyniki: {n}",
+        "ZH": "总结果：{n}",
+        "DE": "Gesamtergebnisse: {n}",
+    },
+    # в”Ђв”Ђ files в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "files.all_regions": {
+        "EN": "All regions",
+        "PL": "Wszystkie regiony",
+        "ZH": "所有地区",
+        "DE": "Alle Regionen",
+    },
+    "files.col.date": {
+        "EN": "Date",
+        "PL": "Data",
+        "ZH": "日期",
+        "DE": "Datum",
+    },
+    "files.col.file": {
+        "EN": "File",
+        "PL": "Plik",
+        "ZH": "文件",
+        "DE": "Datei",
+    },
+    "files.col.size": {
+        "EN": "Size",
+        "PL": "Rozmiar",
+        "ZH": "大小",
+        "DE": "Größe",
+    },
+    "files.dlg.move": {
+        "EN": "Move",
+        "PL": "Przenieś",
+        "ZH": "移动",
+        "DE": "Verschieben",
+    },
+    "files.dlg.new_subfolder": {
+        "EN": "New subfolder",
+        "PL": "Nowy podfolder",
+        "ZH": "新子文件夹",
+        "DE": "Neuer Unterordner",
+    },
+    "files.dlg.rename_folder": {
+        "EN": "Rename folder",
+        "PL": "Zmień nazwę folderu",
+        "ZH": "重命名文件夹",
+        "DE": "Ordner umbenennen",
+    },
+    "files.empty_folder": {
+        "EN": "Folder is empty.",
+        "PL": "Folder jest pusty.",
+        "ZH": "文件夹为空。",
+        "DE": "Ordner ist leer.",
+    },
+    "files.err.create_folder": {
+        "EN": "Error creating folder",
+        "PL": "Błąd tworzenia folderu",
+        "ZH": "创建文件夹错误",
+        "DE": "Fehler beim Erstellen des Ordners",
+    },
+    "files.err.delete": {
+        "EN": "Delete error",
+        "PL": "Błąd usuwania",
+        "ZH": "删除错误",
+        "DE": "Fehler beim Löschen",
+    },
+    "files.err.delete_file": {
+        "EN": "Error deleting file",
+        "PL": "Błąd usuwania pliku",
+        "ZH": "删除文件错误",
+        "DE": "Fehler beim Löschen der Datei",
+    },
+    "files.err.move": {
+        "EN": "Move error",
+        "PL": "Błąd przenoszenia",
+        "ZH": "移动错误",
+        "DE": "Fehler beim Verschieben",
+    },
+    "files.err.no_data": {
+        "EN": "Could not retrieve file",
+        "PL": "Nie udało się pobrać pliku",
+        "ZH": "无法获取文件",
+        "DE": "Datei konnte nicht abgerufen werden",
+    },
+    "files.err.no_other_folder": {
+        "EN": "No other folders to move to",
+        "PL": "Brak innych folderów do przeniesienia",
+        "ZH": "没有其他文件夹可移动到",
+        "DE": "Keine anderen Ordner zum Verschieben vorhanden",
+    },
+    "files.err.rename": {
+        "EN": "Rename error",
+        "PL": "Błąd zmiany nazwy",
+        "ZH": "重命名错误",
+        "DE": "Fehler beim Umbenennen",
+    },
+    "files.err.too_large": {
+        "EN": "File is too large (max. {sz})",
+        "PL": "Plik jest za duży (maks. {sz})",
+        "ZH": "文件太大（最大 {sz}）",
+        "DE": "Datei ist zu groß (max. {sz})",
+    },
+    "files.err.upload": {
+        "EN": "File upload error",
+        "PL": "Błąd przesyłania pliku",
+        "ZH": "文件上传错误",
+        "DE": "Fehler beim Hochladen der Datei",
+    },
+    "files.folder_deleted": {
+        "EN": "Folder deleted",
+        "PL": "Folder usunięty",
+        "ZH": "文件夹已删除",
+        "DE": "Ordner gelöscht",
+    },
+    "files.folders_label": {
+        "EN": "Folders",
+        "PL": "Foldery",
+        "ZH": "文件夹",
+        "DE": "Ordner",
+    },
+    "files.help.title": {
+        "EN": "Help — Files",
+        "PL": "Pomoc — Pliki",
+        "ZH": "帮助 — 文件",
+        "DE": "Hilfe — Dateien",
+    },
+    "files.move_btn": {
+        "EN": "Move",
+        "PL": "Przenieś",
+        "ZH": "移动",
+        "DE": "Verschieben",
+    },
+    "files.move_select_hint": {
+        "EN": "Select folder…",
+        "PL": "Wybierz folder…",
+        "ZH": "选择文件夹…",
+        "DE": "Ordner auswählen…",
+    },
+    "files.moved": {
+        "EN": "Moved",
+        "PL": "Przeniesiono",
+        "ZH": "已移动",
+        "DE": "Verschoben",
+    },
+    "files.new_folder_hint": {
+        "EN": "New folder…",
+        "PL": "Nowy folder…",
+        "ZH": "新文件夹…",
+        "DE": "Neuer Ordner…",
+    },
+    "files.pick_dialog": {
+        "EN": "Select file to upload",
+        "PL": "Wybierz plik do przesłania",
+        "ZH": "选择要上传的文件",
+        "DE": "Datei zum Hochladen auswählen",
+    },
+    "files.save_dialog": {
+        "EN": "Save file",
+        "PL": "Zapisz plik",
+        "ZH": "保存文件",
+        "DE": "Datei speichern",
+    },
+    "files.saved": {
+        "EN": "Saved: {name}",
+        "PL": "Zapisano: {name}",
+        "ZH": "已保存：{name}",
+        "DE": "Gespeichert: {name}",
+    },
+    "files.select_folder": {
+        "EN": "Select folder",
+        "PL": "Wybierz folder",
+        "ZH": "选择文件夹",
+        "DE": "Ordner auswählen",
+    },
+    "files.title": {
+        "EN": "My files",
+        "PL": "Moje pliki",
+        "ZH": "我的文件",
+        "DE": "Meine Dateien",
+    },
+    "files.tooltip.add_subfolder": {
+        "EN": "Subfolder",
+        "PL": "Podfolder",
+        "ZH": "子文件夹",
+        "DE": "Unterordner",
+    },
+    "files.tooltip.create_folder": {
+        "EN": "Create folder",
+        "PL": "Utwórz folder",
+        "ZH": "创建文件夹",
+        "DE": "Ordner erstellen",
+    },
+    "files.tooltip.delete_folder": {
+        "EN": "Delete",
+        "PL": "Usuń",
+        "ZH": "删除",
+        "DE": "Löschen",
+    },
+    "files.tooltip.move": {
+        "EN": "Move",
+        "PL": "Przenieś",
+        "ZH": "移动",
+        "DE": "Verschieben",
+    },
+    "files.tooltip.open": {
+        "EN": "Open",
+        "PL": "Otwórz",
+        "ZH": "打开",
+        "DE": "Öffnen",
+    },
+    "files.tooltip.rename": {
+        "EN": "Rename",
+        "PL": "Zmień nazwę",
+        "ZH": "重命名",
+        "DE": "Umbenennen",
+    },
+    "files.tooltip.save_pc": {
+        "EN": "Save to PC",
+        "PL": "Zapisz na PC",
+        "ZH": "保存到电脑",
+        "DE": "Auf PC speichern",
+    },
+    "files.upload_btn": {
+        "EN": "Upload file",
+        "PL": "Prześlij plik",
+        "ZH": "上传文件",
+        "DE": "Datei hochladen",
+    },
+    "files.upload_hint": {
+        "EN": "Click «Upload file» to add.",
+        "PL": "Kliknij «Prześlij plik» aby dodać.",
+        "ZH": "点击«上传文件»添加。",
+        "DE": "Auf «Datei hochladen» klicken, um hinzuzufügen.",
+    },
+    "files.uploaded": {
+        "EN": "Uploaded",
+        "PL": "Przesłano",
+        "ZH": "已上传",
+        "DE": "Hochgeladen",
+    },
+    "files.uploading": {
+        "EN": "Uploading…",
+        "PL": "Przesyłanie…",
+        "ZH": "正在上传…",
+        "DE": "Wird hochgeladen…",
+    },
+
+    # в”Ђв”Ђ gsm в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "gsm.add_as_compatible": {
+        "EN": "Add as compatible",
+        "PL": "Dodaj jako kompatybilny",
+        "ZH": "添加为兼容",
+        "DE": "Als kompatibel hinzufügen",
+    },
+    "gsm.add_selected": {
+        "EN": "Add selected",
+        "PL": "Dodaj zaznaczone",
+        "ZH": "添加已选",
+        "DE": "Ausgewählte hinzufügen",
+    },
+    "gsm.checking_cache": {
+        "EN": "Checking cache…",
+        "PL": "Sprawdzanie pamięci podręcznej…",
+        "ZH": "正在检查缓存…",
+        "DE": "Cache wird geprüft…",
+    },
+    "gsm.collapse_all_brands": {
+        "EN": "Collapse all brands",
+        "PL": "Zwiń wszystkie marki",
+        "ZH": "折叠所有品牌",
+        "DE": "Alle Marken einklappen",
+    },
+    "gsm.comment_saved": {
+        "EN": "Comment saved",
+        "PL": "Komentarz zapisany",
+        "ZH": "评论已保存",
+        "DE": "Kommentar gespeichert",
+    },
+    "gsm.compare": {
+        "EN": "Compare",
+        "PL": "Porównaj",
+        "ZH": "比较",
+        "DE": "Vergleichen",
+    },
+    "gsm.compare_n": {
+        "EN": "Compare ({n})",
+        "PL": "Porównaj ({n})",
+        "ZH": "比较（{n}）",
+        "DE": "Vergleichen ({n})",
+    },
+    "gsm.comparison_title": {
+        "EN": "Device comparison ({n})",
+        "PL": "Porównanie urządzeń ({n})",
+        "ZH": "设备比较（{n}）",
+        "DE": "Gerätevergleich ({n})",
+    },
+    "gsm.compat_saved": {
+        "EN": "Compatibility saved",
+        "PL": "Kompatybilność zapisana",
+        "ZH": "兼容性已保存",
+        "DE": "Kompatibilität gespeichert",
+    },
+    "gsm.compat_search_hint": {
+        "EN": "Start typing a name…",
+        "PL": "Zacznij wpisywać nazwę…",
+        "ZH": "开始输入名称…",
+        "DE": "Namen eingeben…",
+    },
+    "gsm.confirmed_compatible": {
+        "EN": "Confirmed compatible",
+        "PL": "Potwierdzona kompatybilność",
+        "ZH": "已确认兼容",
+        "DE": "Bestätigt kompatibel",
+    },
+    "gsm.continue": {
+        "EN": "Continue",
+        "PL": "Kontynuuj",
+        "ZH": "继续",
+        "DE": "Fortfahren",
+    },
+    "gsm.delete_device_sa": {
+        "EN": "Delete device (SA)",
+        "PL": "Usuń urządzenie (SA)",
+        "ZH": "删除设备（SA）",
+        "DE": "Gerät löschen (SA)",
+    },
+    "gsm.delete_device_title": {
+        "EN": "Delete device?",
+        "PL": "Usunąć urządzenie?",
+        "ZH": "删除设备？",
+        "DE": "Gerät löschen?",
+    },
+    "gsm.ek_match_removed": {
+        "EN": "EK product removed — the next parse will try to find it again",
+        "PL": "Produkt EK usunięty — kolejne parsowanie spróbuje go ponownie znaleźć",
+        "ZH": "EK 商品已移除——下次解析将重新尝试查找",
+        "DE": "EK-Produkt entfernt — der nächste Parsevorgang versucht es erneut zu finden",
+    },
+    "gsm.err.save_failed": {
+        "EN": "Failed to save",
+        "PL": "Nie udało się zapisać",
+        "ZH": "保存失败",
+        "DE": "Speichern fehlgeschlagen",
+    },
+    "gsm.expand_all_brands": {
+        "EN": "Expand all brands",
+        "PL": "Rozwiń wszystkie marki",
+        "ZH": "展开所有品牌",
+        "DE": "Alle Marken ausklappen",
+    },
+    "gsm.filters_btn": {
+        "EN": "Filters",
+        "PL": "Filtry",
+        "ZH": "筛选器",
+        "DE": "Filter",
+    },
+    "gsm.found_devices": {
+        "EN": "Found: {n} devices{extra}",
+        "PL": "Znaleziono: {n} urządzeń{extra}",
+        "ZH": "找到：{n} 台设备{extra}",
+        "DE": "Gefunden: {n} Geräte{extra}",
+    },
+    "gsm.found_simple": {
+        "EN": "Found: {n} devices",
+        "PL": "Znaleziono: {n} urządzeń",
+        "ZH": "找到：{n} 台设备",
+        "DE": "Gefunden: {n} Geräte",
+    },
+    "gsm.help.title": {
+        "EN": "Help — GSM Parser",
+        "PL": "Pomoc — GSM Parser",
+        "ZH": "帮助 — GSM解析器",
+        "DE": "Hilfe — GSM-Parser",
+    },
+    "gsm.loading_devices": {
+        "EN": "Loading devices…",
+        "PL": "Ładowanie urządzeń…",
+        "ZH": "正在加载设备…",
+        "DE": "Geräte werden geladen…",
+    },
+    "gsm.loading_wait": {
+        "EN": "Please wait, data is still loading…",
+        "PL": "Poczekaj, dane są jeszcze ładowane…",
+        "ZH": "请稍候，数据仍在加载…",
+        "DE": "Bitte warten, Daten werden noch geladen…",
+    },
+    "gsm.manual_ek_url_fetched": {
+        "EN": "EK product loaded: {name}",
+        "PL": "Produkt EK załadowany: {name}",
+        "ZH": "已加载 EK 商品：{name}",
+        "DE": "EK-Produkt geladen: {name}",
+    },
+    "gsm.manual_ek_url_saved": {
+        "EN": "Link saved — it will be used on the next parse",
+        "PL": "Link zapisany — zostanie uwzględniony przy kolejnym parsowaniu",
+        "ZH": "链接已保存——将在下次解析时使用",
+        "DE": "Link gespeichert — wird beim nächsten Parsevorgang berücksichtigt",
+    },
+    "gsm.menu.ek_only": {
+        "EN": "E-Katalog only",
+        "PL": "Tylko E-Katalog",
+        "ZH": "仅E-Katalog",
+        "DE": "Nur E-Katalog",
+    },
+    "gsm.menu.full_parse": {
+        "EN": "Full parse (GSM + EK)",
+        "PL": "Pełne parsowanie (GSM + EK)",
+        "ZH": "完整解析（GSM + EK）",
+        "DE": "Vollständiges Parsen (GSM + EK)",
+    },
+    "gsm.menu.gsm_only": {
+        "EN": "GSM Arena only",
+        "PL": "Tylko GSM Arena",
+        "ZH": "仅GSM Arena",
+        "DE": "Nur GSM Arena",
+    },
+    "gsm.menu.xiaomi_regions": {
+        "EN": "Xiaomi regions",
+        "PL": "Regiony Xiaomi",
+        "ZH": "小米地区",
+        "DE": "Xiaomi-Regionen",
+    },
+    "gsm.name_copied": {
+        "EN": "Name copied",
+        "PL": "Nazwa skopiowana",
+        "ZH": "名称已复制",
+        "DE": "Name kopiert",
+    },
+    "gsm.next_page": {
+        "EN": "Next page",
+        "PL": "Następna strona",
+        "ZH": "下一页",
+        "DE": "Nächste Seite",
+    },
+    "gsm.no_data_90days": {
+        "EN": "No data for the last 90 days",
+        "PL": "Brak danych za ostatnie 90 dni",
+        "ZH": "过去90天没有数据",
+        "DE": "Keine Daten für die letzten 90 Tage",
+    },
+    "gsm.no_devices_found": {
+        "EN": "No devices found. Try changing filters or start parsing.",
+        "PL": "Nie znaleziono urządzeń. Spróbuj zmienić filtry lub uruchom parsowanie.",
+        "ZH": "未找到设备。请尝试更改筛选器或启动解析。",
+        "DE": "Keine Geräte gefunden. Filter ändern oder Parsing starten.",
+    },
+    "gsm.nothing_found": {
+        "EN": "Nothing found",
+        "PL": "Nic nie znaleziono",
+        "ZH": "未找到任何内容",
+        "DE": "Nichts gefunden",
+    },
+    "gsm.nothing_selected": {
+        "EN": "Nothing selected",
+        "PL": "Nic nie zaznaczono",
+        "ZH": "未选择任何内容",
+        "DE": "Nichts ausgewählt",
+    },
+    "gsm.parser_running": {
+        "EN": "Parsing…",
+        "PL": "Parsowanie…",
+        "ZH": "解析中…",
+        "DE": "Wird geparst…",
+    },
+    "gsm.parser_start": {
+        "EN": "Start",
+        "PL": "Uruchom",
+        "ZH": "启动",
+        "DE": "Starten",
+    },
+    "gsm.pause": {
+        "EN": "Pause",
+        "PL": "Pauza",
+        "ZH": "暂停",
+        "DE": "Pause",
+    },
+    "gsm.preparing_page": {
+        "EN": "Preparing page…",
+        "PL": "Przygotowywanie strony…",
+        "ZH": "正在准备页面…",
+        "DE": "Seite wird vorbereitet…",
+    },
+    "gsm.prev_page": {
+        "EN": "Previous page",
+        "PL": "Poprzednia strona",
+        "ZH": "上一页",
+        "DE": "Vorherige Seite",
+    },
+    "gsm.preset_saved": {
+        "EN": "Preset «{name}» saved",
+        "PL": "Preset «{name}» zapisany",
+        "ZH": "预设«{name}»已保存",
+        "DE": "Preset «{name}» gespeichert",
+    },
+    "gsm.presets_hint": {
+        "EN": "My Filters",
+        "PL": "Moje Filtry",
+        "ZH": "我的筛选器",
+        "DE": "Meine Filter",
+    },
+    "gsm.record_deleted": {
+        "EN": "Record deleted",
+        "PL": "Rekord usunięty",
+        "ZH": "记录已删除",
+        "DE": "Datensatz gelöscht",
+    },
+    "gsm.save_filter": {
+        "EN": "Save filter",
+        "PL": "Zapisz filtr",
+        "ZH": "保存筛选器",
+        "DE": "Filter speichern",
+    },
+    "gsm.schedule.menu_item": {
+        "EN": "Schedule launch…",
+        "PL": "Zaplanuj uruchomienie…",
+        "ZH": "计划启动…",
+        "DE": "Start planen…",
+    },
+    "gsm.schedule.dialog_title": {
+        "EN": "Schedule parser launch",
+        "PL": "Zaplanuj uruchomienie parsera",
+        "ZH": "计划解析器启动",
+        "DE": "Parser-Start planen",
+    },
+    "gsm.schedule.mode_label": {
+        "EN": "Launch mode",
+        "PL": "Tryb uruchomienia",
+        "ZH": "启动模式",
+        "DE": "Startmodus",
+    },
+    "gsm.schedule.quick_label": {
+        "EN": "Quick pick:",
+        "PL": "Szybki wybór:",
+        "ZH": "快速选择：",
+        "DE": "Schnellauswahl:",
+    },
+    "gsm.schedule.quick_15m": {
+        "EN": "+15 min",
+        "PL": "+15 min",
+        "ZH": "+15分钟",
+        "DE": "+15 Min",
+    },
+    "gsm.schedule.quick_30m": {
+        "EN": "+30 min",
+        "PL": "+30 min",
+        "ZH": "+30分钟",
+        "DE": "+30 Min",
+    },
+    "gsm.schedule.quick_1h": {
+        "EN": "+1 h",
+        "PL": "+1 godz.",
+        "ZH": "+1小时",
+        "DE": "+1 Std",
+    },
+    "gsm.schedule.quick_2h": {
+        "EN": "+2 h",
+        "PL": "+2 godz.",
+        "ZH": "+2小时",
+        "DE": "+2 Std",
+    },
+    "gsm.schedule.quick_4h": {
+        "EN": "+4 h",
+        "PL": "+4 godz.",
+        "ZH": "+4小时",
+        "DE": "+4 Std",
+    },
+    "gsm.schedule.custom_label": {
+        "EN": "Or set a delay from now:",
+        "PL": "Lub ustaw opóźnienie od teraz:",
+        "ZH": "或设置从现在起的延迟：",
+        "DE": "Oder eine Verzögerung ab jetzt festlegen:",
+    },
+    "gsm.schedule.hours_label": {
+        "EN": "Hours",
+        "PL": "Godziny",
+        "ZH": "小时",
+        "DE": "Stunden",
+    },
+    "gsm.schedule.minutes_label": {
+        "EN": "Minutes",
+        "PL": "Minuty",
+        "ZH": "分钟",
+        "DE": "Minuten",
+    },
+    "gsm.schedule.confirm_btn": {
+        "EN": "Schedule",
+        "PL": "Zaplanuj",
+        "ZH": "计划",
+        "DE": "Planen",
+    },
+    "gsm.schedule.cancel_active_btn": {
+        "EN": "Cancel scheduled launch",
+        "PL": "Anuluj zaplanowane uruchomienie",
+        "ZH": "取消计划启动",
+        "DE": "Geplanten Start abbrechen",
+    },
+    "gsm.schedule.none_active": {
+        "EN": "No launch scheduled",
+        "PL": "Nic nie zaplanowano",
+        "ZH": "未计划启动",
+        "DE": "Kein Start geplant",
+    },
+    "gsm.schedule.active_status": {
+        "EN": "Scheduled for {time} (in {left})",
+        "PL": "Zaplanowano na {time} (za {left})",
+        "ZH": "计划于{time}（还有{left}）",
+        "DE": "Geplant für {time} (in {left})",
+    },
+    "gsm.schedule.scheduled_snack": {
+        "EN": "Launch scheduled in {left}",
+        "PL": "Uruchomienie zaplanowano za {left}",
+        "ZH": "已计划在{left}后启动",
+        "DE": "Start in {left} geplant",
+    },
+    "gsm.schedule.cancelled_snack": {
+        "EN": "Scheduled launch cancelled",
+        "PL": "Zaplanowane uruchomienie anulowano",
+        "ZH": "已取消计划启动",
+        "DE": "Geplanter Start abgebrochen",
+    },
+    "gsm.schedule.invalid_delay": {
+        "EN": "Set a time greater than zero",
+        "PL": "Ustaw czas większy niż zero",
+        "ZH": "请设置大于零的时间",
+        "DE": "Zeit größer als null festlegen",
+    },
+    "gsm.schedule.help_title": {
+        "EN": "Help — Scheduled launch",
+        "PL": "Pomoc — Zaplanowane uruchomienie",
+        "ZH": "帮助 — 计划启动",
+        "DE": "Hilfe — Geplanter Start",
+    },
+    "gsm.schedule.help.desc": {
+        "EN": "Lets you run the parser after a delay instead of immediately — useful when you're running it manually at night and want the changes to be recorded under tomorrow's date.",
+        "PL": "Pozwala uruchomić parser po opóźnieniu zamiast od razu — przydatne, gdy uruchamiasz go ręcznie w nocy i chcesz, aby zmiany zostały zapisane pod jutrzejszą datą.",
+        "ZH": "允许延迟运行解析器而不是立即运行——当您在夜间手动运行它并希望更改记录在明天的日期下时很有用。",
+        "DE": "Ermöglicht das verzögerte statt sofortige Starten des Parsers — nützlich, wenn Sie ihn nachts manuell starten und die Änderungen unter dem morgigen Datum erfasst werden sollen.",
+    },
+    "gsm.schedule.help.steps_title": {
+        "EN": "How to use",
+        "PL": "Jak korzystać",
+        "ZH": "使用方法",
+        "DE": "Anwendung",
+    },
+    "gsm.schedule.help.step1": {
+        "EN": "1. Choose the launch mode (full / GSM only / E-Katalog only).",
+        "PL": "1. Wybierz tryb uruchomienia (pełny / tylko GSM / tylko E-Katalog).",
+        "ZH": "1. 选择启动模式（完整/仅GSM/仅E-Katalog）。",
+        "DE": "1. Wählen Sie den Startmodus (vollständig / nur GSM / nur E-Katalog).",
+    },
+    "gsm.schedule.help.step2": {
+        "EN": "2. Click one of the quick-pick buttons, or set a delay from now in the «Hours» / «Minutes» fields (e.g. 1h 30m means «in 90 minutes», not «at 1:30»).",
+        "PL": "2. Kliknij jeden z przycisków szybkiego wyboru lub ustaw opóźnienie od teraz w polach «Godziny» / «Minuty» (np. 1 godz. 30 min oznacza «za 90 minut», a nie «o 1:30»).",
+        "ZH": "2. 点击其中一个快速选择按钮，或在«小时»/«分钟»字段中设置从现在起的延迟（例如1小时30分钟表示«90分钟后»，而不是«在1:30»）。",
+        "DE": "2. Klicken Sie auf eine der Schnellauswahl-Schaltflächen oder legen Sie eine Verzögerung ab jetzt in den Feldern «Stunden» / «Minuten» fest (z. B. bedeutet 1 Std. 30 Min. «in 90 Minuten», nicht «um 1:30»).",
+    },
+    "gsm.schedule.help.step3": {
+        "EN": "3. Click «Schedule» — a countdown will appear next to the «Run» button.",
+        "PL": "3. Kliknij «Zaplanuj» — obok przycisku «Uruchom» pojawi się odliczanie.",
+        "ZH": "3. 点击«计划»——«运行»按钮旁会出现倒计时。",
+        "DE": "3. Klicken Sie auf «Planen» — neben der Schaltfläche «Starten» erscheint ein Countdown.",
+    },
+    "gsm.schedule.help.step4": {
+        "EN": "4. The app must stay open — the launch happens automatically once the set time arrives.",
+        "PL": "4. Aplikacja musi pozostać otwarta — uruchomienie nastąpi automatycznie, gdy nadejdzie ustawiony czas.",
+        "ZH": "4. 应用程序必须保持打开——设定时间到达后将自动启动。",
+        "DE": "4. Die App muss geöffnet bleiben — der Start erfolgt automatisch, sobald die eingestellte Zeit erreicht ist.",
+    },
+    "gsm.schedule.help.step5": {
+        "EN": "5. «Cancel scheduled launch» removes the timer without running the parser.",
+        "PL": "5. «Anuluj zaplanowane uruchomienie» usuwa licznik czasu bez uruchamiania parsera.",
+        "ZH": "5. «取消计划启动»会移除计时器而不运行解析器。",
+        "DE": "5. «Geplanten Start abbrechen» entfernt den Timer, ohne den Parser zu starten.",
+    },
+    "gsm.search_hint": {
+        "EN": "Search by brand or model…",
+        "PL": "Szukaj według marki lub modelu…",
+        "ZH": "按品牌或型号搜索…",
+        "DE": "Nach Marke oder Modell suchen…",
+    },
+    "gsm.sidebar.appeared_sale": {
+        "EN": "Appeared for sale:",
+        "PL": "Pojawiły się w sprzedaży:",
+        "ZH": "出现销售：",
+        "DE": "Im Verkauf erschienen:",
+    },
+    "gsm.sidebar.regions_appeared": {
+        "EN": "Regions appeared:",
+        "PL": "Pojawiły się regiony:",
+        "ZH": "出现地区：",
+        "DE": "Regionen erschienen:",
+    },
+    "gsm.sidebar.ek_new": {
+        "EN": "New E-Katalog:",
+        "PL": "Nowe E-Katalog:",
+        "ZH": "新E-Katalog：",
+        "DE": "Neues E-Katalog:",
+    },
+    "gsm.sidebar.gsm_new": {
+        "EN": "New GSM Arena:",
+        "PL": "Nowe GSM Arena:",
+        "ZH": "新GSM Arena：",
+        "DE": "Neues GSM Arena:",
+    },
+    "gsm.sidebar.no_new": {
+        "EN": "No new items",
+        "PL": "Brak nowości",
+        "ZH": "没有新品",
+        "DE": "Keine Neuheiten",
+    },
+    "gsm.stop": {
+        "EN": "Stop",
+        "PL": "Stop",
+        "ZH": "停止",
+        "DE": "Stopp",
+    },
+    "gsm.sync_btn": {
+        "EN": "Sync",
+        "PL": "Synchronizacja",
+        "ZH": "同步",
+        "DE": "Synchronisierung",
+    },
+    "gsm.sync_n": {
+        "EN": "Syncing… {n} changed",
+        "PL": "Synchronizacja… {n} zmienionych",
+        "ZH": "同步中… {n} 个已更改",
+        "DE": "Synchronisierung… {n} geändert",
+    },
+    "gsm.sync_tooltip": {
+        "EN": "Force update cache from DB (changes only)",
+        "PL": "Wymuś aktualizację cache z bazy danych (tylko zmiany)",
+        "ZH": "强制从数据库更新缓存（仅更改）",
+        "DE": "Cache aus DB zwangsweise aktualisieren (nur Änderungen)",
+    },
+    "gsm.syncing": {
+        "EN": "Syncing…",
+        "PL": "Synchronizacja…",
+        "ZH": "同步中…",
+        "DE": "Synchronisierung…",
+    },
+    "gsm.title": {
+        "EN": "GSM Parser — Results",
+        "PL": "GSM Parser — Wyniki",
+        "ZH": "GSM解析器 — 结果",
+        "DE": "GSM-Parser — Ergebnisse",
+    },
+    "gsm.variants_saved": {
+        "EN": "Variants saved",
+        "PL": "Warianty zapisane",
+        "ZH": "变体已保存",
+        "DE": "Varianten gespeichert",
+    },
+    "gsm.yes_delete": {
+        "EN": "Yes, delete",
+        "PL": "Tak, usuń",
+        "ZH": "是，删除",
+        "DE": "Ja, löschen",
+    },
+    # в”Ђв”Ђ home в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "home.overall_label": {
+        "EN": "Overall:",
+        "PL": "Ogółem:",
+        "ZH": "总计：",
+        "DE": "Gesamt:",
+    },
+    "home.pack_supplier": {
+        "EN": "pack. supp./",
+        "PL": "dost. opak./",
+        "ZH": "包装供应商/",
+        "DE": "Verp. Lief./",
+    },
+    "home.prod_supplier": {
+        "EN": "prod. supp.",
+        "PL": "dost. tow.",
+        "ZH": "产品供应商",
+        "DE": "Prod. Lief.",
+    },
+    "home.title": {
+        "EN": "Home",
+        "PL": "Główna",
+        "ZH": "主页",
+        "DE": "Startseite",
+    },
+    # в”Ђв”Ђ languages в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "languages.add_btn": {
+        "EN": "Add language",
+        "PL": "Dodaj język",
+        "ZH": "添加语言",
+        "DE": "Sprache hinzufügen",
+    },
+    "languages.col_key": {
+        "EN": "Key",
+        "PL": "Klucz",
+        "ZH": "键",
+        "DE": "Schlüssel",
+    },
+    "languages.col_uk_base": {
+        "EN": "Ukrainian (base)",
+        "PL": "Ukraiński (baza)",
+        "ZH": "乌克兰语（基础）",
+        "DE": "Ukrainisch (Basis)",
+    },
+    "languages.export_excel": {
+        "EN": "Download Excel",
+        "PL": "Pobierz Excel",
+        "ZH": "下载Excel",
+        "DE": "Excel herunterladen",
+    },
+    "languages.help.title": {
+        "EN": "Help — Languages",
+        "PL": "Pomoc — Języki",
+        "ZH": "帮助 — 语言",
+        "DE": "Hilfe — Sprachen",
+    },
+    "languages.import_excel": {
+        "EN": "Upload from Excel",
+        "PL": "Wgraj z Excela",
+        "ZH": "从Excel上传",
+        "DE": "Aus Excel hochladen",
+    },
+    "languages.no_unsaved_changes": {
+        "EN": "No unsaved changes",
+        "PL": "Brak niezapisanych zmian",
+        "ZH": "没有未保存的更改",
+        "DE": "Keine ungespeicherten Änderungen",
+    },
+    "languages.paste_dialog_title": {
+        "EN": "Paste from clipboard — {code}",
+        "PL": "Wklej ze schowka — {code}",
+        "ZH": "从剪贴板粘贴 — {code}",
+        "DE": "Aus Zwischenablage einfügen — {code}",
+    },
+    "languages.translations_saved": {
+        "EN": "Translations saved.",
+        "PL": "Tłumaczenia zapisane.",
+        "ZH": "翻译已保存。",
+        "DE": "Übersetzungen gespeichert.",
+    },
+    # в”Ђв”Ђ media в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "media.col.comment": {
+        "EN": "Comment",
+        "PL": "Komentarz",
+        "ZH": "评论",
+        "DE": "Kommentar",
+    },
+    "media.col.days_pub": {
+        "EN": "Days since pub.",
+        "PL": "Dni od publ.",
+        "ZH": "发布天数",
+        "DE": "Tage seit Veröff.",
+    },
+    "media.col.product_name": {
+        "EN": "Product name",
+        "PL": "Nazwa produktu",
+        "ZH": "产品名称",
+        "DE": "Produktname",
+    },
+    "media.col.pub_dates": {
+        "EN": "Publication dates",
+        "PL": "Daty publikacji",
+        "ZH": "发布日期",
+        "DE": "Veröffentlichungsdaten",
+    },
+    "media.copied": {
+        "EN": "Copied",
+        "PL": "Skopiowano",
+        "ZH": "已复制",
+        "DE": "Kopiert",
+    },
+    "media.create_btn": {
+        "EN": "Create",
+        "PL": "Utwórz",
+        "ZH": "创建",
+        "DE": "Erstellen",
+    },
+    "media.day.0": {"EN": "Mon", "PL": "Pon", "ZH": "周一", "DE": "Mo"},
+    "media.day.1": {"EN": "Tue", "PL": "Wt", "ZH": "周二", "DE": "Di"},
+    "media.day.2": {"EN": "Wed", "PL": "Śr", "ZH": "周三", "DE": "Mi"},
+    "media.day.3": {"EN": "Thu", "PL": "Czw", "ZH": "周四", "DE": "Do"},
+    "media.day.4": {"EN": "Fri", "PL": "Pt", "ZH": "周五", "DE": "Fr"},
+    "media.day.5": {"EN": "Sat", "PL": "Sob", "ZH": "周六", "DE": "Sa"},
+    "media.day.6": {"EN": "Sun", "PL": "Nd", "ZH": "周日", "DE": "So"},
+    "media.dlg.col_width_height": {
+        "EN": "Column / Width / Height",
+        "PL": "Kolumna / Szerokość / Wysokość",
+        "ZH": "列 / 宽度 / 高度",
+        "DE": "Spalte / Breite / Höhe",
+    },
+    "media.dlg.cols_months": {
+        "EN": "Columns and months",
+        "PL": "Kolumny i miesiące",
+        "ZH": "列和月份",
+        "DE": "Spalten und Monate",
+    },
+    "media.dlg.custom_name": {
+        "EN": "Custom name",
+        "PL": "Własna nazwa",
+        "ZH": "自定义名称",
+        "DE": "Benutzerdefinierter Name",
+    },
+    "media.dlg.new_extra_post": {
+        "EN": "New extra post",
+        "PL": "Nowy dodatkowy post",
+        "ZH": "新建额外帖子",
+        "DE": "Neuer zusätzlicher Beitrag",
+    },
+    "media.err.enter_extra_post_name": {
+        "EN": "Specify the extra post name",
+        "PL": "Podaj nazwę dodatkowego postu",
+        "ZH": "请指定额外帖子名称",
+        "DE": "Name des zusätzlichen Beitrags angeben",
+    },
+    "media.err.select_month_year": {
+        "EN": "Select month and year",
+        "PL": "Wybierz miesiąc i rok",
+        "ZH": "选择月份和年份",
+        "DE": "Monat und Jahr auswählen",
+    },
+    "media.extra_post_created": {
+        "EN": "Extra post created",
+        "PL": "Dodatkowy post utworzony",
+        "ZH": "额外帖子已创建",
+        "DE": "Zusätzlicher Beitrag erstellt",
+    },
+    "media.extra_post_deleted": {
+        "EN": "Extra post deleted",
+        "PL": "Dodatkowy post usunięty",
+        "ZH": "额外帖子已删除",
+        "DE": "Zusätzlicher Beitrag gelöscht",
+    },
+    "media.field.archive": {
+        "EN": "Archive",
+        "PL": "Archiwum",
+        "ZH": "归档",
+        "DE": "Archiv",
+    },
+    "media.field.days_pub": {
+        "EN": "Days since pub.",
+        "PL": "Dni od publ.",
+        "ZH": "发布天数",
+        "DE": "Tage seit Veröff.",
+    },
+    "media.field.month": {
+        "EN": "Month",
+        "PL": "Miesiąc",
+        "ZH": "月份",
+        "DE": "Monat",
+    },
+    "media.field.months_count": {
+        "EN": "Number of months",
+        "PL": "Liczba miesięcy",
+        "ZH": "月份数量",
+        "DE": "Anzahl der Monate",
+    },
+    "media.field.product_name": {
+        "EN": "Product name",
+        "PL": "Nazwa produktu",
+        "ZH": "产品名称",
+        "DE": "Produktname",
+    },
+    "media.field.row_height": {
+        "EN": "Row height (px)",
+        "PL": "Wysokość wiersza (px)",
+        "ZH": "行高（px）",
+        "DE": "Zeilenhöhe (px)",
+    },
+    "media.field.show_prev_month": {
+        "EN": "Show previous month",
+        "PL": "Pokaż poprzedni miesiąc",
+        "ZH": "显示上个月",
+        "DE": "Vorherigen Monat anzeigen",
+    },
+    "media.field.text_size": {
+        "EN": "Text size",
+        "PL": "Rozmiar tekstu",
+        "ZH": "文字大小",
+        "DE": "Textgröße",
+    },
+    "media.field.text_wrap": {
+        "EN": "Text wrap",
+        "PL": "Zawijanie tekstu",
+        "ZH": "文字换行",
+        "DE": "Textumbruch",
+    },
+    "media.help.title": {
+        "EN": "Media Plan",
+        "PL": "Plan Mediów",
+        "ZH": "媒体计划",
+        "DE": "Medienplan",
+    },
+    "media.merged_products": {
+        "EN": "Merged {n} products into one post",
+        "PL": "Połączono {n} produkty w jeden post",
+        "ZH": "已将 {n} 个产品合并为一个帖子",
+        "DE": "{n} Produkte zu einem Beitrag zusammengeführt",
+    },
+    "media.not_owner": {
+        "EN": "You are not the owner of this record",
+        "PL": "Nie jesteś właścicielem tego rekordu",
+        "ZH": "您不是此记录的所有者",
+        "DE": "Sie sind nicht der Eigentümer dieses Datensatzes",
+    },
+    "media.reset_sort": {
+        "EN": "Reset sort",
+        "PL": "Resetuj sortowanie",
+        "ZH": "重置排序",
+        "DE": "Sortierung zurücksetzen",
+    },
+    "media.select_merged_to_split": {
+        "EN": "Select merged rows to split",
+        "PL": "Wybierz połączone wiersze do rozdzielenia",
+        "ZH": "选择合并的行以拆分",
+        "DE": "Zusammengeführte Zeilen zum Aufteilen auswählen",
+    },
+    "media.split_rows": {
+        "EN": "Split into {n} rows",
+        "PL": "Podzielono na {n} wiersze",
+        "ZH": "拆分为 {n} 行",
+        "DE": "In {n} Zeilen aufgeteilt",
+    },
+    "media.stale_filter_hint": {
+        "EN": "Filter: >14 days or no publications",
+        "PL": "Filtr: >14 dni lub bez publikacji",
+        "ZH": "筛选器：超过14天或没有发布",
+        "DE": "Filter: >14 Tage oder keine Veröffentlichungen",
+    },
+    "media.title": {
+        "EN": "Media Plan",
+        "PL": "Plan Mediów",
+        "ZH": "媒体计划",
+        "DE": "Medienplan",
+    },
+    "media.tooltip.reset_col_sort": {
+        "EN": "Reset column sort",
+        "PL": "Resetuj sortowanie kolumny",
+        "ZH": "重置列排序",
+        "DE": "Spaltensortierung zurücksetzen",
+    },
+    "media.unmerged_rows": {
+        "EN": "Split into {n} rows",
+        "PL": "Rozdzielono na {n} wiersze",
+        "ZH": "拆分为 {n} 行",
+        "DE": "In {n} Zeilen aufgeteilt",
+    },
+
+    # в”Ђв”Ђ nav в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "nav.admin_title": {
+        "EN": "Admin",
+        "PL": "Admin",
+        "ZH": "管理员",
+        "DE": "Admin",
+    },
+    "nav.all_companies": {
+        "EN": "All companies",
+        "PL": "Wszystkie firmy",
+        "ZH": "所有公司",
+        "DE": "Alle Unternehmen",
+    },
+    "nav.all_regions": {
+        "EN": "All regions",
+        "PL": "Wszystkie regiony",
+        "ZH": "所有地区",
+        "DE": "Alle Regionen",
+    },
+    "nav.app_updates": {
+        "EN": "Updates",
+        "PL": "Aktualizacje",
+        "ZH": "更新",
+        "DE": "Aktualisierungen",
+    },
+    "nav.approvals": {
+        "EN": "Approve requests",
+        "PL": "Zatwierdź wnioski",
+        "ZH": "批准申请",
+        "DE": "Anfragen genehmigen",
+    },
+    "nav.back_to_superadmin": {
+        "EN": "Back to SuperAdmin",
+        "PL": "Wróć do SuperAdmina",
+        "ZH": "返回超级管理员",
+        "DE": "Zurück zum SuperAdmin",
+    },
+    "nav.bulk_template": {
+        "EN": "Bulk template",
+        "PL": "Szablon masowy",
+        "ZH": "批量模板",
+        "DE": "Massenvorlage",
+    },
+    "nav.calculators": {
+        "EN": "Calculators",
+        "PL": "Kalkulatory",
+        "ZH": "计算器",
+        "DE": "Rechner",
+    },
+    "nav.categories": {
+        "EN": "Categories",
+        "PL": "Kategorie",
+        "ZH": "类别",
+        "DE": "Kategorien",
+    },
+    "nav.close_tab": {
+        "EN": "Close page",
+        "PL": "Zamknij stronę",
+        "ZH": "关闭页面",
+        "DE": "Seite schließen",
+    },
+    "nav.company": {
+        "EN": "Company",
+        "PL": "Firma",
+        "ZH": "公司",
+        "DE": "Unternehmen",
+    },
+    "nav.company_label": {
+        "EN": "Company",
+        "PL": "Firma",
+        "ZH": "公司",
+        "DE": "Unternehmen",
+    },
+    "nav.copy": {
+        "EN": "Copy",
+        "PL": "Kopiowanie",
+        "ZH": "复制",
+        "DE": "Kopieren",
+    },
+    "nav.cost_orders": {
+        "EN": "COGS Orders",
+        "PL": "KW Zamówienia",
+        "ZH": "销货成本 订单",
+        "DE": "EK Bestellungen",
+    },
+    "nav.cost_stock": {
+        "EN": "COGS Warehouse",
+        "PL": "KW Magazyn",
+        "ZH": "销货成本 仓库",
+        "DE": "EK Lager",
+    },
+    "nav.default_role": {
+        "EN": "Manager",
+        "PL": "Menedżer",
+        "ZH": "经理",
+        "DE": "Manager",
+    },
+    "nav.default_user": {
+        "EN": "User",
+        "PL": "Użytkownik",
+        "ZH": "用户",
+        "DE": "Benutzer",
+    },
+    "nav.extensions": {
+        "EN": "Extensions",
+        "PL": "Rozszerzenia",
+        "ZH": "扩展",
+        "DE": "Erweiterungen",
+    },
+    "nav.files": {
+        "EN": "Files",
+        "PL": "Pliki",
+        "ZH": "文件",
+        "DE": "Dateien",
+    },
+    "nav.go_to_login": {
+        "EN": "Go to login",
+        "PL": "Przejdź do logowania",
+        "ZH": "前往登录",
+        "DE": "Zur Anmeldung",
+    },
+    "nav.gsm": {
+        "EN": "GSM Parser",
+        "PL": "GSM Parser",
+        "ZH": "GSM解析器",
+        "DE": "GSM-Parser",
+    },
+    "nav.help_title": {
+        "EN": "Help — navigation",
+        "PL": "Pomoc — nawigacja",
+        "ZH": "帮助 — 导航",
+        "DE": "Hilfe — Navigation",
+    },
+    "nav.help_tooltip": {
+        "EN": "Help",
+        "PL": "Pomoc",
+        "ZH": "帮助",
+        "DE": "Hilfe",
+    },
+    "nav.home_tab_title": {
+        "EN": "Home",
+        "PL": "Główna",
+        "ZH": "主页",
+        "DE": "Startseite",
+    },
+    "nav.home_tooltip": {
+        "EN": "Home page",
+        "PL": "Strona główna",
+        "ZH": "主页",
+        "DE": "Startseite",
+    },
+    "nav.languages": {
+        "EN": "Languages",
+        "PL": "Języki",
+        "ZH": "语言",
+        "DE": "Sprachen",
+    },
+    "nav.logout_short": {
+        "EN": "Log out",
+        "PL": "Wyloguj",
+        "ZH": "退出",
+        "DE": "Abmelden",
+    },
+    "nav.logout_tooltip": {
+        "EN": "Log out of account",
+        "PL": "Wyloguj z konta",
+        "ZH": "退出账户",
+        "DE": "Vom Konto abmelden",
+    },
+    "nav.media": {
+        "EN": "Media Plan",
+        "PL": "Plan Mediów",
+        "ZH": "媒体计划",
+        "DE": "Medienplan",
+    },
+    "nav.new_tab": {
+        "EN": "New page",
+        "PL": "Nowa strona",
+        "ZH": "新页面",
+        "DE": "Neue Seite",
+    },
+    "nav.notebook_tooltip": {
+        "EN": "Notebook",
+        "PL": "Notatnik",
+        "ZH": "笔记本",
+        "DE": "Notizbuch",
+    },
+    "nav.open_here": {
+        "EN": "Open in this window",
+        "PL": "Otwórz w tym oknie",
+        "ZH": "在此窗口中打开",
+        "DE": "In diesem Fenster öffnen",
+    },
+    "nav.open_new_window": {
+        "EN": "Open in new window",
+        "PL": "Otwórz w nowym oknie",
+        "ZH": "在新窗口中打开",
+        "DE": "In neuem Fenster öffnen",
+    },
+    "nav.orders": {
+        "EN": "Orders",
+        "PL": "Zamówienia",
+        "ZH": "订单",
+        "DE": "Bestellungen",
+    },
+    "nav.overview": {
+        "EN": "Overview",
+        "PL": "Przegląd",
+        "ZH": "概览",
+        "DE": "Übersicht",
+    },
+    "nav.pack_stock": {
+        "EN": "Packaging Warehouse",
+        "PL": "Magazyn Opakowań",
+        "ZH": "包装仓库",
+        "DE": "Verpackungslager",
+    },
+    "nav.packaging": {
+        "EN": "Packaging",
+        "PL": "Opakowania",
+        "ZH": "包装",
+        "DE": "Verpackung",
+    },
+    "nav.payments": {
+        "EN": "Settlements",
+        "PL": "Rozliczenia",
+        "ZH": "结算",
+        "DE": "Abrechnungen",
+    },
+    "nav.products": {
+        "EN": "Products",
+        "PL": "Produkty",
+        "ZH": "产品",
+        "DE": "Produkte",
+    },
+    "nav.region_label": {
+        "EN": "Region",
+        "PL": "Region",
+        "ZH": "地区",
+        "DE": "Region",
+    },
+    "nav.remote_mode": {
+        "EN": "Remote access mode",
+        "PL": "Tryb zdalnego dostępu",
+        "ZH": "远程访问模式",
+        "DE": "Fernzugriffsmodus",
+    },
+    "nav.schedule": {
+        "EN": "Order Schedule",
+        "PL": "Harmonogram Zamówień",
+        "ZH": "订单计划",
+        "DE": "Bestellungsplan",
+    },
+    "nav.schedule_short": {
+        "EN": "Schedule",
+        "PL": "Harmonogram",
+        "ZH": "计划",
+        "DE": "Zeitplan",
+    },
+    "nav.section_extensions": {
+        "EN": "EXTENSIONS",
+        "PL": "ROZSZERZENIA",
+        "ZH": "扩展",
+        "DE": "ERWEITERUNGEN",
+    },
+    "nav.section_modules": {
+        "EN": "MODULES",
+        "PL": "MODUŁY",
+        "ZH": "模块",
+        "DE": "MODULE",
+    },
+    "nav.section_operations": {
+        "EN": "OPERATIONS",
+        "PL": "OPERACJE",
+        "ZH": "操作",
+        "DE": "OPERATIONEN",
+    },
+    "nav.section_parser": {
+        "EN": "PARSER",
+        "PL": "PARSER",
+        "ZH": "解析器",
+        "DE": "PARSER",
+    },
+    "nav.section_tools": {
+        "EN": "TOOLS",
+        "PL": "NARZĘDZIA",
+        "ZH": "工具",
+        "DE": "WERKZEUGE",
+    },
+    "nav.settings_tooltip": {
+        "EN": "Settings",
+        "PL": "Ustawienia",
+        "ZH": "设置",
+        "DE": "Einstellungen",
+    },
+    "nav.superadmin_title": {
+        "EN": "SuperAdmin",
+        "PL": "SuperAdmin",
+        "ZH": "超级管理员",
+        "DE": "SuperAdmin",
+    },
+    "nav.suppliers": {
+        "EN": "Suppliers",
+        "PL": "Dostawcy",
+        "ZH": "供应商",
+        "DE": "Lieferanten",
+    },
+    "nav.switch_account": {
+        "EN": "Switch account",
+        "PL": "Zmień konto",
+        "ZH": "切换账户",
+        "DE": "Konto wechseln",
+    },
+    "nav.switch_account_confirm_title": {
+        "EN": "Switch account?",
+        "PL": "Zmienić konto?",
+        "ZH": "切换账户？",
+        "DE": "Konto wechseln?",
+    },
+    "nav.switch_account_tooltip": {
+        "EN": "Return to login screen",
+        "PL": "Wróć do ekranu logowania",
+        "ZH": "返回登录界面",
+        "DE": "Zum Anmeldebildschirm zurückkehren",
+    },
+    "nav.tab_default_title": {
+        "EN": "Page {n}",
+        "PL": "Strona {n}",
+        "ZH": "页面 {n}",
+        "DE": "Seite {n}",
+    },
+    "nav.tab_fallback": {
+        "EN": "Page",
+        "PL": "Strona",
+        "ZH": "页面",
+        "DE": "Seite",
+    },
+    "nav.toggle_menu": {
+        "EN": "Show/hide menu",
+        "PL": "Pokaż/ukryj menu",
+        "ZH": "显示/隐藏菜单",
+        "DE": "Menü ein-/ausblenden",
+    },
+    "nav.users": {
+        "EN": "Users",
+        "PL": "Użytkownicy",
+        "ZH": "用户",
+        "DE": "Benutzer",
+    },
+    # в”Ђв”Ђ orders в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "orders.chip.total": {
+        "EN": "Orders",
+        "PL": "Zamówienia",
+        "ZH": "订单",
+        "DE": "Bestellungen",
+    },
+    "orders.col_settings.row_height": {
+        "EN": "Row height",
+        "PL": "Wysokość wiersza",
+        "ZH": "行高",
+        "DE": "Zeilenhöhe",
+    },
+    "orders.col_settings.show_invoice": {
+        "EN": "Show invoice table",
+        "PL": "Pokaż tabelę faktur",
+        "ZH": "显示发票表格",
+        "DE": "Rechnungstabelle anzeigen",
+    },
+    "orders.col_settings.show_packing": {
+        "EN": "Show packing table",
+        "PL": "Pokaż tabelę packingu",
+        "ZH": "显示装箱单表格",
+        "DE": "Packing-Tabelle anzeigen",
+    },
+    "orders.dlg.add_title": {
+        "EN": "Add order",
+        "PL": "Dodaj zamówienie",
+        "ZH": "添加订单",
+        "DE": "Bestellung hinzufügen",
+    },
+    "orders.dlg.column_settings": {
+        "EN": "Table sizes",
+        "PL": "Rozmiary tabeli",
+        "ZH": "表格大小",
+        "DE": "Tabellengrößen",
+    },
+    "orders.dlg.delete_title": {
+        "EN": "Delete order?",
+        "PL": "Usunąć zamówienie?",
+        "ZH": "删除订单？",
+        "DE": "Bestellung löschen?",
+    },
+    "orders.dlg.edit_title": {
+        "EN": "Edit order",
+        "PL": "Edytuj zamówienie",
+        "ZH": "编辑订单",
+        "DE": "Bestellung bearbeiten",
+    },
+    "orders.dlg.new_title": {
+        "EN": "New order",
+        "PL": "Nowe zamówienie",
+        "ZH": "新订单",
+        "DE": "Neue Bestellung",
+    },
+    "orders.empty_state": {
+        "EN": "No orders",
+        "PL": "Brak zamówień",
+        "ZH": "没有订单",
+        "DE": "Keine Bestellungen",
+    },
+    "orders.err.invoice_exists": {
+        "EN": "Invoice {inv!r} already exists in this region",
+        "PL": "Faktura {inv!r} już istnieje w tym regionie",
+        "ZH": "发票 {inv!r} 在此地区已存在",
+        "DE": "Rechnung {inv!r} existiert bereits in dieser Region",
+    },
+    "orders.err.save_failed": {
+        "EN": "Failed to save",
+        "PL": "Nie udało się zapisać",
+        "ZH": "保存失败",
+        "DE": "Speichern fehlgeschlagen",
+    },
+    "orders.err.save_local_failed": {
+        "EN": "Failed to save locally",
+        "PL": "Nie udało się zapisać lokalnie",
+        "ZH": "本地保存失败",
+        "DE": "Lokales Speichern fehlgeschlagen",
+    },
+    "orders.err.table_empty_export": {
+        "EN": "Table is empty — nothing to export",
+        "PL": "Tabela jest pusta — nic do eksportu",
+        "ZH": "表格为空 — 没有可导出的内容",
+        "DE": "Tabelle ist leer — nichts zu exportieren",
+    },
+    "orders.field.1c": {
+        "EN": "Accounting status",
+        "PL": "Status księgowy",
+        "ZH": "记账状态",
+        "DE": "Buchhaltungsstatus",
+    },
+    "orders.field.1c_num": {
+        "EN": "Accounting #",
+        "PL": "Nr księgowy",
+        "ZH": "记账编号",
+        "DE": "Buchhaltungs-Nr.",
+    },
+    "orders.field.accept_date": {
+        "EN": "Acceptance date",
+        "PL": "Data odbioru",
+        "ZH": "验收日期",
+        "DE": "Eingangsdatum",
+    },
+    "orders.field.comment": {
+        "EN": "Comment",
+        "PL": "Komentarz",
+        "ZH": "评论",
+        "DE": "Kommentar",
+    },
+    "orders.field.currency": {
+        "EN": "Currency",
+        "PL": "Waluta",
+        "ZH": "货币",
+        "DE": "Währung",
+    },
+    "orders.field.custom_name": {
+        "EN": "Custom name",
+        "PL": "Własna nazwa",
+        "ZH": "自定义名称",
+        "DE": "Benutzerdefinierter Name",
+    },
+    "orders.field.delivery_type": {
+        "EN": "Delivery type",
+        "PL": "Typ dostawy",
+        "ZH": "配送类型",
+        "DE": "Lieferart",
+    },
+    "orders.field.invoice_num": {
+        "EN": "Invoice #",
+        "PL": "Nr Faktury",
+        "ZH": "发票编号",
+        "DE": "Rechnungs-Nr.",
+    },
+    "orders.field.order_date": {
+        "EN": "Order date",
+        "PL": "Data zamówienia",
+        "ZH": "订单日期",
+        "DE": "Bestelldatum",
+    },
+    "orders.field.payment": {
+        "EN": "Payment",
+        "PL": "Płatność",
+        "ZH": "付款",
+        "DE": "Zahlung",
+    },
+    "orders.field.price": {
+        "EN": "Price",
+        "PL": "Cena",
+        "ZH": "价格",
+        "DE": "Preis",
+    },
+    "orders.field.quantity": {
+        "EN": "Quantity",
+        "PL": "Ilość",
+        "ZH": "数量",
+        "DE": "Menge",
+    },
+    "orders.field.region": {
+        "EN": "Region",
+        "PL": "Region",
+        "ZH": "地区",
+        "DE": "Region",
+    },
+    "orders.field.ship_date": {
+        "EN": "Ship date",
+        "PL": "Data wysyłki",
+        "ZH": "发货日期",
+        "DE": "Versanddatum",
+    },
+    "orders.field.status": {
+        "EN": "Status",
+        "PL": "Status",
+        "ZH": "状态",
+        "DE": "Status",
+    },
+    "orders.field.supplier": {
+        "EN": "Supplier",
+        "PL": "Dostawca",
+        "ZH": "供应商",
+        "DE": "Lieferant",
+    },
+    "orders.field.supplier_required": {
+        "EN": "Supplier *",
+        "PL": "Dostawca *",
+        "ZH": "供应商 *",
+        "DE": "Lieferant *",
+    },
+    "orders.field.warehouse_date": {
+        "EN": "Warehouse date",
+        "PL": "Data w magazynie",
+        "ZH": "入库日期",
+        "DE": "Lagerdatum",
+    },
+    "orders.field.weight_actual": {
+        "EN": "Actual weight kg",
+        "PL": "Waga rzeczywista kg",
+        "ZH": "实际重量 kg",
+        "DE": "Tatsächl. Gewicht kg",
+    },
+    "orders.field.weight_unit": {
+        "EN": "Weight/unit kg",
+        "PL": "Waga/szt kg",
+        "ZH": "重量/件 kg",
+        "DE": "Gewicht/Stück kg",
+    },
+    "orders.filter.accept_month": {
+        "EN": "Acceptance month",
+        "PL": "Miesiąc odbioru",
+        "ZH": "验收月份",
+        "DE": "Eingangmonat",
+    },
+    "orders.filter.all_1c": {
+        "EN": "All accounting statuses",
+        "PL": "Wszystkie statusy księgowe",
+        "ZH": "所有记账状态",
+        "DE": "Alle Buchhaltungsstatus",
+    },
+    "orders.filter.all_categories": {
+        "EN": "All categories",
+        "PL": "Wszystkie kategorie",
+        "ZH": "所有类别",
+        "DE": "Alle Kategorien",
+    },
+    "orders.filter.all_deliveries": {
+        "EN": "All deliveries",
+        "PL": "Wszystkie dostawy",
+        "ZH": "所有配送",
+        "DE": "Alle Lieferungen",
+    },
+    "orders.filter.all_months": {
+        "EN": "All months",
+        "PL": "Wszystkie miesiące",
+        "ZH": "所有月份",
+        "DE": "Alle Monate",
+    },
+    "orders.filter.all_payments": {
+        "EN": "All payments",
+        "PL": "Wszystkie płatności",
+        "ZH": "所有付款",
+        "DE": "Alle Zahlungen",
+    },
+    "orders.filter.all_prefix": {
+        "EN": "All: {title}",
+        "PL": "Wszystkie: {title}",
+        "ZH": "所有：{title}",
+        "DE": "Alle: {title}",
+    },
+    "orders.filter.all_products": {
+        "EN": "All products",
+        "PL": "Wszystkie produkty",
+        "ZH": "所有产品",
+        "DE": "Alle Produkte",
+    },
+    "orders.filter.all_statuses": {
+        "EN": "All statuses",
+        "PL": "Wszystkie statusy",
+        "ZH": "所有状态",
+        "DE": "Alle Status",
+    },
+    "orders.filter.all_suppliers": {
+        "EN": "All suppliers",
+        "PL": "Wszyscy dostawcy",
+        "ZH": "所有供应商",
+        "DE": "Alle Lieferanten",
+    },
+    "orders.filter.category": {
+        "EN": "Category",
+        "PL": "Kategoria",
+        "ZH": "类别",
+        "DE": "Kategorie",
+    },
+    "orders.filter.delivery": {
+        "EN": "Delivery",
+        "PL": "Dostawa",
+        "ZH": "配送",
+        "DE": "Lieferung",
+    },
+    "orders.filter.label": {
+        "EN": "Filters:",
+        "PL": "Filtry:",
+        "ZH": "筛选器：",
+        "DE": "Filter:",
+    },
+    "orders.filter.payment_month": {
+        "EN": "Payment month",
+        "PL": "Miesiąc płatności",
+        "ZH": "付款月份",
+        "DE": "Zahlungsmonat",
+    },
+    "orders.filter.product": {
+        "EN": "Product",
+        "PL": "Produkt",
+        "ZH": "产品",
+        "DE": "Produkt",
+    },
+    "orders.filter.receive_month": {
+        "EN": "Receive month",
+        "PL": "Miesiąc odbioru",
+        "ZH": "收货月份",
+        "DE": "Empfangsmonat",
+    },
+    "orders.filter.supplier": {
+        "EN": "Supplier",
+        "PL": "Dostawca",
+        "ZH": "供应商",
+        "DE": "Lieferant",
+    },
+    "orders.invoice_paste_label": {
+        "EN": "Paste from Excel (Ctrl+V)",
+        "PL": "Wklej z Excela (Ctrl+V)",
+        "ZH": "从Excel粘贴（Ctrl+V）",
+        "DE": "Aus Excel einfügen (Strg+V)",
+    },
+    "orders.loading": {
+        "EN": "Loading orders...",
+        "PL": "Ładowanie zamówień...",
+        "ZH": "加载订单...",
+        "DE": "Bestellungen werden geladen...",
+    },
+    "orders.mode.multi": {
+        "EN": "1 order = multiple products",
+        "PL": "1 zamówienie = wiele produktów",
+        "ZH": "1个订单 = 多个产品",
+        "DE": "1 Bestellung = mehrere Produkte",
+    },
+    "orders.mode.single": {
+        "EN": "1 order = 1 product",
+        "PL": "1 zamówienie = 1 produkt",
+        "ZH": "1个订单 = 1个产品",
+        "DE": "1 Bestellung = 1 Produkt",
+    },
+    "orders.nbu_unavailable": {
+        "EN": "NBU unavailable — enter rate manually",
+        "PL": "NBU niedostępne — wprowadź kurs ręcznie",
+        "ZH": "NBU不可用 — 请手动输入汇率",
+        "DE": "NBU nicht verfügbar — Kurs manuell eingeben",
+    },
+    "orders.no_category": {
+        "EN": "No category",
+        "PL": "Bez kategorii",
+        "ZH": "无类别",
+        "DE": "Keine Kategorie",
+    },
+    "orders.no_supplier": {
+        "EN": "No supplier",
+        "PL": "Bez dostawcy",
+        "ZH": "无供应商",
+        "DE": "Kein Lieferant",
+    },
+    "orders.packing_paste_label": {
+        "EN": "Paste from Excel (Ctrl+V) — packing",
+        "PL": "Wklej z Excela (Ctrl+V) — packing",
+        "ZH": "从Excel粘贴（Ctrl+V）— 装箱单",
+        "DE": "Aus Excel einfügen (Strg+V) — Packing",
+    },
+    "orders.payment.advance": {
+        "EN": "Advance",
+        "PL": "Zaliczka",
+        "ZH": "预付款",
+        "DE": "Anzahlung",
+    },
+    "orders.payment.paid": {
+        "EN": "Paid",
+        "PL": "Opłac.",
+        "ZH": "已付",
+        "DE": "Bezahlt",
+    },
+    "orders.payment.paid_full": {
+        "EN": "Paid",
+        "PL": "Opłacone",
+        "ZH": "已全额付款",
+        "DE": "Bezahlt",
+    },
+    "orders.payment.transferred": {
+        "EN": "Transferred",
+        "PL": "Przekazano",
+        "ZH": "已转账",
+        "DE": "Überwiesen",
+    },
+    "orders.payment.unpaid": {
+        "EN": "Unpaid",
+        "PL": "Nieopłac.",
+        "ZH": "未付",
+        "DE": "Unbezahlt",
+    },
+    "orders.payment.unpaid_full": {
+        "EN": "Unpaid",
+        "PL": "Nieopłacone",
+        "ZH": "未全额付款",
+        "DE": "Unbezahlt",
+    },
+    "orders.pick_invoice_file": {
+        "EN": "Select invoice file (.xlsx)",
+        "PL": "Wybierz plik faktury (.xlsx)",
+        "ZH": "选择发票文件（.xlsx）",
+        "DE": "Rechnungsdatei auswählen (.xlsx)",
+    },
+    "orders.pick_packing_file": {
+        "EN": "Select packing file (.xlsx)",
+        "PL": "Wybierz plik packingu (.xlsx)",
+        "ZH": "选择装箱单文件（.xlsx）",
+        "DE": "Packing-Datei auswählen (.xlsx)",
+    },
+    "orders.section.basic_info": {
+        "EN": "Basic information",
+        "PL": "Podstawowe informacje",
+        "ZH": "基本信息",
+        "DE": "Grundinformationen",
+    },
+    "orders.section.invoice_packing": {
+        "EN": "Invoice / Packing",
+        "PL": "Faktura / Packing",
+        "ZH": "发票 / 装箱单",
+        "DE": "Rechnung / Packing",
+    },
+    "orders.section.products": {
+        "EN": "Products",
+        "PL": "Produkty",
+        "ZH": "产品",
+        "DE": "Produkte",
+    },
+    "orders.section.statuses": {
+        "EN": "Statuses",
+        "PL": "Statusy",
+        "ZH": "状态",
+        "DE": "Status",
+    },
+    "orders.section.transition_dates": {
+        "EN": "Transition dates",
+        "PL": "Daty przejść",
+        "ZH": "过渡日期",
+        "DE": "Übergangsdaten",
+    },
+    "orders.section.visible_columns": {
+        "EN": "Visible columns",
+        "PL": "Widoczne kolumny",
+        "ZH": "可见列",
+        "DE": "Sichtbare Spalten",
+    },
+    "orders.status.accepted": {
+        "EN": "Accepted",
+        "PL": "Przyjęty",
+        "ZH": "已验收",
+        "DE": "Angenommen",
+    },
+    "orders.status.at_warehouse": {
+        "EN": "At warehouse",
+        "PL": "W magazynie",
+        "ZH": "在仓库",
+        "DE": "Im Lager",
+    },
+    "orders.status.in_transit": {
+        "EN": "In transit",
+        "PL": "W drodze",
+        "ZH": "运输中",
+        "DE": "Unterwegs",
+    },
+    "orders.status.production": {
+        "EN": "Production",
+        "PL": "Produkcja",
+        "ZH": "生产中",
+        "DE": "Produktion",
+    },
+    "orders.status.ready_for_shipment": {
+        "EN": "Ready",
+        "PL": "Gotowy",
+        "ZH": "待发货",
+        "DE": "Bereit",
+    },
+    "orders.submission.not_submitted": {
+        "EN": "Not submitted",
+        "PL": "Nieprzesłany",
+        "ZH": "未提交",
+        "DE": "Nicht eingereicht",
+    },
+    "orders.submission.submitted": {
+        "EN": "Submitted",
+        "PL": "Wprowadzony",
+        "ZH": "已提交",
+        "DE": "Eingereicht",
+    },
+    "orders.sync.already_running": {
+        "EN": "Sync is already running",
+        "PL": "Synchronizacja jest już uruchomiona",
+        "ZH": "同步已在运行",
+        "DE": "Synchronisierung läuft bereits",
+    },
+    "orders.sync.error": {
+        "EN": "Not saved",
+        "PL": "Nie zapisano",
+        "ZH": "未保存",
+        "DE": "Nicht gespeichert",
+    },
+    "orders.sync.error_tip": {
+        "EN": "Changes remain local only. Click to retry sending to DB.",
+        "PL": "Zmiany pozostają tylko lokalnie. Kliknij, aby ponownie wysłać do bazy danych.",
+        "ZH": "更改仅保留在本地。点击重试发送到数据库。",
+        "DE": "Änderungen verbleiben nur lokal. Zum erneuten Senden an DB klicken.",
+    },
+    "orders.sync.no_local_changes": {
+        "EN": "No local changes to sync",
+        "PL": "Brak lokalnych zmian do synchronizacji",
+        "ZH": "没有本地更改需要同步",
+        "DE": "Keine lokalen Änderungen zum Synchronisieren",
+    },
+    "orders.sync.pending": {
+        "EN": "Local",
+        "PL": "Lokalnie",
+        "ZH": "本地",
+        "DE": "Lokal",
+    },
+    "orders.sync.pending_tip": {
+        "EN": "Data saved in cache and not yet transferred to DB. Click to force sync.",
+        "PL": "Dane zapisane w pamięci podręcznej i jeszcze nie przeniesione do bazy. Kliknij, aby wymusić synchronizację.",
+        "ZH": "数据已保存到缓存，尚未传输到数据库。点击强制同步。",
+        "DE": "Daten im Cache gespeichert und noch nicht in die DB übertragen. Zum erzwungenen Synchronisieren klicken.",
+    },
+    "orders.sync.start_failed": {
+        "EN": "Failed to start sync",
+        "PL": "Nie udało się uruchomić synchronizacji",
+        "ZH": "启动同步失败",
+        "DE": "Synchronisierung konnte nicht gestartet werden",
+    },
+    "orders.sync.synced": {
+        "EN": "Saved",
+        "PL": "Zapisano",
+        "ZH": "已保存",
+        "DE": "Gespeichert",
+    },
+    "orders.sync.synced_tip": {
+        "EN": "Data already transferred to DB. Click to force re-sync.",
+        "PL": "Dane już przeniesione do bazy. Kliknij, aby wymusić ponowną synchronizację.",
+        "ZH": "数据已传输到数据库。点击强制重新同步。",
+        "DE": "Daten bereits in die DB übertragen. Zum erzwungenen Neu-Synchronisieren klicken.",
+    },
+    "orders.sync.syncing": {
+        "EN": "Updating...",
+        "PL": "Aktualizacja...",
+        "ZH": "更新中...",
+        "DE": "Aktualisierung...",
+    },
+    "orders.sync.syncing_tip": {
+        "EN": "Transferring local changes to DB.",
+        "PL": "Przenoszenie lokalnych zmian do bazy danych.",
+        "ZH": "正在将本地更改传输到数据库。",
+        "DE": "Lokale Änderungen werden in die DB übertragen.",
+    },
+    "orders.sync.unsaved": {
+        "EN": "Not saved",
+        "PL": "Nie zapisano",
+        "ZH": "未保存",
+        "DE": "Nicht gespeichert",
+    },
+    "orders.sync.unsaved_tip": {
+        "EN": "There are changes in the table that haven't even reached the cache. Click to force save and sync.",
+        "PL": "Są zmiany w tabeli, które jeszcze nie trafiły do pamięci podręcznej. Kliknij, aby wymusić zapis i synchronizację.",
+        "ZH": "表格中有更改尚未进入缓存。点击强制保存并同步。",
+        "DE": "Es gibt Änderungen in der Tabelle, die den Cache noch nicht erreicht haben. Zum erzwungenen Speichern und Synchronisieren klicken.",
+    },
+    "orders.table_empty": {
+        "EN": "Table is empty",
+        "PL": "Tabela jest pusta",
+        "ZH": "表格为空",
+        "DE": "Tabelle ist leer",
+    },
+    "orders.title": {
+        "EN": "Orders",
+        "PL": "Zamówienia",
+        "ZH": "订单",
+        "DE": "Bestellungen",
+    },
+    "orders.tooltip.edit": {
+        "EN": "Edit (incl. multiple products)",
+        "PL": "Edytuj (w tym wiele produktów)",
+        "ZH": "编辑（包括多个产品）",
+        "DE": "Bearbeiten (inkl. mehrere Produkte)",
+    },
+    "orders.tooltip.expand_invoice": {
+        "EN": "Expand Invoice",
+        "PL": "Rozwiń Fakturę",
+        "ZH": "展开发票",
+        "DE": "Rechnung erweitern",
+    },
+    "orders.tooltip.expand_packing": {
+        "EN": "Expand Packing",
+        "PL": "Rozwiń Packing",
+        "ZH": "展开装箱单",
+        "DE": "Packing erweitern",
+    },
+    "orders.tooltip.invoice_packing": {
+        "EN": "Invoice/packing",
+        "PL": "Faktura/packing",
+        "ZH": "发票/装箱单",
+        "DE": "Rechnung/Packing",
+    },
+
+    # в”Ђв”Ђ pack_stock в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "pack_stock.count_label": {
+        "EN": "Packagings:",
+        "PL": "Opakowania:",
+        "ZH": "包装数量：",
+        "DE": "Verpackungen:",
+    },
+    "pack_stock.help.title": {
+        "EN": "Packaging warehouse",
+        "PL": "Magazyn opakowań",
+        "ZH": "包装仓库",
+        "DE": "Verpackungslager",
+    },
+    "pack_stock.sync.error_tip": {
+        "EN": "Update error. Click to retry.",
+        "PL": "Błąd aktualizacji. Kliknij, aby ponowić.",
+        "ZH": "更新错误。点击重试。",
+        "DE": "Aktualisierungsfehler. Zum Wiederholen klicken.",
+    },
+    "pack_stock.sync.synced_tip": {
+        "EN": "Data in DB. Click to refresh from DB.",
+        "PL": "Dane w bazie danych. Kliknij, aby odświeżyć z bazy.",
+        "ZH": "数据在数据库中。点击从数据库刷新。",
+        "DE": "Daten in der DB. Zum Aktualisieren aus der DB klicken.",
+    },
+    "pack_stock.title": {
+        "EN": "Packaging warehouse",
+        "PL": "Magazyn opakowań",
+        "ZH": "包装仓库",
+        "DE": "Verpackungslager",
+    },
+    # в”Ђв”Ђ packaging в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "packaging.add_button": {
+        "EN": "Add packaging",
+        "PL": "Dodaj opakowanie",
+        "ZH": "添加包装",
+        "DE": "Verpackung hinzufügen",
+    },
+    "packaging.base_update_failed_copy_created": {
+        "EN": "Could not update base record — your personal copy was created",
+        "PL": "Nie udało się zaktualizować rekordu bazowego — utworzono Twoją osobistą kopię",
+        "ZH": "无法更新基础记录 — 已创建您的个人副本",
+        "DE": "Basisdatensatz konnte nicht aktualisiert werden — Ihre persönliche Kopie wurde erstellt",
+    },
+    "packaging.card.edit_btn": {
+        "EN": "Edit",
+        "PL": "Edytuj",
+        "ZH": "编辑",
+        "DE": "Bearbeiten",
+    },
+    "packaging.card.from_supplier": {
+        "EN": "from {name}",
+        "PL": "od {name}",
+        "ZH": "来自 {name}",
+        "DE": "von {name}",
+    },
+    "packaging.card.notes": {
+        "EN": "Notes: {v}",
+        "PL": "Notatki: {v}",
+        "ZH": "备注：{v}",
+        "DE": "Notizen: {v}",
+    },
+    "packaging.card.photo_btn": {
+        "EN": "Photo",
+        "PL": "Zdjęcie",
+        "ZH": "照片",
+        "DE": "Foto",
+    },
+    "packaging.card.price": {
+        "EN": "Price: {price} {ccy}",
+        "PL": "Cena: {price} {ccy}",
+        "ZH": "价格：{price} {ccy}",
+        "DE": "Preis: {price} {ccy}",
+    },
+    "packaging.card.size": {
+        "EN": "Size: {v}",
+        "PL": "Rozmiar: {v}",
+        "ZH": "尺寸：{v}",
+        "DE": "Größe: {v}",
+    },
+    "packaging.card.view_btn": {
+        "EN": "View",
+        "PL": "Przeglądaj",
+        "ZH": "查看",
+        "DE": "Ansehen",
+    },
+    "packaging.copy_btn": {
+        "EN": "Copy",
+        "PL": "Kopiuj",
+        "ZH": "复制",
+        "DE": "Kopieren",
+    },
+    "packaging.deleted": {
+        "EN": "Deleted",
+        "PL": "Usunięto",
+        "ZH": "已删除",
+        "DE": "Gelöscht",
+    },
+    "packaging.dlg.close": {
+        "EN": "Close",
+        "PL": "Zamknij",
+        "ZH": "关闭",
+        "DE": "Schließen",
+    },
+    "packaging.dlg.delete_confirm": {
+        "EN": "Delete packaging?",
+        "PL": "Usunąć opakowanie?",
+        "ZH": "删除包装？",
+        "DE": "Verpackung löschen?",
+    },
+    "packaging.dlg.delete_image": {
+        "EN": "Delete packaging image?",
+        "PL": "Usunąć zdjęcie opakowania?",
+        "ZH": "删除包装图片？",
+        "DE": "Verpackungsbild löschen?",
+    },
+    "packaging.dlg.edit_title": {
+        "EN": "Packaging",
+        "PL": "Opakowanie",
+        "ZH": "包装",
+        "DE": "Verpackung",
+    },
+    "packaging.empty_state": {
+        "EN": "No packaging in the selected context",
+        "PL": "Brak opakowań w wybranym kontekście",
+        "ZH": "所选上下文中没有包装",
+        "DE": "Keine Verpackung im gewählten Kontext",
+    },
+    "packaging.err.db": {
+        "EN": "DB error",
+        "PL": "Błąd bazy danych",
+        "ZH": "数据库错误",
+        "DE": "DB-Fehler",
+    },
+    "packaging.err.db_update": {
+        "EN": "DB update error",
+        "PL": "Błąd aktualizacji bazy danych",
+        "ZH": "数据库更新错误",
+        "DE": "DB-Aktualisierungsfehler",
+    },
+    "packaging.err.enter_name": {
+        "EN": "Enter a name",
+        "PL": "Wprowadź nazwę",
+        "ZH": "请输入名称",
+        "DE": "Name eingeben",
+    },
+    "packaging.err.file_not_found": {
+        "EN": "Selected file not found",
+        "PL": "Wybrany plik nie został znaleziony",
+        "ZH": "未找到所选文件",
+        "DE": "Ausgewählte Datei nicht gefunden",
+    },
+    "packaging.err.name_exists": {
+        "EN": "Packaging with this name already exists",
+        "PL": "Opakowanie o tej nazwie już istnieje",
+        "ZH": "该名称的包装已存在",
+        "DE": "Verpackung mit diesem Namen existiert bereits",
+    },
+    "packaging.err.name_exists_ui": {
+        "EN": "Packaging with this name already exists",
+        "PL": "Opakowanie o tej nazwie już istnieje",
+        "ZH": "该名称的包装已存在",
+        "DE": "Verpackung mit diesem Namen existiert bereits",
+    },
+    "packaging.err.no_price": {
+        "EN": "Packaging price not set",
+        "PL": "Cena opakowania nie jest ustawiona",
+        "ZH": "包装价格未设置",
+        "DE": "Verpackungspreis nicht festgelegt",
+    },
+    "packaging.err.no_supplier": {
+        "EN": "Packaging supplier not selected",
+        "PL": "Dostawca opakowań nie wybrany",
+        "ZH": "未选择包装供应商",
+        "DE": "Verpackungslieferant nicht ausgewählt",
+    },
+    "packaging.err.select_company": {
+        "EN": "Select a company",
+        "PL": "Wybierz firmę",
+        "ZH": "选择公司",
+        "DE": "Unternehmen auswählen",
+    },
+    "packaging.err.select_user": {
+        "EN": "Select at least one user",
+        "PL": "Wybierz co najmniej jednego użytkownika",
+        "ZH": "请至少选择一个用户",
+        "DE": "Mindestens einen Benutzer auswählen",
+    },
+    "packaging.field.box_name": {
+        "EN": "Box name",
+        "PL": "Nazwa pudełka",
+        "ZH": "箱子名称",
+        "DE": "Kartonname",
+    },
+    "packaging.field.box_price": {
+        "EN": "Box price",
+        "PL": "Cena pudełka",
+        "ZH": "箱子价格",
+        "DE": "Kartonpreis",
+    },
+    "packaging.field.box_size": {
+        "EN": "Box size",
+        "PL": "Rozmiar pudełka",
+        "ZH": "箱子尺寸",
+        "DE": "Kartongröße",
+    },
+    "packaging.field.notes": {
+        "EN": "Customization notes",
+        "PL": "Notatki o obróbce",
+        "ZH": "定制备注",
+        "DE": "Anpassungsnotizen",
+    },
+    "packaging.help.title": {
+        "EN": "Packaging",
+        "PL": "Opakowania",
+        "ZH": "包装",
+        "DE": "Verpackung",
+    },
+    "packaging.image_deleted": {
+        "EN": "Image deleted",
+        "PL": "Obraz usunięty",
+        "ZH": "图片已删除",
+        "DE": "Bild gelöscht",
+    },
+    "packaging.loading": {
+        "EN": "Loading packaging...",
+        "PL": "Ładowanie opakowań...",
+        "ZH": "加载包装...",
+        "DE": "Verpackung wird geladen...",
+    },
+    "packaging.locked_record": {
+        "EN": "This packaging is locked by another user",
+        "PL": "To opakowanie jest zablokowane przez innego użytkownika",
+        "ZH": "此包装被其他用户锁定",
+        "DE": "Diese Verpackung ist von einem anderen Benutzer gesperrt",
+    },
+    "packaging.no_photo": {
+        "EN": "This packaging has no photo",
+        "PL": "To opakowanie nie ma zdjęcia",
+        "ZH": "此包装没有照片",
+        "DE": "Diese Verpackung hat kein Foto",
+    },
+    "packaging.readonly_mode_hint": {
+        "EN": "Subordinate view mode: create and edit disabled",
+        "PL": "Tryb podglądu podwładnego: tworzenie i edycja wyłączone",
+        "ZH": "下属查看模式：创建和编辑已禁用",
+        "DE": "Untergeordneter Ansichtsmodus: Erstellen und Bearbeiten deaktiviert",
+    },
+    "packaging.saved": {
+        "EN": "Data saved!",
+        "PL": "Dane zapisane!",
+        "ZH": "数据已保存！",
+        "DE": "Daten gespeichert!",
+    },
+    "packaging.search_hint": {
+        "EN": "Quick packaging search",
+        "PL": "Szybkie wyszukiwanie opakowań",
+        "ZH": "快速搜索包装",
+        "DE": "Schnelle Verpackungssuche",
+    },
+    "packaging.subordinate_readonly": {
+        "EN": "Subordinate tab: view only",
+        "PL": "Zakładka podwładnego: tylko podgląd",
+        "ZH": "下属选项卡：仅查看",
+        "DE": "Untergeordneter Tab: nur Ansicht",
+    },
+    "packaging.superadmin_mode_hint": {
+        "EN": "Mode: All companies/regions. Click Edit for modal.",
+        "PL": "Tryb: Wszystkie firmy/regiony. Kliknij Edytuj dla okna modalnego.",
+        "ZH": "模式：所有公司/地区。点击编辑打开弹窗。",
+        "DE": "Modus: Alle Unternehmen/Regionen. Bearbeiten für Modal anklicken.",
+    },
+    "packaging.title": {
+        "EN": "Packaging",
+        "PL": "Opakowania",
+        "ZH": "包装",
+        "DE": "Verpackung",
+    },
+    "packaging.tooltip.delete_full": {
+        "EN": "Delete completely",
+        "PL": "Usuń całkowicie",
+        "ZH": "完全删除",
+        "DE": "Vollständig löschen",
+    },
+    "packaging.tooltip.delete_image": {
+        "EN": "Delete image",
+        "PL": "Usuń obraz",
+        "ZH": "删除图片",
+        "DE": "Bild löschen",
+    },
+    "packaging.tooltip.locked_record": {
+        "EN": "Record locked by another user",
+        "PL": "Rekord zablokowany przez innego użytkownika",
+        "ZH": "记录被其他用户锁定",
+        "DE": "Datensatz von einem anderen Benutzer gesperrt",
+    },
+    "packaging.unknown_region": {
+        "EN": "Unk. region",
+        "PL": "Nieznany region",
+        "ZH": "未知地区",
+        "DE": "Unbek. Region",
+    },
+    "packaging.unknown_supplier": {
+        "EN": "Unknown supplier",
+        "PL": "Nieznany dostawca",
+        "ZH": "未知供应商",
+        "DE": "Unbekannter Lieferant",
+    },
+    # в”Ђв”Ђ payments в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "payments.balance.label": {
+        "EN": "Balance:",
+        "PL": "Saldo:",
+        "ZH": "余额：",
+        "DE": "Saldo:",
+    },
+    "payments.balance.they_owe": {
+        "EN": "Suppliers owe us",
+        "PL": "Dostawcy są nam winni",
+        "ZH": "供应商欠我们",
+        "DE": "Lieferanten schulden uns",
+    },
+    "payments.balance.they_owe_full": {
+        "EN": "Balance (supplier owes):",
+        "PL": "Saldo (dostawca winny):",
+        "ZH": "余额（供应商欠款）：",
+        "DE": "Saldo (Lieferant schuldet):",
+    },
+    "payments.balance.they_owe_short": {
+        "EN": "Balance (supp.):",
+        "PL": "Saldo (dost.):",
+        "ZH": "余额（供应商）：",
+        "DE": "Saldo (Lief.):",
+    },
+    "payments.balance.total": {
+        "EN": "Total balance",
+        "PL": "Łączne saldo",
+        "ZH": "总余额",
+        "DE": "Gesamtsaldo",
+    },
+    "payments.balance.we_owe": {
+        "EN": "We owe",
+        "PL": "My jesteśmy winni",
+        "ZH": "我们欠款",
+        "DE": "Wir schulden",
+    },
+    "payments.balance.we_owe_short": {
+        "EN": "Balance (we owe):",
+        "PL": "Saldo (my winni):",
+        "ZH": "余额（我们欠）：",
+        "DE": "Saldo (wir schulden):",
+    },
+    "payments.balance.zero": {
+        "EN": "Balance is zero",
+        "PL": "Saldo jest zerowe",
+        "ZH": "余额为零",
+        "DE": "Saldo ist null",
+    },
+    "payments.chip.all": {
+        "EN": "All",
+        "PL": "Wszystkie",
+        "ZH": "全部",
+        "DE": "Alle",
+    },
+    "payments.chip.paid": {
+        "EN": "Paid",
+        "PL": "Opłacono",
+        "ZH": "已付款",
+        "DE": "Bezahlt",
+    },
+    "payments.col.amount": {
+        "EN": "Amount",
+        "PL": "Wartość",
+        "ZH": "金额",
+        "DE": "Betrag",
+    },
+    "payments.col.amount_usd": {
+        "EN": "Amount $",
+        "PL": "Wartość $",
+        "ZH": "金额 $",
+        "DE": "Betrag $",
+    },
+    "payments.col.expand": {
+        "EN": "Expand",
+        "PL": "Rozwinięcie",
+        "ZH": "展开",
+        "DE": "Erweitern",
+    },
+    "payments.col.order1c": {
+        "EN": "PO Accounting #",
+        "PL": "Nr księgowy ZP",
+        "ZH": "采购单记账编号",
+        "DE": "BO Buchhaltungs-Nr.",
+    },
+    "payments.col.paid": {
+        "EN": "Paid",
+        "PL": "Opłacono",
+        "ZH": "已付",
+        "DE": "Bezahlt",
+    },
+    "payments.col.payment": {
+        "EN": "Payment",
+        "PL": "Zapłata",
+        "ZH": "付款",
+        "DE": "Zahlung",
+    },
+    "payments.col.unit_cost": {
+        "EN": "COGS",
+        "PL": "KW",
+        "ZH": "销货成本",
+        "DE": "EK",
+    },
+    "payments.compensation": {
+        "EN": "Compensation",
+        "PL": "Kompensacja",
+        "ZH": "补偿",
+        "DE": "Kompensation",
+    },
+    "payments.compensation_amount": {
+        "EN": "Compensation amount ({ccy})",
+        "PL": "Kwota kompensacji ({ccy})",
+        "ZH": "补偿金额（{ccy}）",
+        "DE": "Kompensationsbetrag ({ccy})",
+    },
+    "payments.dlg.col_widths": {
+        "EN": "Column widths, px",
+        "PL": "Szerokości kolumn, px",
+        "ZH": "列宽，px",
+        "DE": "Spaltenbreiten, px",
+    },
+    "payments.dlg.delete_comp_title": {
+        "EN": "Delete compensation?",
+        "PL": "Usunąć kompensację?",
+        "ZH": "删除补偿？",
+        "DE": "Kompensation löschen?",
+    },
+    "payments.dlg.row_height": {
+        "EN": "Row height, px",
+        "PL": "Wysokość wiersza, px",
+        "ZH": "行高，px",
+        "DE": "Zeilenhöhe, px",
+    },
+    "payments.dlg.table_title": {
+        "EN": "Table",
+        "PL": "Tabela",
+        "ZH": "表格",
+        "DE": "Tabelle",
+    },
+    "payments.help.title": {
+        "EN": "Settlements",
+        "PL": "Rozliczenia",
+        "ZH": "结算",
+        "DE": "Abrechnungen",
+    },
+    "payments.loading.orders": {
+        "EN": "Orders: {n}",
+        "PL": "Zamówienia: {n}",
+        "ZH": "订单：{n}",
+        "DE": "Bestellungen: {n}",
+    },
+    "payments.loading.orders_ellipsis": {
+        "EN": "Orders...",
+        "PL": "Zamówienia...",
+        "ZH": "订单...",
+        "DE": "Bestellungen...",
+    },
+    "payments.loading.products": {
+        "EN": "Products: {n}",
+        "PL": "Produkty: {n}",
+        "ZH": "产品：{n}",
+        "DE": "Produkte: {n}",
+    },
+    "payments.loading.settlements": {
+        "EN": "Settlements: {n}",
+        "PL": "Rozliczenia: {n}",
+        "ZH": "结算：{n}",
+        "DE": "Abrechnungen: {n}",
+    },
+    "payments.loading.suppliers": {
+        "EN": "Suppliers: {n}",
+        "PL": "Dostawcy: {n}",
+        "ZH": "供应商：{n}",
+        "DE": "Lieferanten: {n}",
+    },
+    "payments.no_orders_to_show": {
+        "EN": "No orders to display",
+        "PL": "Brak zamówień do wyświetlenia",
+        "ZH": "没有可显示的订单",
+        "DE": "Keine Bestellungen zur Anzeige",
+    },
+    "payments.no_orders_with_status": {
+        "EN": "No orders with this status",
+        "PL": "Brak zamówień z takim statusem",
+        "ZH": "没有具有此状态的订单",
+        "DE": "Keine Bestellungen mit diesem Status",
+    },
+    "payments.opening_balance": {
+        "EN": "Opening balance",
+        "PL": "Saldo początkowe",
+        "ZH": "期初余额",
+        "DE": "Anfangssaldo",
+    },
+    "payments.opening_balance_ccy": {
+        "EN": "Opening balance ({ccy})",
+        "PL": "Saldo początkowe ({ccy})",
+        "ZH": "期初余额（{ccy}）",
+        "DE": "Anfangssaldo ({ccy})",
+    },
+    "payments.other_1c": {
+        "EN": "Other PO Accounting #",
+        "PL": "Inny Nr księgowy ZP",
+        "ZH": "其他采购单记账编号",
+        "DE": "Anderer BO Buchhaltungs-Nr.",
+    },
+    "payments.other_invoice": {
+        "EN": "Other invoice",
+        "PL": "Inna faktura",
+        "ZH": "其他发票",
+        "DE": "Andere Rechnung",
+    },
+    "payments.show_all": {
+        "EN": "Show all",
+        "PL": "Pokaż wszystkie",
+        "ZH": "显示全部",
+        "DE": "Alle anzeigen",
+    },
+    "payments.show_last_15": {
+        "EN": "Show last 15",
+        "PL": "Pokaż ostatnie 15",
+        "ZH": "显示最近15条",
+        "DE": "Letzte 15 anzeigen",
+    },
+    "payments.stat.orders_sum": {
+        "EN": "Orders sum:",
+        "PL": "Suma zamówień:",
+        "ZH": "订单总额：",
+        "DE": "Bestellsumme:",
+    },
+    "payments.stat.paid_sum": {
+        "EN": "Paid:",
+        "PL": "Opłacono:",
+        "ZH": "已付：",
+        "DE": "Bezahlt:",
+    },
+    "payments.supplier_colon": {
+        "EN": "Supplier: {name}",
+        "PL": "Dostawca: {name}",
+        "ZH": "供应商：{name}",
+        "DE": "Lieferant: {name}",
+    },
+    "payments.title": {
+        "EN": "Settlements",
+        "PL": "Rozliczenia",
+        "ZH": "结算",
+        "DE": "Abrechnungen",
+    },
+    # в”Ђв”Ђ products в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "products.add_btn": {
+        "EN": "Add product",
+        "PL": "Dodaj produkt",
+        "ZH": "添加产品",
+        "DE": "Produkt hinzufügen",
+    },
+    "products.archive": {
+        "EN": "Archive",
+        "PL": "Archiwizuj",
+        "ZH": "归档",
+        "DE": "Archivieren",
+    },
+    "products.archive_section": {
+        "EN": "Archive",
+        "PL": "Archiwum",
+        "ZH": "存档",
+        "DE": "Archiv",
+    },
+    "products.complete_series_btn": {
+        "EN": "Complete series",
+        "PL": "Uzupełnij serię",
+        "ZH": "完善系列",
+        "DE": "Serie vervollständigen",
+    },
+    "products.deleted": {
+        "EN": "Product deleted",
+        "PL": "Produkt usunięty",
+        "ZH": "产品已删除",
+        "DE": "Produkt gelöscht",
+    },
+    "products.dlg.complete_series": {
+        "EN": "Complete series into product",
+        "PL": "Uzupełnij serię do produktu",
+        "ZH": "将系列完善为产品",
+        "DE": "Serie zu Produkt vervollständigen",
+    },
+    "products.dlg.delete_confirm": {
+        "EN": "Delete product?",
+        "PL": "Usunąć produkt?",
+        "ZH": "删除产品？",
+        "DE": "Produkt löschen?",
+    },
+    "products.dlg.edit_title": {
+        "EN": "Product",
+        "PL": "Produkt",
+        "ZH": "产品",
+        "DE": "Produkt",
+    },
+    "products.edit_btn": {
+        "EN": "Edit product",
+        "PL": "Edytuj produkt",
+        "ZH": "编辑产品",
+        "DE": "Produkt bearbeiten",
+    },
+    "products.empty_state": {
+        "EN": "No products in the selected context",
+        "PL": "Brak produktów w wybranym kontekście",
+        "ZH": "所选上下文中没有产品",
+        "DE": "Keine Produkte im gewählten Kontext",
+    },
+    "products.err.delete": {
+        "EN": "Failed to delete product",
+        "PL": "Nie udało się usunąć produktu",
+        "ZH": "删除产品失败",
+        "DE": "Produkt konnte nicht gelöscht werden",
+    },
+    "products.err.name_exists": {
+        "EN": "A product with this name already exists",
+        "PL": "Produkt o tej nazwie już istnieje",
+        "ZH": "该名称的产品已存在",
+        "DE": "Ein Produkt mit diesem Namen existiert bereits",
+    },
+    "products.err.photo_select": {
+        "EN": "Photo selection error: {ex}",
+        "PL": "Błąd wyboru zdjęcia: {ex}",
+        "ZH": "照片选择错误：{ex}",
+        "DE": "Fotoauswahlfehler: {ex}",
+    },
+    "products.err.save": {
+        "EN": "Failed to save product",
+        "PL": "Nie udało się zapisać produktu",
+        "ZH": "保存产品失败",
+        "DE": "Produkt konnte nicht gespeichert werden",
+    },
+    "products.field.delete_photo_n": {
+        "EN": "Delete photo {n}",
+        "PL": "Usuń zdjęcie {n}",
+        "ZH": "删除照片 {n}",
+        "DE": "Foto {n} löschen",
+    },
+    "products.field.name": {
+        "EN": "Product name",
+        "PL": "Nazwa produktu",
+        "ZH": "产品名称",
+        "DE": "Produktname",
+    },
+    "products.field.notes": {
+        "EN": "Notes",
+        "PL": "Notatki",
+        "ZH": "备注",
+        "DE": "Notizen",
+    },
+    "products.field.photo_n": {
+        "EN": "Photo {n}:",
+        "PL": "Zdjęcie {n}:",
+        "ZH": "照片 {n}：",
+        "DE": "Foto {n}:",
+    },
+    "products.field.photo_not_loaded": {
+        "EN": "Not loaded",
+        "PL": "Nie załadowano",
+        "ZH": "未加载",
+        "DE": "Nicht geladen",
+    },
+    "products.field.photo_selected": {
+        "EN": "Photo {n} selected",
+        "PL": "Zdjęcie {n} wybrane",
+        "ZH": "照片 {n} 已选择",
+        "DE": "Foto {n} ausgewählt",
+    },
+    "products.field.photos_up_to_3": {
+        "EN": "Product photos (up to 3):",
+        "PL": "Zdjęcia produktu (do 3):",
+        "ZH": "产品照片（最多3张）：",
+        "DE": "Produktfotos (bis zu 3):",
+    },
+    "products.field.purchase_currency": {
+        "EN": "Purchase currency",
+        "PL": "Waluta zakupu",
+        "ZH": "采购货币",
+        "DE": "Einkaufswährung",
+    },
+    "products.field.purchase_price": {
+        "EN": "Purchase price",
+        "PL": "Cena zakupu",
+        "ZH": "采购价格",
+        "DE": "Einkaufspreis",
+    },
+    "products.field.upload_photo_n": {
+        "EN": "Upload photo {n}",
+        "PL": "Prześlij zdjęcie {n}",
+        "ZH": "上传照片 {n}",
+        "DE": "Foto {n} hochladen",
+    },
+    "products.field.weight": {
+        "EN": "Weight (kg)",
+        "PL": "Waga (kg)",
+        "ZH": "重量（kg）",
+        "DE": "Gewicht (kg)",
+    },
+    "products.loading": {
+        "EN": "Loading products...",
+        "PL": "Ładowanie produktów...",
+        "ZH": "加载产品...",
+        "DE": "Produkte werden geladen...",
+    },
+    "products.locked_by_other": {
+        "EN": "Record is being edited by another user",
+        "PL": "Rekord jest edytowany przez innego użytkownika",
+        "ZH": "记录正在被其他用户编辑",
+        "DE": "Datensatz wird von einem anderen Benutzer bearbeitet",
+    },
+    "products.no_photo": {
+        "EN": "This product has no photo",
+        "PL": "Ten produkt nie ma zdjęcia",
+        "ZH": "此产品没有照片",
+        "DE": "Dieses Produkt hat kein Foto",
+    },
+    "products.no_series_to_complete": {
+        "EN": "No series to complete into a product",
+        "PL": "Brak serii do uzupełnienia do produktu",
+        "ZH": "没有可完善为产品的系列",
+        "DE": "Keine Serie zum Vervollständigen zu einem Produkt",
+    },
+    "products.saved": {
+        "EN": "Product saved",
+        "PL": "Produkt zapisany",
+        "ZH": "产品已保存",
+        "DE": "Produkt gespeichert",
+    },
+    "products.search_hint": {
+        "EN": "Search products",
+        "PL": "Szukaj produktów",
+        "ZH": "搜索产品",
+        "DE": "Produkte suchen",
+    },
+    "products.select_series": {
+        "EN": "Select series",
+        "PL": "Wybierz serię",
+        "ZH": "选择系列",
+        "DE": "Serie auswählen",
+    },
+    "products.series_completed": {
+        "EN": "Series completed into product",
+        "PL": "Seria uzupełniona do produktu",
+        "ZH": "系列已完善为产品",
+        "DE": "Serie zu Produkt vervollständigt",
+    },
+    "products.title": {
+        "EN": "Products",
+        "PL": "Produkty",
+        "ZH": "产品",
+        "DE": "Produkte",
+    },
+    "products.view_btn": {
+        "EN": "View product",
+        "PL": "Przeglądaj produkt",
+        "ZH": "查看产品",
+        "DE": "Produkt ansehen",
+    },
+
+    # в”Ђв”Ђ schedule в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "schedule.add_note_btn": {
+        "EN": "+ Note",
+        "PL": "+ Notatka",
+        "ZH": "+ 备注",
+        "DE": "+ Notiz",
+    },
+    "schedule.copy_btn": {
+        "EN": "Copy",
+        "PL": "Kopiuj",
+        "ZH": "复制",
+        "DE": "Kopieren",
+    },
+    "schedule.dlg.budget": {
+        "EN": "Budget",
+        "PL": "Budżet",
+        "ZH": "预算",
+        "DE": "Budget",
+    },
+    "schedule.dlg.group_items": {
+        "EN": "Group items",
+        "PL": "Pozycje w grupie",
+        "ZH": "组内项目",
+        "DE": "Gruppenelemente",
+    },
+    "schedule.dlg.move_order": {
+        "EN": "Move order",
+        "PL": "Przenieś zamówienie",
+        "ZH": "移动订单",
+        "DE": "Bestellung verschieben",
+    },
+    "schedule.dlg.note": {
+        "EN": "Note / planned item",
+        "PL": "Notatka / planowana pozycja",
+        "ZH": "备注 / 计划项目",
+        "DE": "Notiz / geplante Position",
+    },
+    "schedule.dlg.open_archive_month": {
+        "EN": "Open month from archive",
+        "PL": "Otwórz miesiąc z archiwum",
+        "ZH": "从归档打开月份",
+        "DE": "Monat aus Archiv öffnen",
+    },
+    "schedule.dlg.order_plan": {
+        "EN": "Order plan",
+        "PL": "Plan zamówienia",
+        "ZH": "订单计划",
+        "DE": "Bestellplan",
+    },
+    "schedule.dropdown.not_selected": {
+        "EN": "— not selected —",
+        "PL": "— nie wybrano —",
+        "ZH": "— 未选择 —",
+        "DE": "— nicht ausgewählt —",
+    },
+    "schedule.dropdown.select": {
+        "EN": "Select",
+        "PL": "Wybierz",
+        "ZH": "选择",
+        "DE": "Auswählen",
+    },
+    "schedule.field.amount_actual": {
+        "EN": "Actual amount",
+        "PL": "Kwota rzeczywista",
+        "ZH": "实际金额",
+        "DE": "Tatsächlicher Betrag",
+    },
+    "schedule.field.card_height": {
+        "EN": "Card height",
+        "PL": "Wysokość karty",
+        "ZH": "卡片高度",
+        "DE": "Kartenhöhe",
+    },
+    "schedule.field.category_required": {
+        "EN": "Category *",
+        "PL": "Kategoria *",
+        "ZH": "类别 *",
+        "DE": "Kategorie *",
+    },
+    "schedule.field.comment_optional": {
+        "EN": "Comment (optional)",
+        "PL": "Komentarz (opcjonalnie)",
+        "ZH": "评论（可选）",
+        "DE": "Kommentar (optional)",
+    },
+    "schedule.field.currency_actual": {
+        "EN": "Actual currency",
+        "PL": "Waluta rzeczywista",
+        "ZH": "实际货币",
+        "DE": "Tatsächliche Währung",
+    },
+    "schedule.field.grouping": {
+        "EN": "Grouping",
+        "PL": "Grupowanie",
+        "ZH": "分组",
+        "DE": "Gruppierung",
+    },
+    "schedule.field.name_required": {
+        "EN": "Name *",
+        "PL": "Nazwa *",
+        "ZH": "名称 *",
+        "DE": "Name *",
+    },
+    "schedule.field.order_archive_months": {
+        "EN": "Archive → Months",
+        "PL": "Archiwum → Miesiące",
+        "ZH": "归档 → 月份",
+        "DE": "Archiv → Monate",
+    },
+    "schedule.field.order_months_archive": {
+        "EN": "Months → Archive",
+        "PL": "Miesiące → Archiwum",
+        "ZH": "月份 → 归档",
+        "DE": "Monate → Archiv",
+    },
+    "schedule.field.ordered_actual": {
+        "EN": "Actual ordered",
+        "PL": "Zamówiono rzeczywiście",
+        "ZH": "实际订购",
+        "DE": "Tatsächlich bestellt",
+    },
+    "schedule.field.position": {
+        "EN": "Schedule position",
+        "PL": "Pozycja harmonogramu",
+        "ZH": "计划位置",
+        "DE": "Zeitplanposition",
+    },
+    "schedule.field.production_days": {
+        "EN": "Production lead time (days)",
+        "PL": "Czas produkcji (dni)",
+        "ZH": "生产提前期（天）",
+        "DE": "Produktionsvorlaufzeit (Tage)",
+    },
+    "schedule.field.right_block_order": {
+        "EN": "Right block order",
+        "PL": "Kolejność prawego bloku",
+        "ZH": "右侧块顺序",
+        "DE": "Reihenfolge des rechten Blocks",
+    },
+    "schedule.field.supplier_amount": {
+        "EN": "Supplier amount",
+        "PL": "Kwota dostawcy",
+        "ZH": "供应商金额",
+        "DE": "Lieferantenbetrag",
+    },
+    "schedule.field.unit_price": {
+        "EN": "Unit price",
+        "PL": "Cena za jednostkę",
+        "ZH": "单价",
+        "DE": "Stückpreis",
+    },
+    "schedule.field.year": {
+        "EN": "Year",
+        "PL": "Rok",
+        "ZH": "年份",
+        "DE": "Jahr",
+    },
+    "schedule.help.title": {
+        "EN": "Order Schedule",
+        "PL": "Harmonogram Zamówień",
+        "ZH": "订单计划",
+        "DE": "Bestellungsplan",
+    },
+    "schedule.merge_selected": {
+        "EN": "Merge selected",
+        "PL": "Połącz wybrane",
+        "ZH": "合并已选",
+        "DE": "Ausgewählte zusammenführen",
+    },
+    "schedule.months_ahead": {
+        "EN": "Planning for {n} months ahead",
+        "PL": "Planowanie na {n} miesięcy do przodu",
+        "ZH": "未来 {n} 个月的规划",
+        "DE": "Planung für {n} Monate im Voraus",
+    },
+    "schedule.snack.archive_past_only": {
+        "EN": "Only past and current months can be opened from archive",
+        "PL": "Z archiwum można otworzyć tylko minione i bieżący miesiąc",
+        "ZH": "从归档只能打开过去和当前月份",
+        "DE": "Aus dem Archiv können nur vergangene und der aktuelle Monat geöffnet werden",
+    },
+    "schedule.snack.enter_name": {
+        "EN": "Enter a name",
+        "PL": "Wprowadź nazwę",
+        "ZH": "请输入名称",
+        "DE": "Name eingeben",
+    },
+    "schedule.snack.merge_failed": {
+        "EN": "Failed to merge rows",
+        "PL": "Nie udało się połączyć wierszy",
+        "ZH": "合并行失败",
+        "DE": "Zeilen konnten nicht zusammengeführt werden",
+    },
+    "schedule.snack.merged": {
+        "EN": "Rows merged",
+        "PL": "Wiersze połączone",
+        "ZH": "行已合并",
+        "DE": "Zeilen zusammengeführt",
+    },
+    "schedule.snack.no_merged_to_split": {
+        "EN": "No merged rows to split",
+        "PL": "Brak połączonych wierszy do rozdzielenia",
+        "ZH": "没有合并的行可以拆分",
+        "DE": "Keine zusammengeführten Zeilen zum Aufteilen",
+    },
+    "schedule.snack.no_target_row": {
+        "EN": "Could not determine the target row",
+        "PL": "Nie udało się określić wiersza docelowego",
+        "ZH": "无法确定目标行",
+        "DE": "Zielzeile konnte nicht bestimmt werden",
+    },
+    "schedule.snack.note_deleted": {
+        "EN": "Note deleted",
+        "PL": "Notatka usunięta",
+        "ZH": "备注已删除",
+        "DE": "Notiz gelöscht",
+    },
+    "schedule.snack.note_saved": {
+        "EN": "Note saved",
+        "PL": "Notatka zapisana",
+        "ZH": "备注已保存",
+        "DE": "Notiz gespeichert",
+    },
+    "schedule.snack.order_copied": {
+        "EN": "Order copied",
+        "PL": "Zamówienie skopiowane",
+        "ZH": "订单已复制",
+        "DE": "Bestellung kopiert",
+    },
+    "schedule.snack.order_moved": {
+        "EN": "Order moved",
+        "PL": "Zamówienie przeniesione",
+        "ZH": "订单已移动",
+        "DE": "Bestellung verschoben",
+    },
+    "schedule.snack.product_deactivated": {
+        "EN": "Product moved to inactive",
+        "PL": "Produkt przeniesiony do nieaktywnych",
+        "ZH": "产品已移至非活动",
+        "DE": "Produkt zu inaktiv verschoben",
+    },
+    "schedule.snack.product_reactivated": {
+        "EN": "Product is active again",
+        "PL": "Produkt jest znowu aktywny",
+        "ZH": "产品已重新激活",
+        "DE": "Produkt ist wieder aktiv",
+    },
+    "schedule.snack.readonly_mode": {
+        "EN": "Editing is not available in view mode",
+        "PL": "Edycja jest niedostępna w trybie podglądu",
+        "ZH": "查看模式下无法编辑",
+        "DE": "Im Ansichtsmodus ist keine Bearbeitung möglich",
+    },
+    "schedule.snack.row_prep_failed": {
+        "EN": "Failed to prepare row for saving",
+        "PL": "Nie udało się przygotować wiersza do zapisu",
+        "ZH": "准备行以保存失败",
+        "DE": "Zeile konnte nicht zum Speichern vorbereitet werden",
+    },
+    "schedule.snack.select_category": {
+        "EN": "Select category",
+        "PL": "Wybierz kategorię",
+        "ZH": "请选择类别",
+        "DE": "Kategorie auswählen",
+    },
+    "schedule.snack.split_positions": {
+        "EN": "Split: {n} positions",
+        "PL": "Rozdzielono: {n} pozycji",
+        "ZH": "拆分：{n} 个位置",
+        "DE": "Aufgeteilt: {n} Positionen",
+    },
+    "schedule.snack.task_deleted": {
+        "EN": "Task deleted",
+        "PL": "Zadanie usunięte",
+        "ZH": "任务已删除",
+        "DE": "Aufgabe gelöscht",
+    },
+    "schedule.snack.task_saved": {
+        "EN": "Task saved",
+        "PL": "Zadanie zapisane",
+        "ZH": "任务已保存",
+        "DE": "Aufgabe gespeichert",
+    },
+    "schedule.split_selected": {
+        "EN": "Split selected",
+        "PL": "Rozdziel wybrane",
+        "ZH": "拆分已选",
+        "DE": "Ausgewählte aufteilen",
+    },
+    "schedule.status.not_ordered": {
+        "EN": "Not ordered",
+        "PL": "Nie zamówiono",
+        "ZH": "未订购",
+        "DE": "Nicht bestellt",
+    },
+    "schedule.status.ordered": {
+        "EN": "Ordered",
+        "PL": "Zamówiono",
+        "ZH": "已订购",
+        "DE": "Bestellt",
+    },
+    "schedule.title": {
+        "EN": "Order Schedule",
+        "PL": "Harmonogram Zamówień",
+        "ZH": "订单计划",
+        "DE": "Bestellungsplan",
+    },
+    "schedule.tooltip.edit_note": {
+        "EN": "Edit note",
+        "PL": "Edytuj notatkę",
+        "ZH": "编辑备注",
+        "DE": "Notiz bearbeiten",
+    },
+    "schedule.tooltip.hide_archive": {
+        "EN": "Hide all archive months",
+        "PL": "Ukryj wszystkie archiwalne miesiące",
+        "ZH": "隐藏所有归档月份",
+        "DE": "Alle archivierten Monate ausblenden",
+    },
+    # в”Ђв”Ђ settings в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "settings.add_field_btn": {
+        "EN": "Add field",
+        "PL": "Dodaj pole",
+        "ZH": "添加字段",
+        "DE": "Feld hinzufügen",
+    },
+    "settings.add_price_tier": {
+        "EN": "Add price tier",
+        "PL": "Dodaj poziom cen",
+        "ZH": "添加价格层级",
+        "DE": "Preisstufe hinzufügen",
+    },
+    "settings.dlg.default_hierarchy": {
+        "EN": "Default hierarchy: {name}",
+        "PL": "Domyślna hierarchia: {name}",
+        "ZH": "默认层级：{name}",
+        "DE": "Standardhierarchie: {name}",
+    },
+    "settings.dlg.delete_region": {
+        "EN": "Delete region",
+        "PL": "Usuń region",
+        "ZH": "删除地区",
+        "DE": "Region löschen",
+    },
+    "settings.dlg.price_tiers": {
+        "EN": "Price tiers: {name}",
+        "PL": "Poziomy cen: {name}",
+        "ZH": "价格层级：{name}",
+        "DE": "Preisstufen: {name}",
+    },
+    "settings.dlg.rename_region": {
+        "EN": "Rename region",
+        "PL": "Zmień nazwę regionu",
+        "ZH": "重命名地区",
+        "DE": "Region umbenennen",
+    },
+    "settings.err.create_region": {
+        "EN": "Failed to create region",
+        "PL": "Nie udało się utworzyć regionu",
+        "ZH": "创建地区失败",
+        "DE": "Region konnte nicht erstellt werden",
+    },
+    "settings.err.enter_current_password": {
+        "EN": "Enter current password",
+        "PL": "Wprowadź aktualne hasło",
+        "ZH": "请输入当前密码",
+        "DE": "Aktuelles Passwort eingeben",
+    },
+    "settings.err.enter_region_name": {
+        "EN": "Enter a region name",
+        "PL": "Wprowadź nazwę regionu",
+        "ZH": "请输入地区名称",
+        "DE": "Regionsnamen eingeben",
+    },
+    "settings.err.region_exists": {
+        "EN": "This region already exists",
+        "PL": "Taki region już istnieje",
+        "ZH": "该地区已存在",
+        "DE": "Diese Region existiert bereits",
+    },
+    "settings.err.save_payment_fields": {
+        "EN": "Failed to save payment fields",
+        "PL": "Nie udało się zapisać pól płatności",
+        "ZH": "保存付款字段失败",
+        "DE": "Zahlungsfelder konnten nicht gespeichert werden",
+    },
+    "settings.field.current_password": {
+        "EN": "Current password",
+        "PL": "Aktualne hasło",
+        "ZH": "当前密码",
+        "DE": "Aktuelles Passwort",
+    },
+    "settings.field.new_password": {
+        "EN": "New password",
+        "PL": "Nowe hasło",
+        "ZH": "新密码",
+        "DE": "Neues Passwort",
+    },
+    "settings.gsm.brands_label": {
+        "EN": "Brands",
+        "PL": "Marki",
+        "ZH": "品牌",
+        "DE": "Marken",
+    },
+    "settings.gsm.description": {
+        "EN": "Configure personal GSM Parser display — filters are applied automatically in the sidebar and when opening the page.",
+        "PL": "Skonfiguruj osobiste wyświetlanie GSM Parser — filtry są stosowane automatycznie w pasku bocznym i przy otwieraniu strony.",
+        "ZH": "配置个人GSM解析器显示 — 筛选器在侧边栏和打开页面时自动应用。",
+        "DE": "Persönliche GSM-Parser-Anzeige konfigurieren — Filter werden automatisch in der Seitenleiste und beim Öffnen der Seite angewendet.",
+    },
+    "settings.gsm.enable_label": {
+        "EN": "Enable GSM Parser for me",
+        "PL": "Włącz GSM Parser dla mnie",
+        "ZH": "为我启用GSM解析器",
+        "DE": "GSM-Parser für mich aktivieren",
+    },
+    "settings.gsm.title": {
+        "EN": "GSM Parser",
+        "PL": "GSM Parser",
+        "ZH": "GSM解析器",
+        "DE": "GSM-Parser",
+    },
+    "settings.gsm.types_label": {
+        "EN": "Device types",
+        "PL": "Typy urządzeń",
+        "ZH": "设备类型",
+        "DE": "Gerätetypen",
+    },
+    "settings.help.title": {
+        "EN": "Settings",
+        "PL": "Ustawienia",
+        "ZH": "设置",
+        "DE": "Einstellungen",
+    },
+    "settings.no_regions": {
+        "EN": "The company has no regions yet",
+        "PL": "Firma nie ma jeszcze regionów",
+        "ZH": "公司尚无地区",
+        "DE": "Das Unternehmen hat noch keine Regionen",
+    },
+    "settings.payment_fields_hint": {
+        "EN": "Configure fields that can be filled in for suppliers.",
+        "PL": "Skonfiguruj pola, które mogą być wypełniane dla dostawców.",
+        "ZH": "配置可为供应商填写的字段。",
+        "DE": "Felder konfigurieren, die für Lieferanten ausgefüllt werden können.",
+    },
+    "settings.price_tiers_saved": {
+        "EN": "Price tiers saved",
+        "PL": "Poziomy cen zapisane",
+        "ZH": "价格层级已保存",
+        "DE": "Preisstufen gespeichert",
+    },
+    "settings.region_created": {
+        "EN": "Region created",
+        "PL": "Region utworzony",
+        "ZH": "地区已创建",
+        "DE": "Region erstellt",
+    },
+    "settings.region_deleted": {
+        "EN": "Region deleted",
+        "PL": "Region usunięty",
+        "ZH": "地区已删除",
+        "DE": "Region gelöscht",
+    },
+    "settings.region_updated": {
+        "EN": "Region updated",
+        "PL": "Region zaktualizowany",
+        "ZH": "地区已更新",
+        "DE": "Region aktualisiert",
+    },
+    # в”Ђв”Ђ suppliers в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    "suppliers.add_btn": {
+        "EN": "Add supplier",
+        "PL": "Dodaj dostawcę",
+        "ZH": "添加供应商",
+        "DE": "Lieferant hinzufügen",
+    },
+    "suppliers.deleted": {
+        "EN": "Deleted",
+        "PL": "Usunięto",
+        "ZH": "已删除",
+        "DE": "Gelöscht",
+    },
+    "suppliers.dlg.delete_confirm": {
+        "EN": "Delete supplier?",
+        "PL": "Usunąć dostawcę?",
+        "ZH": "删除供应商？",
+        "DE": "Lieferant löschen?",
+    },
+    "suppliers.empty_state": {
+        "EN": "No suppliers in the selected context",
+        "PL": "Brak dostawców w wybranym kontekście",
+        "ZH": "所选上下文中没有供应商",
+        "DE": "Keine Lieferanten im gewählten Kontext",
+    },
+    "suppliers.field.name": {
+        "EN": "Supplier name",
+        "PL": "Nazwa dostawcy",
+        "ZH": "供应商名称",
+        "DE": "Lieferantenname",
+    },
+    "suppliers.field.phone": {
+        "EN": "Phone number",
+        "PL": "Numer telefonu",
+        "ZH": "电话号码",
+        "DE": "Telefonnummer",
+    },
+    "suppliers.help.title": {
+        "EN": "Suppliers",
+        "PL": "Dostawcy",
+        "ZH": "供应商",
+        "DE": "Lieferanten",
+    },
+    "suppliers.loading": {
+        "EN": "Loading suppliers...",
+        "PL": "Ładowanie dostawców...",
+        "ZH": "加载供应商...",
+        "DE": "Lieferanten werden geladen...",
+    },
+    "suppliers.locked_by_other": {
+        "EN": "This supplier is locked by another user",
+        "PL": "Ten dostawca jest zablokowany przez innego użytkownika",
+        "ZH": "此供应商被其他用户锁定",
+        "DE": "Dieser Lieferant ist von einem anderen Benutzer gesperrt",
+    },
+    "suppliers.search_hint": {
+        "EN": "Quick supplier search",
+        "PL": "Szybkie wyszukiwanie dostawców",
+        "ZH": "快速搜索供应商",
+        "DE": "Schnelle Lieferantensuche",
+    },
+    "suppliers.title": {
+        "EN": "Suppliers",
+        "PL": "Dostawcy",
+        "ZH": "供应商",
+        "DE": "Lieferanten",
+    },
+    "app.offline.body": {
+        "EN": "No connection. This window will close automatically once the internet connection is restored.",
+        "PL": "Brak połączenia. To okno zniknie automatycznie po przywróceniu internetu.",
+        "ZH": "无网络连接。互联网连接恢复后，此窗口将自动关闭。",
+        "DE": "Keine Verbindung. Dieses Fenster schließt sich automatisch, sobald die Internetverbindung wiederhergestellt ist.",
+    },
+    "app.update.err_file_too_small": {
+        "EN": "The update file is too small. Make sure the link points directly to the .exe installer.",
+        "PL": "Plik aktualizacji jest zbyt mały. Upewnij się, że link prowadzi bezpośrednio do instalatora .exe.",
+        "ZH": "更新文件过小。请确认链接直接指向.exe安装程序。",
+        "DE": "Die Update-Datei ist zu klein. Stellen Sie sicher, dass der Link direkt auf den .exe-Installer verweist.",
+    },
+    "app.update.err_github_404": {
+        "EN": "GitHub returned 404. The link is probably not to an .exe asset, or the repository is private. Auto-update requires a public direct URL to the installer.",
+        "PL": "GitHub zwrócił błąd 404. Prawdopodobnie link nie prowadzi do zasobu .exe lub repozytorium jest prywatne. Autoaktualizacja wymaga publicznego bezpośredniego URL do instalatora.",
+        "ZH": "GitHub返回404错误。链接可能未指向.exe资源，或仓库为私有。自动更新需要指向安装程序的公开直接URL。",
+        "DE": "GitHub hat 404 zurückgegeben. Der Link führt wahrscheinlich nicht zu einem .exe-Asset, oder das Repository ist privat. Für die automatische Aktualisierung ist eine öffentliche direkte URL zum Installer erforderlich.",
+    },
+    "app.update.err_not_direct_url": {
+        "EN": "The update URL is not a direct link to an .exe file. Provide a direct asset URL from GitHub Releases.",
+        "PL": "URL aktualizacji nie jest bezpośrednim linkiem do pliku .exe. Podaj bezpośredni URL zasobu z GitHub Releases.",
+        "ZH": "更新URL不是指向.exe文件的直接链接。请提供来自GitHub Releases的直接资源URL。",
+        "DE": "Die Update-URL ist kein direkter Link zu einer .exe-Datei. Geben Sie eine direkte Asset-URL aus GitHub Releases an.",
+    },
+    "app.update.installer_launched": {
+        "EN": "The installer has started. Confirm the UAC prompt and wait for it to finish.",
+        "PL": "Instalator został uruchomiony. Potwierdź UAC i poczekaj na zakończenie.",
+        "ZH": "安装程序已启动。请确认UAC提示并等待完成。",
+        "DE": "Der Installer wurde gestartet. Bestätigen Sie die UAC-Abfrage und warten Sie auf den Abschluss.",
+    },
+    "app.update.version_info": {
+        "EN": "Current version: {current}\nMinimum required: {required}",
+        "PL": "Bieżąca wersja: {current}\nMinimalna wymagana: {required}",
+        "ZH": "当前版本：{current}\n最低要求版本：{required}",
+        "DE": "Aktuelle Version: {current}\nMindestens erforderlich: {required}",
+    },
+    "auth.err.missing_company": {
+        "EN": "Not entered: Company name",
+        "PL": "Nie podano: Nazwa firmy",
+        "ZH": "未填写：公司名称",
+        "DE": "Nicht eingegeben: Firmenname",
+    },
+    "auth.err.missing_password_len": {
+        "EN": "Password: 4 to 8 characters",
+        "PL": "Hasło: od 4 do 8 znaków",
+        "ZH": "密码：4到8个字符",
+        "DE": "Passwort: 4 bis 8 Zeichen",
+    },
+    "auth.login.company_hint": {
+        "EN": "Leave empty only for SuperAdmin — other users must specify a company",
+        "PL": "Puste tylko dla SuperAdmina — inni użytkownicy muszą podać firmę",
+        "ZH": "仅超级管理员可留空 — 其他用户必须填写公司",
+        "DE": "Nur für SuperAdmin leer lassen — andere Benutzer müssen ein Unternehmen angeben",
+    },
+    "auth.login.err_auth_failed": {
+        "EN": "Authorization error. Please try again later.",
+        "PL": "Błąd autoryzacji. Spróbuj ponownie później.",
+        "ZH": "授权错误。请稍后重试。",
+        "DE": "Autorisierungsfehler. Bitte versuchen Sie es später erneut.",
+    },
+    "auth.login.err_blocked": {
+        "EN": "The account is blocked. Please contact the administrator.",
+        "PL": "Konto jest zablokowane. Skontaktuj się z administratorem.",
+        "ZH": "账户已被封锁。请联系管理员。",
+        "DE": "Das Konto ist gesperrt. Bitte wenden Sie sich an den Administrator.",
+    },
+    "auth.login.err_invalid_credentials": {
+        "EN": "Incorrect details entered — check them and try again!",
+        "PL": "Wprowadzono nieprawidłowe dane — sprawdź je i spróbuj ponownie!",
+        "ZH": "输入的信息有误，请检查后重试！",
+        "DE": "Falsche Angaben eingegeben — überprüfen Sie sie und versuchen Sie es erneut!",
+    },
+    "auth.login.err_not_approved": {
+        "EN": "Access has not yet been approved by the administrator!",
+        "PL": "Dostęp nie został jeszcze zatwierdzony przez administratora!",
+        "ZH": "管理员尚未批准访问！",
+        "DE": "Der Zugriff wurde noch nicht vom Administrator genehmigt!",
+    },
+    "auth.login.go_register": {
+        "EN": "Create a new account (Registration)",
+        "PL": "Utwórz nowe konto (Rejestracja)",
+        "ZH": "创建新账户（注册）",
+        "DE": "Neues Konto erstellen (Registrierung)",
+    },
+    "auth.login.new_account_option": {
+        "EN": "— Another account (not saved, enter details manually) —",
+        "PL": "— Inne konto (niezapisane, wprowadź dane ręcznie) —",
+        "ZH": "— 其他账户（未保存，手动输入信息）—",
+        "DE": "— Anderes Konto (nicht gespeichert, Daten manuell eingeben) —",
+    },
+    "auth.login.quick_cleared": {
+        "EN": "Quick login cleared. Enter your details manually and log in again.",
+        "PL": "Szybkie logowanie wyczyszczone. Wprowadź dane ręcznie i zaloguj się ponownie.",
+        "ZH": "快速登录已清除。请手动输入信息后重新登录。",
+        "DE": "Schnellanmeldung gelöscht. Geben Sie die Daten manuell ein und melden Sie sich erneut an.",
+    },
+    "auth.login.quick_delete_one_tooltip": {
+        "EN": "Remove the selected account from the list",
+        "PL": "Usuń wybrane konto z listy",
+        "ZH": "从列表中删除所选账户",
+        "DE": "Ausgewähltes Konto aus der Liste entfernen",
+    },
+    "auth.login.quick_delete_none_selected": {
+        "EN": "Select a saved account to delete",
+        "PL": "Wybierz zapisane konto do usunięcia",
+        "ZH": "请选择要删除的已保存账户",
+        "DE": "Wählen Sie ein gespeichertes Konto zum Löschen aus",
+    },
+    "auth.login.quick_deleted_one": {
+        "EN": "Account removed from the list",
+        "PL": "Konto usunięte z listy",
+        "ZH": "账户已从列表中删除",
+        "DE": "Konto aus der Liste entfernt",
+    },
+    "auth.register.available_regions": {
+        "EN": "Available regions",
+        "PL": "Dostępne regiony",
+        "ZH": "可用地区",
+        "DE": "Verfügbare Regionen",
+    },
+    "auth.register.company_hint_sa": {
+        "EN": "Not filled in for SuperAdmin",
+        "PL": "Nie wypełnia się dla SuperAdmina",
+        "ZH": "超级管理员无需填写",
+        "DE": "Wird für SuperAdmin nicht ausgefüllt",
+    },
+    "auth.register.company_not_found": {
+        "EN": "Company not found. Once the company is created, regions will become available for selection.",
+        "PL": "Nie znaleziono firmy. Po utworzeniu firmy regiony będą dostępne do wyboru.",
+        "ZH": "未找到公司。创建公司后，即可选择地区。",
+        "DE": "Unternehmen nicht gefunden. Nach dem Anlegen des Unternehmens stehen Regionen zur Auswahl.",
+    },
+    "auth.register.err_check_fields": {
+        "EN": "Check the unfilled fields",
+        "PL": "Sprawdź niewypełnione pola",
+        "ZH": "请检查未填写的字段",
+        "DE": "Überprüfen Sie die nicht ausgefüllten Felder",
+    },
+    "auth.register.refresh_regions": {
+        "EN": "Refresh region list",
+        "PL": "Odśwież listę regionów",
+        "ZH": "刷新地区列表",
+        "DE": "Regionsliste aktualisieren",
+    },
+    "auth.register.regions_hint_none_selected": {
+        "EN": "If no region is selected, the user will have access to all company regions",
+        "PL": "Jeśli nie wybierzesz żadnego regionu, użytkownik będzie miał dostęp do wszystkich regionów firmy",
+        "ZH": "如果不选择任何地区，用户将可以访问公司的所有地区",
+        "DE": "Wird keine Region ausgewählt, erhält der Benutzer Zugriff auf alle Regionen des Unternehmens",
+    },
+    "auth.register.regions_note": {
+        "EN": "Regions and price tiers are set centrally by the SuperAdmin in company management.",
+        "PL": "Regiony i poziomy cen są ustawiane centralnie przez SuperAdmina w zarządzaniu firmą.",
+        "ZH": "地区和价格等级由超级管理员在公司管理中统一设置。",
+        "DE": "Regionen und Preisstufen werden zentral vom SuperAdmin in der Unternehmensverwaltung festgelegt.",
+    },
+    "auth.register.sa_no_region_limit": {
+        "EN": "For SuperAdmin, region access is not restricted",
+        "PL": "Dla SuperAdmina dostęp do regionów nie jest ograniczony",
+        "ZH": "超级管理员不受地区访问限制",
+        "DE": "Für SuperAdmin ist der Regionszugriff nicht eingeschränkt",
+    },
+    "auth.register.sa_no_region_limit_hint": {
+        "EN": "Region restrictions do not apply to SuperAdmin",
+        "PL": "Ograniczenia regionów nie dotyczą SuperAdmina",
+        "ZH": "地区限制不适用于超级管理员",
+        "DE": "Regionsbeschränkungen gelten nicht für SuperAdmin",
+    },
+    "auth.register.title": {
+        "EN": "Registration in CatMan Pro",
+        "PL": "Rejestracja w CatMan Pro",
+        "ZH": "在CatMan Pro中注册",
+        "DE": "Registrierung in CatMan Pro",
+    },
+    "common.next_page": {
+        "EN": "Next page",
+        "PL": "Następna strona",
+        "ZH": "下一页",
+        "DE": "Nächste Seite",
+    },
+    "common.prev_page": {
+        "EN": "Previous page",
+        "PL": "Poprzednia strona",
+        "ZH": "上一页",
+        "DE": "Vorherige Seite",
+    },
+    "cost_orders.col.amount_full": {
+        "EN": "Full amount",
+        "PL": "Pełna kwota",
+        "ZH": "全额",
+        "DE": "Gesamtbetrag",
+    },
+    "cost_orders.col.log_actual": {
+        "EN": "Log. actual {ccy}",
+        "PL": "Log. rzecz. {ccy}",
+        "ZH": "物流实际 {ccy}",
+        "DE": "Log. Ist {ccy}",
+    },
+    "cost_orders.col.log_calc": {
+        "EN": "Log. calc.",
+        "PL": "Log. wyl.",
+        "ZH": "物流估算",
+        "DE": "Log. ber.",
+    },
+    "cost_orders.col.new_price": {
+        "EN": "New price",
+        "PL": "Nowa cena",
+        "ZH": "新价格",
+        "DE": "Neuer Preis",
+    },
+    "cost_orders.col.tariff": {
+        "EN": "Tariff",
+        "PL": "Taryfa",
+        "ZH": "运费",
+        "DE": "Tarif",
+    },
+    "cost_orders.col.unit_cost": {
+        "EN": "Cost",
+        "PL": "C.k.",
+        "ZH": "成本价",
+        "DE": "SK",
+    },
+    "cost_orders.col.weight_actual": {
+        "EN": "Weight act.",
+        "PL": "Waga rzecz.",
+        "ZH": "实际重量",
+        "DE": "Gewicht Ist",
+    },
+    "cost_orders.col.weight_calc": {
+        "EN": "Weight calc.",
+        "PL": "Waga wyl.",
+        "ZH": "估算重量",
+        "DE": "Gewicht ber.",
+    },
+    "cost_orders.err.filter": {
+        "EN": "Filter error",
+        "PL": "Błąd filtra",
+        "ZH": "筛选器错误",
+        "DE": "Filterfehler",
+    },
+    "cost_orders.err.merge": {
+        "EN": "Merge error",
+        "PL": "Błąd łączenia",
+        "ZH": "合并错误",
+        "DE": "Fehler beim Zusammenführen",
+    },
+    "cost_orders.filter.logistics_ccy": {
+        "EN": "Logistics, currency",
+        "PL": "Logistyka, waluta",
+        "ZH": "物流，货币",
+        "DE": "Logistik, Währung",
+    },
+    "cost_orders.filter.new_price_ccy": {
+        "EN": "New price, currency",
+        "PL": "Nowa cena, waluta",
+        "ZH": "新价格，货币",
+        "DE": "Neuer Preis, Währung",
+    },
+    "cost_orders.filter.unit_cost_ccy": {
+        "EN": "Order cost, currency",
+        "PL": "C.k. zamówienia, waluta",
+        "ZH": "订单成本价，货币",
+        "DE": "Bestellselbstkosten, Währung",
+    },
+    "cost_orders.merge": {
+        "EN": "Merge",
+        "PL": "Połącz",
+        "ZH": "合并",
+        "DE": "Zusammenführen",
+    },
+    "cost_orders.merge_count": {
+        "EN": "Merge ({n})",
+        "PL": "Połącz ({n})",
+        "ZH": "合并（{n}）",
+        "DE": "Zusammenführen ({n})",
+    },
+    "cost_orders.merge_hint_count": {
+        "EN": "Merge {n} orders",
+        "PL": "Połącz {n} zamówień",
+        "ZH": "合并{n}个订单",
+        "DE": "{n} Bestellungen zusammenführen",
+    },
+    "cost_orders.merge_hint_select": {
+        "EN": "Select 2+ orders to merge",
+        "PL": "Wybierz 2+ zamówienia do połączenia",
+        "ZH": "选择2个及以上订单进行合并",
+        "DE": "Wählen Sie 2+ Bestellungen zum Zusammenführen",
+    },
+    "cost_orders.no_rows": {
+        "EN": "No rows",
+        "PL": "Brak wierszy",
+        "ZH": "没有行",
+        "DE": "Keine Zeilen",
+    },
+    "cost_orders.tier_fallback": {
+        "EN": "Tier",
+        "PL": "Poziom",
+        "ZH": "级别",
+        "DE": "Stufe",
+    },
+    "cost_orders.title": {
+        "EN": "Cost Price / Profitability",
+        "PL": "Cena kosztowa / Rentowność",
+        "ZH": "成本价 / 盈利能力",
+        "DE": "Selbstkosten / Rentabilität",
+    },
+    "files.delete_file_confirm": {
+        "EN": "Delete \"{fname}\"?",
+        "PL": "Usunąć \"{fname}\"?",
+        "ZH": "删除\"{fname}\"？",
+        "DE": "\"{fname}\" löschen?",
+    },
+    "files.delete_folder_body": {
+        "EN": "All files and subfolders will be deleted permanently.",
+        "PL": "Wszystkie pliki i podfoldery zostaną trwale usunięte.",
+        "ZH": "所有文件和子文件夹将被永久删除。",
+        "DE": "Alle Dateien und Unterordner werden unwiderruflich gelöscht.",
+    },
+    "files.delete_folder_confirm": {
+        "EN": "Delete \"{name}\"?",
+        "PL": "Usunąć \"{name}\"?",
+        "ZH": "删除\"{name}\"？",
+        "DE": "\"{name}\" löschen?",
+    },
+    "files.dlg.rename_file": {
+        "EN": "Rename file",
+        "PL": "Zmień nazwę pliku",
+        "ZH": "重命名文件",
+        "DE": "Datei umbenennen",
+    },
+    "files.loading": {
+        "EN": "Loading…",
+        "PL": "Ładowanie…",
+        "ZH": "加载中…",
+        "DE": "Wird geladen…",
+    },
+    "files.no_folders": {
+        "EN": "No folders.",
+        "PL": "Brak folderów.",
+        "ZH": "没有文件夹。",
+        "DE": "Keine Ordner.",
+    },
+    "files.renamed": {
+        "EN": "Renamed",
+        "PL": "Zmieniono nazwę",
+        "ZH": "已重命名",
+        "DE": "Umbenannt",
+    },
+    "gsm.running": {
+        "EN": "Parsing in progress…",
+        "PL": "Trwa parsowanie…",
+        "ZH": "正在解析…",
+        "DE": "Parsing läuft…",
+    },
+    "languages.clear_filter": {
+        "EN": "Show all",
+        "PL": "Pokaż wszystkie",
+        "ZH": "显示全部",
+        "DE": "Alle anzeigen",
+    },
+    "languages.empty_filter_active": {
+        "EN": "Only entries with an empty translation in at least one language are shown",
+        "PL": "Wyświetlane są tylko wpisy z pustym tłumaczeniem w co najmniej jednym języku",
+        "ZH": "仅显示至少一种语言翻译为空的条目",
+        "DE": "Es werden nur Einträge angezeigt, die in mindestens einer Sprache keine Übersetzung haben",
+    },
+    "languages.empty_state": {
+        "EN": "No registered text for translation yet. Keys appear automatically as soon as the corresponding app tab is opened at least once.",
+        "PL": "Nie ma jeszcze żadnego zarejestrowanego tekstu do tłumaczenia. Klucze pojawiają się automatycznie, gdy odpowiednia zakładka aplikacji zostanie otwarta choć raz.",
+        "ZH": "尚无任何已注册的待翻译文本。只要相应的应用程序标签页被打开过一次，键就会自动出现。",
+        "DE": "Es gibt noch keinen registrierten Text zur Übersetzung. Schlüssel erscheinen automatisch, sobald der entsprechende App-Tab mindestens einmal geöffnet wurde.",
+    },
+    "languages.err.save_some_failed": {
+        "EN": "Failed to save some translations",
+        "PL": "Nie udało się zapisać niektórych tłumaczeń",
+        "ZH": "部分翻译保存失败",
+        "DE": "Einige Übersetzungen konnten nicht gespeichert werden",
+    },
+    "languages.no_empty": {
+        "EN": "All translations are filled in for all languages 🎉",
+        "PL": "Wszystkie tłumaczenia są uzupełnione dla wszystkich języków 🎉",
+        "ZH": "所有语言的翻译均已填写完成 🎉",
+        "DE": "Alle Übersetzungen sind für alle Sprachen ausgefüllt 🎉",
+    },
+    "languages.no_matches": {
+        "EN": "Nothing found for this query.",
+        "PL": "Nie znaleziono nic dla tego zapytania.",
+        "ZH": "未找到与此查询匹配的内容。",
+        "DE": "Für diese Anfrage wurde nichts gefunden.",
+    },
+    "languages.search_hint": {
+        "EN": "Search by key or Ukrainian text",
+        "PL": "Szukaj według klucza lub tekstu ukraińskiego",
+        "ZH": "按键或乌克兰语文本搜索",
+        "DE": "Suche nach Schlüssel oder ukrainischem Text",
+    },
+    "nav.help_body": {
+        "EN": "On the left — the section menu (products, orders, warehouse, etc.), the «hamburger» button hides/shows it. Top right — calculators, notebook, home page, settings, language switcher and logout button. In the center — the current date and time. Right-clicking a menu item opens it in a new window.",
+        "PL": "Po lewej — menu sekcji (produkty, zamówienia, magazyn itd.), przyciskiem-«hamburgerem» można je ukryć/pokazać. Na górze po prawej — kalkulatory, notatnik, strona główna, ustawienia, przełącznik języka i przycisk wylogowania. Na środku — bieżąca data i godzina. Kliknięcie prawym przyciskiem myszy na pozycji menu otwiera ją w nowym oknie.",
+        "ZH": "左侧 — 板块菜单（商品、订单、仓库等），可通过«汉堡»按钮隐藏/显示。右上方 — 计算器、记事本、主页、设置、语言切换器和退出按钮。中间 — 当前日期和时间。右键点击菜单项可在新窗口中打开。",
+        "DE": "Links — das Bereichsmenü (Produkte, Bestellungen, Lager usw.), über die «Hamburger»-Schaltfläche ein-/ausblendbar. Oben rechts — Rechner, Notizbuch, Startseite, Einstellungen, Sprachumschalter und Abmelde-Schaltfläche. In der Mitte — aktuelles Datum und Uhrzeit. Ein Rechtsklick auf einen Menüpunkt öffnet ihn in einem neuen Fenster.",
+    },
+    "nav.help_body_admin": {
+        "EN": "At the top — admin section buttons (requests, users, categories, suppliers, packaging, copying, extensions, settings, product from template). On the right — company/region selection, the «Overview» button returns to the home screen, there is a language switcher and a logout button.",
+        "PL": "U góry — przyciski sekcji administracyjnych (wnioski, użytkownicy, kategorie, dostawcy, opakowania, kopiowanie, rozszerzenia, ustawienia, produkt z szablonu). Po prawej — wybór firmy/regionu, przycisk «Przegląd» wraca do ekranu głównego, jest przełącznik języka i przycisk wylogowania.",
+        "ZH": "顶部 — 管理板块按钮（申请、用户、类别、供应商、包装、复制、扩展、设置、按模板建品）。右侧 — 公司/地区选择，«概览»按钮返回主屏幕，有语言切换器和退出按钮。",
+        "DE": "Oben — Schaltflächen der Verwaltungsbereiche (Anträge, Benutzer, Kategorien, Lieferanten, Verpackung, Kopieren, Erweiterungen, Einstellungen, Produkt aus Vorlage). Rechts — Auswahl von Unternehmen/Region, die Schaltfläche «Übersicht» kehrt zum Startbildschirm zurück, es gibt einen Sprachumschalter und eine Abmelde-Schaltfläche.",
+    },
+    "nav.help_body_sa": {
+        "EN": "At the top — superadmin section buttons (requests, users, company, updates, extensions, languages, settings). On the right — company selection, the «Overview» button returns to the home screen, there is a language switcher and a logout button. The «Languages» section lets you manage interface translations for all users.",
+        "PL": "U góry — przyciski sekcji superadministratora (wnioski, użytkownicy, firma, aktualizacje, rozszerzenia, języki, ustawienia). Po prawej — wybór firmy, przycisk «Przegląd» wraca do ekranu głównego, jest przełącznik języka i przycisk wylogowania. Sekcja «Języki» pozwala zarządzać tłumaczeniami interfejsu dla wszystkich użytkowników.",
+        "ZH": "顶部 — 超级管理员板块按钮（申请、用户、公司、更新、扩展、语言、设置）。右侧 — 公司选择，«概览»按钮返回主屏幕，有语言切换器和退出按钮。«语言»板块可为所有用户管理界面翻译。",
+        "DE": "Oben — Schaltflächen der Superadmin-Bereiche (Anträge, Benutzer, Unternehmen, Updates, Erweiterungen, Sprachen, Einstellungen). Rechts — Unternehmensauswahl, die Schaltfläche «Übersicht» kehrt zum Startbildschirm zurück, es gibt einen Sprachumschalter und eine Abmelde-Schaltfläche. Der Bereich «Sprachen» ermöglicht die Verwaltung der Oberflächenübersetzungen für alle Benutzer.",
+    },
+    "nav.logout_done": {
+        "EN": "Logged out. Restart the app to log in.",
+        "PL": "Wylogowano. Uruchom ponownie aplikację, aby się zalogować.",
+        "ZH": "已退出登录。请重启应用程序以重新登录。",
+        "DE": "Abmeldung erfolgt. Starten Sie die App neu, um sich anzumelden.",
+    },
+    "nav.switch_account_confirm_body": {
+        "EN": "You will be taken to the login screen. The current session will be ended.",
+        "PL": "Zostaniesz przeniesiony do ekranu logowania. Bieżąca sesja zostanie zakończona.",
+        "ZH": "您将被转到登录界面。当前会话将被终止。",
+        "DE": "Sie werden zum Anmeldebildschirm weitergeleitet. Die aktuelle Sitzung wird beendet.",
+    },
+    "orders.col_settings.display_from_month": {
+        "EN": "First month to display",
+        "PL": "Pierwszy miesiąc wyświetlania",
+        "ZH": "显示的起始月份",
+        "DE": "Erster anzuzeigender Monat",
+    },
+    "orders.col_settings.show_all_history": {
+        "EN": "Show all history",
+        "PL": "Pokaż całą historię",
+        "ZH": "显示全部历史记录",
+        "DE": "Gesamten Verlauf anzeigen",
+    },
+    "payments.dlg.display_from_month": {
+        "EN": "First month to display",
+        "PL": "Pierwszy miesiąc wyświetlania",
+        "ZH": "显示的起始月份",
+        "DE": "Erster anzuzeigender Monat",
+    },
+    "payments.dlg.show_all_history": {
+        "EN": "Show all history",
+        "PL": "Pokaż całą historię",
+        "ZH": "显示全部历史记录",
+        "DE": "Gesamten Verlauf anzeigen",
+    },
+    "stock.chip.total": {
+        "EN": "Products",
+        "PL": "Produkty",
+        "ZH": "商品数",
+        "DE": "Produkte",
+    },
+    "stock.chip.with_cost": {
+        "EN": "With cost",
+        "PL": "Z kosztem",
+        "ZH": "有成本",
+        "DE": "Mit Kosten",
+    },
+    "stock.chip.with_qty": {
+        "EN": "With quantity",
+        "PL": "Z ilością",
+        "ZH": "有数量",
+        "DE": "Mit Menge",
+    },
+    "stock.chip.without_both": {
+        "EN": "Missing both",
+        "PL": "Bez obu",
+        "ZH": "两者都无",
+        "DE": "Beides fehlt",
+    },
+    "stock.chip.without_cost": {
+        "EN": "Without cost",
+        "PL": "Bez kosztu",
+        "ZH": "无成本",
+        "DE": "Ohne Kosten",
+    },
+    "stock.chip.without_qty": {
+        "EN": "Without quantity",
+        "PL": "Bez ilości",
+        "ZH": "无数量",
+        "DE": "Ohne Menge",
+    },
+    "stock.col.amount_stock": {
+        "EN": "Warehouse value {ccy}",
+        "PL": "Wartość magazyn {ccy}",
+        "ZH": "库存价值 {ccy}",
+        "DE": "Lagerwert {ccy}",
+    },
+    "stock.col.orders_unit_cost": {
+        "EN": "Order cost {ccy}",
+        "PL": "C.k. zam. {ccy}",
+        "ZH": "订单成本价 {ccy}",
+        "DE": "Bestell-SK {ccy}",
+    },
+    "stock.col.qty": {
+        "EN": "Qty warehouse",
+        "PL": "Ilość magazyn",
+        "ZH": "库存数量",
+        "DE": "Menge Lager",
+    },
+    "stock.col.unit_cost_blended": {
+        "EN": "Cost {ccy}",
+        "PL": "C.k. {ccy}",
+        "ZH": "成本价 {ccy}",
+        "DE": "SK {ccy}",
+    },
+    "stock.col.unit_cost_stock": {
+        "EN": "Warehouse cost {ccy}",
+        "PL": "C.k. magazyn {ccy}",
+        "ZH": "库存成本价 {ccy}",
+        "DE": "Lager-SK {ccy}",
+    },
+    "stock.filter.search_hint": {
+        "EN": "Search product...",
+        "PL": "Szukaj produktu...",
+        "ZH": "搜索商品...",
+        "DE": "Produkt suchen...",
+    },
+    "stock.no_products": {
+        "EN": "No products",
+        "PL": "Brak produktów",
+        "ZH": "没有商品",
+        "DE": "Keine Produkte",
+    },
+    "payments.status.production": {
+        "EN": "Production",
+        "PL": "Produkcja",
+        "ZH": "生产中",
+        "DE": "Produktion",
+    },
+    "schedule.field.quantity": {
+        "EN": "Quantity",
+        "PL": "Ilość",
+        "ZH": "数量",
+        "DE": "Menge",
+    },
+    "orders.field.currency_short": {
+        "EN": "Ccy.",
+        "PL": "Wal.",
+        "ZH": "币种",
+        "DE": "Währ.",
+    },
+    "orders.nbu_unavailable_body": {
+        "EN": "NBU unavailable — enter rate manually",
+        "PL": "NBU niedostępny — wprowadź kurs ręcznie",
+        "ZH": "乌克兰国家银行汇率不可用 — 请手动输入汇率",
+        "DE": "NBU nicht verfügbar — Kurs manuell eingeben",
+    },
+    "auth.role.закупівельник": {
+        "EN": "Buyer",
+        "PL": "Zaopatrzeniowiec",
+        "ZH": "采购员",
+        "DE": "Einkäufer",
+    },
+    "auth.role.категорійнийменеджер": {
+        "EN": "Category Manager",
+        "PL": "Kierownik kategorii",
+        "ZH": "品类经理",
+        "DE": "Kategorie-Manager",
+    },
+    "auth.role.керівникнаправлення": {
+        "EN": "Division Manager",
+        "PL": "Kierownik działu",
+        "ZH": "部门主管",
+        "DE": "Bereichsleiter",
+    },
+    "auth.role.керівник": {
+        "EN": "Manager",
+        "PL": "Kierownik",
+        "ZH": "经理",
+        "DE": "Leiter",
+    },
+    "auth.role.адмін": {
+        "EN": "Admin",
+        "PL": "Admin",
+        "ZH": "管理员",
+        "DE": "Admin",
+    },
+    "auth.role.суперадмін": {
+        "EN": "Super Admin",
+        "PL": "SuperAdmin",
+        "ZH": "超级管理员",
+        "DE": "SuperAdmin",
+    },
+    "orders.transition_date.ready_for_shipment": {
+        "EN": "Ready date",
+        "PL": "Data gotowości",
+        "ZH": "就绪日期",
+        "DE": "Bereitschaftsdatum",
+    },
+    "orders.transition_date.in_transit": {
+        "EN": "Shipment date",
+        "PL": "Data wysyłki",
+        "ZH": "发货日期",
+        "DE": "Versanddatum",
+    },
+    "orders.transition_date.at_warehouse": {
+        "EN": "Warehouse arrival date",
+        "PL": "Data przyjęcia na magazyn",
+        "ZH": "入库日期",
+        "DE": "Wareneingangsdatum",
+    },
+    "orders.transition_date.accepted": {
+        "EN": "Acceptance date",
+        "PL": "Data odbioru",
+        "ZH": "验收日期",
+        "DE": "Abnahmedatum",
+    },
+    "orders.month.1": {
+        "EN": "January",
+        "PL": "Styczeń",
+        "ZH": "一月",
+        "DE": "Januar",
+    },
+    "orders.month.2": {
+        "EN": "February",
+        "PL": "Luty",
+        "ZH": "二月",
+        "DE": "Februar",
+    },
+    "orders.month.3": {
+        "EN": "March",
+        "PL": "Marzec",
+        "ZH": "三月",
+        "DE": "März",
+    },
+    "orders.month.4": {
+        "EN": "April",
+        "PL": "Kwiecień",
+        "ZH": "四月",
+        "DE": "April",
+    },
+    "orders.month.5": {
+        "EN": "May",
+        "PL": "Maj",
+        "ZH": "五月",
+        "DE": "Mai",
+    },
+    "orders.month.6": {
+        "EN": "June",
+        "PL": "Czerwiec",
+        "ZH": "六月",
+        "DE": "Juni",
+    },
+    "orders.month.7": {
+        "EN": "July",
+        "PL": "Lipiec",
+        "ZH": "七月",
+        "DE": "Juli",
+    },
+    "orders.month.8": {
+        "EN": "August",
+        "PL": "Sierpień",
+        "ZH": "八月",
+        "DE": "August",
+    },
+    "orders.month.9": {
+        "EN": "September",
+        "PL": "Wrzesień",
+        "ZH": "九月",
+        "DE": "September",
+    },
+    "orders.month.10": {
+        "EN": "October",
+        "PL": "Październik",
+        "ZH": "十月",
+        "DE": "Oktober",
+    },
+    "orders.month.11": {
+        "EN": "November",
+        "PL": "Listopad",
+        "ZH": "十一月",
+        "DE": "November",
+    },
+    "orders.month.12": {
+        "EN": "December",
+        "PL": "Grudzień",
+        "ZH": "十二月",
+        "DE": "Dezember",
+    },
+    "notebook.month_gen.1": {
+        "EN": "January",
+        "PL": "stycznia",
+        "ZH": "一月",
+        "DE": "Januar",
+    },
+    "notebook.month_gen.2": {
+        "EN": "February",
+        "PL": "lutego",
+        "ZH": "二月",
+        "DE": "Februar",
+    },
+    "notebook.month_gen.3": {
+        "EN": "March",
+        "PL": "marca",
+        "ZH": "三月",
+        "DE": "März",
+    },
+    "notebook.month_gen.4": {
+        "EN": "April",
+        "PL": "kwietnia",
+        "ZH": "四月",
+        "DE": "April",
+    },
+    "notebook.month_gen.5": {
+        "EN": "May",
+        "PL": "maja",
+        "ZH": "五月",
+        "DE": "Mai",
+    },
+    "notebook.month_gen.6": {
+        "EN": "June",
+        "PL": "czerwca",
+        "ZH": "六月",
+        "DE": "Juni",
+    },
+    "notebook.month_gen.7": {
+        "EN": "July",
+        "PL": "lipca",
+        "ZH": "七月",
+        "DE": "Juli",
+    },
+    "notebook.month_gen.8": {
+        "EN": "August",
+        "PL": "sierpnia",
+        "ZH": "八月",
+        "DE": "August",
+    },
+    "notebook.month_gen.9": {
+        "EN": "September",
+        "PL": "września",
+        "ZH": "九月",
+        "DE": "September",
+    },
+    "notebook.month_gen.10": {
+        "EN": "October",
+        "PL": "października",
+        "ZH": "十月",
+        "DE": "Oktober",
+    },
+    "notebook.month_gen.11": {
+        "EN": "November",
+        "PL": "listopada",
+        "ZH": "十一月",
+        "DE": "November",
+    },
+    "notebook.month_gen.12": {
+        "EN": "December",
+        "PL": "grudnia",
+        "ZH": "十二月",
+        "DE": "Dezember",
+    },
+    "notebook.day_long.0": {
+        "EN": "Monday",
+        "PL": "Poniedziałek",
+        "ZH": "星期一",
+        "DE": "Montag",
+    },
+    "notebook.day_long.1": {
+        "EN": "Tuesday",
+        "PL": "Wtorek",
+        "ZH": "星期二",
+        "DE": "Dienstag",
+    },
+    "notebook.day_long.2": {
+        "EN": "Wednesday",
+        "PL": "Środa",
+        "ZH": "星期三",
+        "DE": "Mittwoch",
+    },
+    "notebook.day_long.3": {
+        "EN": "Thursday",
+        "PL": "Czwartek",
+        "ZH": "星期四",
+        "DE": "Donnerstag",
+    },
+    "notebook.day_long.4": {
+        "EN": "Friday",
+        "PL": "Piątek",
+        "ZH": "星期五",
+        "DE": "Freitag",
+    },
+    "notebook.day_long.5": {
+        "EN": "Saturday",
+        "PL": "Sobota",
+        "ZH": "星期六",
+        "DE": "Samstag",
+    },
+    "notebook.day_long.6": {
+        "EN": "Sunday",
+        "PL": "Niedziela",
+        "ZH": "星期日",
+        "DE": "Sonntag",
+    },
+    "gsm.status.0": {
+        "EN": "New",
+        "PL": "Nowość",
+        "ZH": "新品",
+        "DE": "Neuheit",
+    },
+    "gsm.status.1": {
+        "EN": "On sale",
+        "PL": "W sprzedaży",
+        "ZH": "在售",
+        "DE": "Im Verkauf",
+    },
+    "gsm.status.2": {
+        "EN": "Outdated",
+        "PL": "Przestarzały",
+        "ZH": "已过时",
+        "DE": "Veraltet",
+    },
+    "gsm.status.3": {
+        "EN": "Discontinued",
+        "PL": "Wycofany z produkcji",
+        "ZH": "已停产",
+        "DE": "Außer Produktion",
+    },
+    "gsm.col.brand": {
+        "EN": "Brand",
+        "PL": "Marka",
+        "ZH": "品牌",
+        "DE": "Marke",
+    },
+    "gsm.col.gsm_name": {
+        "EN": "Name",
+        "PL": "Nazwa",
+        "ZH": "名称",
+        "DE": "Name",
+    },
+    "gsm.col.network": {
+        "EN": "Network",
+        "PL": "Sieć",
+        "ZH": "网络",
+        "DE": "Netz",
+    },
+    "gsm.col.type": {
+        "EN": "Type",
+        "PL": "Typ",
+        "ZH": "类型",
+        "DE": "Typ",
+    },
+    "gsm.col.year": {
+        "EN": "Year",
+        "PL": "Rok",
+        "ZH": "年份",
+        "DE": "Jahr",
+    },
+    "gsm.col.release": {
+        "EN": "Release",
+        "PL": "Wydanie",
+        "ZH": "发布",
+        "DE": "Release",
+    },
+    "gsm.col.gsm_size": {
+        "EN": "Size",
+        "PL": "Rozmiar",
+        "ZH": "尺寸",
+        "DE": "Größe",
+    },
+    "gsm.col.gsm_diag": {
+        "EN": "Diagonal",
+        "PL": "Przekątna",
+        "ZH": "屏幕尺寸",
+        "DE": "Diagonale",
+    },
+    "gsm.col.ek_name": {
+        "EN": "EK Name",
+        "PL": "Nazwa EK",
+        "ZH": "EK名称",
+        "DE": "EK-Name",
+    },
+    "gsm.col.ek_net": {
+        "EN": "Network",
+        "PL": "Sieć",
+        "ZH": "网络",
+        "DE": "Netz",
+    },
+    "gsm.col.ek_date": {
+        "EN": "Date",
+        "PL": "Data",
+        "ZH": "日期",
+        "DE": "Datum",
+    },
+    "gsm.col.ek_size": {
+        "EN": "Size",
+        "PL": "Rozmiar",
+        "ZH": "尺寸",
+        "DE": "Größe",
+    },
+    "gsm.col.ek_diag": {
+        "EN": "Diagonal",
+        "PL": "Przekątna",
+        "ZH": "屏幕尺寸",
+        "DE": "Diagonale",
+    },
+    "gsm.col.ek_status": {
+        "EN": "Status",
+        "PL": "Status",
+        "ZH": "状态",
+        "DE": "Status",
+    },
+    "gsm.col.ek_shops": {
+        "EN": "Shops",
+        "PL": "Sklepy",
+        "ZH": "店铺",
+        "DE": "Geschäfte",
+    },
+    "gsm.col.ek_price": {
+        "EN": "Price",
+        "PL": "Cena",
+        "ZH": "价格",
+        "DE": "Preis",
+    },
+    "cost_orders.status.production": {
+        "EN": "Production",
+        "PL": "Produkcja",
+        "ZH": "生产中",
+        "DE": "Produktion",
+    },
+    "cost_orders.status.ready_for_shipment": {
+        "EN": "Ready",
+        "PL": "Gotowy",
+        "ZH": "待发货",
+        "DE": "Bereit",
+    },
+    "cost_orders.status.in_transit": {
+        "EN": "In transit",
+        "PL": "W drodze",
+        "ZH": "运输中",
+        "DE": "Unterwegs",
+    },
+    "cost_orders.status.at_warehouse": {
+        "EN": "At warehouse",
+        "PL": "W magazynie",
+        "ZH": "在仓库",
+        "DE": "Im Lager",
+    },
+    "cost_orders.status.accepted": {
+        "EN": "Accepted",
+        "PL": "Przyjęty",
+        "ZH": "已验收",
+        "DE": "Angenommen",
+    },
+    "bulk_template.product_separate": {
+        "EN": "Product separate: there's a «Name» column (row below the levels)",
+        "PL": "Produkt osobno: jest kolumna «Nazwa» (wiersz poniżej poziomów)",
+        "ZH": "商品单独：有«名称»列（层级下方的行）",
+        "DE": "Produkt separat: es gibt eine Spalte «Name» (Zeile unterhalb der Ebenen)",
+    },
+    "calc.cp.calculate_btn": {
+        "EN": "Calculate",
+        "PL": "Oblicz",
+        "ZH": "计算",
+        "DE": "Berechnen",
+    },
+    "calc.cp.err.fill_cost_weight_margin": {
+        "EN": "Fill in cost, weight and target profitability",
+        "PL": "Wypełnij koszt, wagę i docelową rentowność",
+        "ZH": "请填写成本、重量和目标盈利能力",
+        "DE": "Kosten, Gewicht und Zielrentabilität ausfüllen",
+    },
+    "calc.cp.err.fill_cost_weight_price": {
+        "EN": "Fill in cost, weight and sale price",
+        "PL": "Wypełnij koszt, wagę i cenę sprzedaży",
+        "ZH": "请填写成本、重量和销售价格",
+        "DE": "Kosten, Gewicht und Verkaufspreis ausfüllen",
+    },
+    "calc.cp.err.open": {
+        "EN": "Failed to open calculator",
+        "PL": "Nie udało się otworzyć kalkulatora",
+        "ZH": "无法打开计算器",
+        "DE": "Rechner konnte nicht geöffnet werden",
+    },
+    "calc.cp.field.cost": {
+        "EN": "Product cost",
+        "PL": "Koszt produktu",
+        "ZH": "商品成本",
+        "DE": "Produktkosten",
+    },
+    "calc.cp.field.sale_price": {
+        "EN": "Sale price",
+        "PL": "Cena sprzedaży",
+        "ZH": "销售价格",
+        "DE": "Verkaufspreis",
+    },
+    "calc.cp.input_params": {
+        "EN": "Input parameters",
+        "PL": "Parametry wejściowe",
+        "ZH": "输入参数",
+        "DE": "Eingabeparameter",
+    },
+    "calc.cp.price_btn": {
+        "EN": "Price Calculator",
+        "PL": "Kalkulator ceny",
+        "ZH": "价格计算器",
+        "DE": "Preisrechner",
+    },
+    "calc.cp.price_title": {
+        "EN": "Price calculator",
+        "PL": "Kalkulator ceny",
+        "ZH": "价格计算器",
+        "DE": "Preisrechner",
+    },
+    "calc.cp.profitability_btn": {
+        "EN": "Profitability Calculator",
+        "PL": "Kalkulator rentowności",
+        "ZH": "盈利能力计算器",
+        "DE": "Rentabilitätsrechner",
+    },
+    "calc.cp.profitability_title": {
+        "EN": "Profitability calculator",
+        "PL": "Kalkulator rentowności",
+        "ZH": "盈利能力计算器",
+        "DE": "Rentabilitätsrechner",
+    },
+    "calc.cp.region_deliveries": {
+        "EN": "Region deliveries",
+        "PL": "Dostawy regionu",
+        "ZH": "地区配送",
+        "DE": "Regionslieferungen",
+    },
+    "calc.picker_title": {
+        "EN": "Calculators",
+        "PL": "Kalkulatory",
+        "ZH": "计算器",
+        "DE": "Rechner",
+    },
+    "calc.results_title": {
+        "EN": "Calculation results",
+        "PL": "Wyniki obliczeń",
+        "ZH": "计算结果",
+        "DE": "Berechnungsergebnisse",
+    },
+    "calc.save_dlg.name_label": {
+        "EN": "Calculation name",
+        "PL": "Nazwa obliczenia",
+        "ZH": "计算名称",
+        "DE": "Berechnungsname",
+    },
+    "calc.save_dlg.title": {
+        "EN": "Save calculation",
+        "PL": "Zapisz obliczenie",
+        "ZH": "保存计算",
+        "DE": "Berechnung speichern",
+    },
+    "calc.type.basic": {
+        "EN": "Basic",
+        "PL": "Zwykły",
+        "ZH": "普通",
+        "DE": "Einfach",
+    },
+    "calc.type.cost": {
+        "EN": "Cost price",
+        "PL": "Cena kosztowa",
+        "ZH": "成本价",
+        "DE": "Selbstkosten",
+    },
+    "calc.type.profit": {
+        "EN": "Profitability",
+        "PL": "Rentowność",
+        "ZH": "盈利能力",
+        "DE": "Rentabilität",
+    },
+    "calc.type.saved": {
+        "EN": "Saved",
+        "PL": "Zapisane",
+        "ZH": "已保存",
+        "DE": "Gespeichert",
+    },
+    "calc.type.turnover": {
+        "EN": "Turnover / Coverage",
+        "PL": "Obrót / Zabezp.",
+        "ZH": "周转 / 保障",
+        "DE": "Umsatz / Deckung",
+    },
+    "common.close": {
+        "EN": "Close",
+        "PL": "Zamknij",
+        "ZH": "关闭",
+        "DE": "Schließen",
+    },
+    "general.no_manager_selected": {
+        "EN": "No manager selected",
+        "PL": "Nie wybrano żadnego menedżera",
+        "ZH": "未选择任何经理",
+        "DE": "Kein Manager ausgewählt",
+    },
+    "general.no_regions": {
+        "EN": "No regions",
+        "PL": "Brak regionów",
+        "ZH": "没有地区",
+        "DE": "Keine Regionen",
+    },
+    "gsm.spec.announced": {
+        "EN": "Announced",
+        "PL": "Zapowiedź",
+        "ZH": "发布公告",
+        "DE": "Angekündigt",
+    },
+    "gsm.spec.battery": {
+        "EN": "Battery",
+        "PL": "Bateria",
+        "ZH": "电池",
+        "DE": "Akku",
+    },
+    "gsm.spec.chipset": {
+        "EN": "Chipset",
+        "PL": "Chipset",
+        "ZH": "处理器",
+        "DE": "Chipsatz",
+    },
+    "gsm.spec.display": {
+        "EN": "Diagonal",
+        "PL": "Przekątna",
+        "ZH": "屏幕尺寸",
+        "DE": "Diagonale",
+    },
+    "gsm.spec.memory": {
+        "EN": "Memory",
+        "PL": "Pamięć",
+        "ZH": "内存",
+        "DE": "Speicher",
+    },
+    "gsm.spec.price_max": {
+        "EN": "Price to",
+        "PL": "Cena do",
+        "ZH": "最高价格",
+        "DE": "Preis bis",
+    },
+    "gsm.spec.price_min": {
+        "EN": "Price from",
+        "PL": "Cena od",
+        "ZH": "最低价格",
+        "DE": "Preis ab",
+    },
+    "gsm.spec.released": {
+        "EN": "Release",
+        "PL": "Wydanie",
+        "ZH": "发布",
+        "DE": "Release",
+    },
+    "gsm.spec.shops": {
+        "EN": "Shops",
+        "PL": "Sklepy",
+        "ZH": "店铺",
+        "DE": "Geschäfte",
+    },
+    "gsm.spec.status": {
+        "EN": "Status",
+        "PL": "Status",
+        "ZH": "状态",
+        "DE": "Status",
+    },
+    "notebook.empty_recent": {
+        "EN": "Nothing yet",
+        "PL": "Jeszcze nic",
+        "ZH": "暂无内容",
+        "DE": "Noch nichts",
+    },
+    "notebook.notes_hint": {
+        "EN": "Free-form notes…",
+        "PL": "Dowolne notatki…",
+        "ZH": "自由笔记…",
+        "DE": "Freie Notizen…",
+    },
+    "notebook.notes_section": {
+        "EN": "Notes",
+        "PL": "Notatki",
+        "ZH": "笔记",
+        "DE": "Notizen",
+    },
+    "notebook.order_linked_tooltip": {
+        "EN": "Linked to the order schedule",
+        "PL": "Powiązane z harmonogramem zamówień",
+        "ZH": "已关联订单排期",
+        "DE": "Mit dem Bestellplan verknüpft",
+    },
+    "notebook.recent_section": {
+        "EN": "Recent entries",
+        "PL": "Ostatnie wpisy",
+        "ZH": "最近记录",
+        "DE": "Letzte Einträge",
+    },
+    "notebook.repeat.tooltip": {
+        "EN": "Make repeating",
+        "PL": "Ustaw jako powtarzalne",
+        "ZH": "设为重复",
+        "DE": "Wiederholend machen",
+    },
+    "notebook.task_hint": {
+        "EN": "New task… Enter to add",
+        "PL": "Nowe zadanie… Enter, aby dodać",
+        "ZH": "新任务… 按回车添加",
+        "DE": "Neue Aufgabe… Enter zum Hinzufügen",
+    },
+    "notebook.tasks_section": {
+        "EN": "Tasks",
+        "PL": "Zadania",
+        "ZH": "任务",
+        "DE": "Aufgaben",
+    },
+    "notebook.title": {
+        "EN": "My notebook",
+        "PL": "Mój notatnik",
+        "ZH": "我的记事本",
+        "DE": "Mein Notizbuch",
+    },
+    "notebook.today": {
+        "EN": "Today",
+        "PL": "Dzisiaj",
+        "ZH": "今天",
+        "DE": "Heute",
+    },
+    "payments.chip.unpaid_label": {
+        "EN": "Unpaid:",
+        "PL": "Nieopłacone:",
+        "ZH": "未付：",
+        "DE": "Unbezahlt:",
+    },
+    "products.card_tooltip": {
+        "EN": "Product card",
+        "PL": "Karta produktu",
+        "ZH": "商品卡片",
+        "DE": "Produktkarte",
+    },
+    "products.not_found": {
+        "EN": "Product not found",
+        "PL": "Nie znaleziono produktu",
+        "ZH": "未找到商品",
+        "DE": "Produkt nicht gefunden",
+    },
+    "themes.appearance_section": {
+        "EN": "Appearance",
+        "PL": "Wygląd",
+        "ZH": "外观",
+        "DE": "Erscheinungsbild",
+    },
+    "themes.nav_pack_hint": {
+        "EN": "Replaces the icons next to page names in the menu.",
+        "PL": "Zastępuje ikony obok nazw stron w menu.",
+        "ZH": "替换菜单中页面名称旁的图标。",
+        "DE": "Ersetzt die Symbole neben den Seitennamen im Menü.",
+    },
+    "themes.nav_pack_section": {
+        "EN": "Navigation icon pack",
+        "PL": "Pakiet ikon nawigacji",
+        "ZH": "导航图标包",
+        "DE": "Navigations-Icon-Paket",
+    },
+    "themes.theme_hint": {
+        "EN": "Applied immediately to all tabs and buttons.",
+        "PL": "Stosowane natychmiast do wszystkich zakładek i przycisków.",
+        "ZH": "立即应用于所有标签页和按钮。",
+        "DE": "Wird sofort auf alle Tabs und Schaltflächen angewendet.",
+    },
+    "themes.theme_section": {
+        "EN": "Interface theme",
+        "PL": "Motyw interfejsu",
+        "ZH": "界面主题",
+        "DE": "Oberflächenthema",
+    },
+    # ── Table column headers (added 2026-07-13) ─────────────────────────────
+    # orders.col.* — Orders table (views/orders_view.py)
+    "orders.col.date": {"EN": "Date", "PL": "Data", "ZH": "日期", "DE": "Datum"},
+    "orders.col.log": {"EN": "Leg", "PL": "Odcinek", "ZH": "环节", "DE": "Etappe"},
+    "orders.col.date_payment": {"EN": "Payment", "PL": "Płatność", "ZH": "付款", "DE": "Zahlung"},
+    "orders.col.date_receive": {"EN": "Received", "PL": "Otrzymano", "ZH": "收货", "DE": "Erhalten"},
+    "orders.col.dur_acc": {"EN": "Deviation", "PL": "Odchylenie", "ZH": "偏差", "DE": "Abweichung"},
+    "orders.col.inv": {"EN": "Invoice", "PL": "Faktura", "ZH": "发票", "DE": "Rechnung"},
+    "orders.col.order1c": {"EN": "Acct. No.", "PL": "Nr księg.", "ZH": "记账号", "DE": "Buchh.-Nr."},
+    "orders.col.product": {"EN": "Product", "PL": "Produkt", "ZH": "产品", "DE": "Produkt"},
+    "orders.col.status": {"EN": "Status", "PL": "Status", "ZH": "状态", "DE": "Status"},
+    "orders.col.delivery": {"EN": "Delivery Type", "PL": "Typ dostawy", "ZH": "配送类型", "DE": "Liefertyp"},
+    "orders.col.comment": {"EN": "Comment", "PL": "Komentarz", "ZH": "备注", "DE": "Kommentar"},
+    "orders.col.qty": {"EN": "Qty", "PL": "Ilość", "ZH": "数量", "DE": "Menge"},
+    "orders.col.amount": {"EN": "Amount", "PL": "Wartość", "ZH": "金额", "DE": "Betrag"},
+    "orders.col.amount_usd": {"EN": "Amount $", "PL": "Wartość $", "ZH": "金额 $", "DE": "Betrag $"},
+    "orders.col.payment": {"EN": "Payment", "PL": "Płatność", "ZH": "付款", "DE": "Zahlung"},
+    "orders.col.submission": {"EN": "Data Entry", "PL": "Wprowadzanie danych", "ZH": "数据录入", "DE": "Dateneingabe"},
+    "orders.col.date_prod_end": {"EN": "Ready", "PL": "Gotowe", "ZH": "已完成", "DE": "Fertig"},
+    "orders.col.dur_prod": {"EN": "Prod. Term", "PL": "Czas produkcji", "ZH": "生产周期", "DE": "Produktionsfrist"},
+    "orders.col.date_wh": {"EN": "In Stock", "PL": "W magazynie", "ZH": "入库", "DE": "Auf Lager"},
+    "orders.col.dur_deliv": {"EN": "Delivery Term", "PL": "Czas dostawy", "ZH": "交货期", "DE": "Lieferfrist"},
+    "orders.col.date_1c": {"EN": "Receiving", "PL": "Odbiór", "ZH": "收货验收", "DE": "Wareneingang"},
+    "orders.col.term_acc": {"EN": "Receiving Term", "PL": "Czas odbioru", "ZH": "验收周期", "DE": "Abnahmefrist"},
+    "orders.col.w_prev": {"EN": "Calc. Weight", "PL": "Waga wyliczona", "ZH": "计算重量", "DE": "Berechn. Gewicht"},
+    "orders.col.w_fact": {"EN": "Actual Weight", "PL": "Waga rzeczywista", "ZH": "实际重量", "DE": "Ist-Gewicht"},
+    "orders.col.tariff": {"EN": "Tariff", "PL": "Taryfa", "ZH": "运费单价", "DE": "Tarif"},
+    "orders.col.unit_cost": {"EN": "Cost", "PL": "Koszt", "ZH": "成本", "DE": "Kosten"},
+    # cost_orders.col.* — С/В Замовлення (views/cost_price_orders_table.py)
+    "cost_orders.col.date": {"EN": "Date", "PL": "Data", "ZH": "日期", "DE": "Datum"},
+    "cost_orders.col.invoice": {"EN": "Invoice", "PL": "Faktura", "ZH": "发票", "DE": "Rechnung"},
+    "cost_orders.col.order1c": {"EN": "Acct. No.", "PL": "Nr księg.", "ZH": "记账号", "DE": "Buchh.-Nr."},
+    "cost_orders.col.product": {"EN": "Product", "PL": "Produkt", "ZH": "产品", "DE": "Produkt"},
+    "cost_orders.col.status": {"EN": "Status", "PL": "Status", "ZH": "状态", "DE": "Status"},
+    "cost_orders.col.delivery": {"EN": "Delivery Type", "PL": "Typ dostawy", "ZH": "配送类型", "DE": "Liefertyp"},
+    "cost_orders.col.comment": {"EN": "Comment", "PL": "Komentarz", "ZH": "备注", "DE": "Kommentar"},
+    "cost_orders.col.qty": {"EN": "Qty", "PL": "Ilość", "ZH": "数量", "DE": "Menge"},
+    "cost_orders.col.amount": {"EN": "Amount", "PL": "Wartość", "ZH": "金额", "DE": "Betrag"},
+    "cost_orders.col.full_amount": {"EN": "Full Amount", "PL": "Pełna wartość", "ZH": "总金额", "DE": "Gesamtbetrag"},
+    "cost_orders.col.calc_weight": {"EN": "Calc. Weight", "PL": "Waga wyliczona", "ZH": "计算重量", "DE": "Berechn. Gewicht"},
+    "cost_orders.col.fact_weight": {"EN": "Actual Weight", "PL": "Waga rzeczywista", "ZH": "实际重量", "DE": "Ist-Gewicht"},
+    "cost_orders.col.log_fact": {"EN": "Log. Actual", "PL": "Log. rzeczyw.", "ZH": "物流(实际)", "DE": "Log. tatsächl."},
+    "cost_orders.col.new_margin": {"EN": "New Margin", "PL": "Nowa marża", "ZH": "新利润率", "DE": "Neue Marge"},
+    # cost_stock.col.* — С/В Склад (views/cost_price_stock_page.py)
+    "cost_stock.col.product": {"EN": "Product", "PL": "Produkt", "ZH": "产品", "DE": "Produkt"},
+    "cost_stock.col.qty": {"EN": "Stock Qty", "PL": "Ilość magazyn.", "ZH": "库存数量", "DE": "Lagermenge"},
+    "cost_stock.col.amount_stock": {"EN": "Stock Value", "PL": "Wartość magazynu", "ZH": "库存价值", "DE": "Lagerwert"},
+    "cost_stock.col.unit_cost_stock": {"EN": "Stock Cost", "PL": "Koszt magazynu", "ZH": "库存成本", "DE": "Lagerkosten"},
+    "cost_stock.col.orders_unit_cost": {"EN": "Order Cost", "PL": "Koszt zamówienia", "ZH": "订单成本", "DE": "Bestellkosten"},
+    "cost_stock.col.unit_cost_blended": {"EN": "Cost", "PL": "Koszt", "ZH": "成本", "DE": "Kosten"},
+    "cost_stock.col.new_price": {"EN": "New Price", "PL": "Nowa cena", "ZH": "新价格", "DE": "Neuer Preis"},
+    "cost_stock.col.new_margin": {"EN": "New Margin", "PL": "Nowa marża", "ZH": "新利润率", "DE": "Neue Marge"},
+    # pack_stock.col.* / .toggle.* — Склад Пакування (views/packaging_stock_view.py)
+    "pack_stock.col.d": {"EN": "Date", "PL": "Data", "ZH": "日期", "DE": "Datum"},
+    "pack_stock.col.qty": {"EN": "Quantity", "PL": "Ilość", "ZH": "数量", "DE": "Menge"},
+    "pack_stock.col.st": {"EN": "Status", "PL": "Status", "ZH": "状态", "DE": "Status"},
+    "pack_stock.col.cost": {"EN": "Amount", "PL": "Wartość", "ZH": "金额", "DE": "Betrag"},
+    "pack_stock.col.cost_usd": {"EN": "Amount $", "PL": "Wartość $", "ZH": "金额 $", "DE": "Betrag $"},
+    "pack_stock.col.paid": {"EN": "Paid", "PL": "Zapłacono", "ZH": "已付款", "DE": "Bezahlt"},
+    "pack_stock.col.ship": {"EN": "Shipped", "PL": "Wysłano", "ZH": "已发货", "DE": "Versandt"},
+    "pack_stock.col.bal_pack": {"EN": "Balance", "PL": "Saldo", "ZH": "结余", "DE": "Saldo"},
+    "pack_stock.col.bal_goods": {"EN": "Balance", "PL": "Saldo", "ZH": "结余", "DE": "Saldo"},
+    "pack_stock.col.zp": {"EN": "Acct. No.", "PL": "Nr księg.", "ZH": "记账号", "DE": "Buchh.-Nr."},
+    "pack_stock.col.inv": {"EN": "Invoice", "PL": "Faktura", "ZH": "发票", "DE": "Rechnung"},
+    "pack_stock.col.cmt": {"EN": "Comment", "PL": "Komentarz", "ZH": "备注", "DE": "Kommentar"},
+    "pack_stock.toggle.bal_pack": {"EN": "Balance (pack.)", "PL": "Saldo (opak.)", "ZH": "结余(包装)", "DE": "Saldo (Verp.)"},
+    "pack_stock.toggle.bal_goods": {"EN": "Balance (goods)", "PL": "Saldo (towar)", "ZH": "结余(货品)", "DE": "Saldo (Ware)"},
+    "pack_stock.toggle.del": {"EN": "Delete", "PL": "Usuwanie", "ZH": "删除", "DE": "Löschen"},
+    # payments.col.* — Взаєморозрахунки (views/payments_view.py)
+    "payments.col.invoice": {"EN": "Invoice", "PL": "Faktura", "ZH": "发票", "DE": "Rechnung"},
+    "payments.col.status": {"EN": "Status", "PL": "Status", "ZH": "状态", "DE": "Status"},
+    "payments.col.transferred": {"EN": "Transferred", "PL": "Przekazano", "ZH": "已转账", "DE": "Übertragen"},
+    "payments.col.product": {"EN": "Product", "PL": "Produkt", "ZH": "产品", "DE": "Produkt"},
+    "payments.col.comment": {"EN": "Comment", "PL": "Komentarz", "ZH": "备注", "DE": "Kommentar"},
+    "payments.col.delivery": {"EN": "Delivery Type", "PL": "Typ dostawy", "ZH": "配送类型", "DE": "Liefertyp"},
+    "payments.col.qty": {"EN": "Qty", "PL": "Ilość", "ZH": "数量", "DE": "Menge"},
+    # schedule.col.* — Розклад Замовлень (views/order_schedule_view.py)
+    "schedule.col.state": {"EN": "State", "PL": "Stan", "ZH": "状态", "DE": "Zustand"},
+    "schedule.col.name": {"EN": "Schedule Item", "PL": "Pozycja harmonogramu", "ZH": "排期项目", "DE": "Zeitplanposition"},
+    "schedule.col.name_sort_tooltip": {"EN": "Sort by name (A-Z / Z-A)", "PL": "Sortuj wg nazwy (A-Z / Z-A)", "ZH": "按名称排序 (A-Z / Z-A)", "DE": "Nach Name sortieren (A-Z / Z-A)"},
+    "schedule.col.archive": {"EN": "Archive", "PL": "Archiwum", "ZH": "归档", "DE": "Archiv"},
+    "schedule.col.deadline": {"EN": "deadline ↑", "PL": "termin ↑", "ZH": "截止日期 ↑", "DE": "Frist ↑"},
+    "schedule.col.months_sort_tooltip": {"EN": "Sort by latest order date", "PL": "Sortuj wg ostatniej daty zamówienia", "ZH": "按最新订单日期排序", "DE": "Nach letztem Bestelldatum sortieren"},
+    # media.col.* new entries — Медіа План (views/media_plan_view.py)
+    "media.col.inactive_short": {"EN": "Inactive", "PL": "Nieakt.", "ZH": "未激活", "DE": "Inaktiv"},
+    "media.col.name_sort_tooltip": {"EN": "Sort by name (A-Z / Z-A)", "PL": "Sortuj wg nazwy (A-Z / Z-A)", "ZH": "按名称排序 (A-Z / Z-A)", "DE": "Nach Name sortieren (A-Z / Z-A)"},
+    "media.col.days_sort_tooltip": {"EN": "Sort by days since publication", "PL": "Sortuj wg dni od publikacji", "ZH": "按发布天数排序", "DE": "Nach Tagen seit Veröffentlichung sortieren"},
+    "media.col.pinned_month": {"EN": "Pinned month", "PL": "Przypięty miesiąc", "ZH": "已固定月份", "DE": "Angehefteter Monat"},
+    "media.col.month_sort_tooltip": {"EN": "Sort by latest date", "PL": "Sortuj wg ostatniej daty", "ZH": "按最新日期排序", "DE": "Nach letztem Datum sortieren"},
+    "media.col.archive": {"EN": "Archive", "PL": "Archiwum", "ZH": "归档", "DE": "Archiv"},
+    "media.col.open_archive_month": {"EN": "Open month from archive", "PL": "Otwórz miesiąc z archiwum", "ZH": "从归档打开月份", "DE": "Monat aus Archiv öffnen"},
+    # calc.col.* — Калькулятори (views/cost_price_calculators.py)
+    "calc.col.delivery_type": {"EN": "Delivery Type", "PL": "Typ dostawy", "ZH": "配送类型", "DE": "Liefertyp"},
+    "calc.col.tariff": {"EN": "Tariff", "PL": "Taryfa", "ZH": "运费单价", "DE": "Tarif"},
+    "calc.col.unit_cost": {"EN": "Cost", "PL": "Koszt", "ZH": "成本", "DE": "Kosten"},
+    "calc.col.margin": {"EN": "Profitability", "PL": "Rentowność", "ZH": "盈利率", "DE": "Rentabilität"},
+    "calc.col.sale_price": {"EN": "Sale Price", "PL": "Cena sprzedaży", "ZH": "销售价格", "DE": "Verkaufspreis"},
+    # settings.users_table.col.* — Налаштування → Користувачі (views/settings_view.py)
+    "settings.users_table.col.name": {"EN": "Name", "PL": "Imię", "ZH": "姓名", "DE": "Name"},
+    "settings.users_table.col.role": {"EN": "Role", "PL": "Rola", "ZH": "角色", "DE": "Rolle"},
+    "settings.users_table.col.approved": {"EN": "Approved", "PL": "Zatwierdzono", "ZH": "已批准", "DE": "Bestätigt"},
+    "settings.users_table.col.access": {"EN": "Access", "PL": "Dostęp", "ZH": "权限", "DE": "Zugriff"},
+    # extensions.gsm_log.col.* — Розширення → GSM Parser run log (views/extensions_view.py)
+    "extensions.gsm_log.col.source": {"EN": "Source", "PL": "Źródło", "ZH": "来源", "DE": "Quelle"},
+    "extensions.gsm_log.col.brand": {"EN": "Brand", "PL": "Marka", "ZH": "品牌", "DE": "Marke"},
+    "extensions.gsm_log.col.type": {"EN": "Type", "PL": "Typ", "ZH": "类型", "DE": "Typ"},
+    "extensions.gsm_log.col.model": {"EN": "Model", "PL": "Model", "ZH": "型号", "DE": "Modell"},
+    "extensions.gsm_log.col.last_seen": {"EN": "Last Date", "PL": "Ostatnia data", "ZH": "最后日期", "DE": "Letztes Datum"},
+    # gsm.device_modal.col.* — GSM Parser device card regional-variant sub-table
+    "gsm.device_modal.col.variation": {"EN": "Variant", "PL": "Wariant", "ZH": "变体", "DE": "Variante"},
+    "gsm.device_modal.col.color": {"EN": "Color", "PL": "Kolor", "ZH": "颜色", "DE": "Farbe"},
+    "gsm.device_modal.col.price_lo": {"EN": "Lower Price", "PL": "Cena niższa", "ZH": "较低价格", "DE": "Niedrigerer Preis"},
+    "gsm.device_modal.col.price_hi": {"EN": "Higher Price", "PL": "Cena wyższa", "ZH": "较高价格", "DE": "Höherer Preis"},
+    "gsm.device_modal.col.shops": {"EN": "Shops", "PL": "Sklepy", "ZH": "商店", "DE": "Geschäfte"},
+    # products.price_matrix.col.* — product card price-tier matrix (views/products_view.py)
+    "products.price_matrix.col.tier": {"EN": "Price Tier", "PL": "Poziom ceny", "ZH": "价格等级", "DE": "Preisstufe"},
+    "products.price_matrix.col.sale_price": {"EN": "Sale Price", "PL": "Cena sprzedaży", "ZH": "销售价格", "DE": "Verkaufspreis"},
+    "products.price_matrix.col.delivery_fallback": {"EN": "Delivery", "PL": "Dostawa", "ZH": "配送", "DE": "Lieferung"},
+    "products.price_matrix.col.avg_fact": {"EN": "Avg. Actual", "PL": "Śr. rzeczywista", "ZH": "平均实际", "DE": "Ø tatsächlich"},
+    "products.price_matrix.tariffs_title": {"EN": "Delivery Tariffs", "PL": "Taryfy dostawy", "ZH": "配送运费", "DE": "Liefertarife"},
+    "products.price_matrix.col.delivery_type": {"EN": "Delivery Type", "PL": "Typ dostawy", "ZH": "配送类型", "DE": "Liefertyp"},
+    "products.price_matrix.col.tariff": {"EN": "Tariff", "PL": "Taryfa", "ZH": "运费单价", "DE": "Tarif"},
+    # extensions.brands_table.col.* — Розширення → GSM Parser brand config table (views/extensions_view.py)
+    "extensions.brands_table.col.enabled": {"EN": "On", "PL": "Wł.", "ZH": "启用", "DE": "Ein"},
+    "extensions.brands_table.col.brand": {"EN": "Brand", "PL": "Marka", "ZH": "品牌", "DE": "Marke"},
+    "extensions.brands_table.col.gsm_url": {"EN": "GsmArena Link", "PL": "Link GsmArena", "ZH": "GsmArena 链接", "DE": "GsmArena-Link"},
+    "extensions.brands_table.col.last_item": {"EN": "Last Parsed Item", "PL": "Ostatni sparsowany element", "ZH": "最后解析项目", "DE": "Letzter geparster Eintrag"},
+    "extensions.brands_table.col.ek_phones": {"EN": "EK Smartphones", "PL": "EK Smartfony", "ZH": "EK 智能手机", "DE": "EK Smartphones"},
+    "extensions.brands_table.col.ek_tablets": {"EN": "EK Tablets", "PL": "EK Tablety", "ZH": "EK 平板电脑", "DE": "EK Tablets"},
+    "extensions.brands_table.col.ek_watches": {"EN": "EK Watches", "PL": "EK Zegarki", "ZH": "EK 手表", "DE": "EK Uhren"},
+    # notebook.* — Блокнот repeat/qty prompts (views/notebook_view.py)
+    "notebook.repeat.title": {"EN": "Repeat", "PL": "Powtarzanie", "ZH": "重复", "DE": "Wiederholung"},
+    "notebook.repeat.daily": {"EN": "Daily", "PL": "Codziennie", "ZH": "每天", "DE": "Täglich"},
+    "notebook.repeat.weekly": {"EN": "Weekly", "PL": "Co tydzień", "ZH": "每周", "DE": "Wöchentlich"},
+    "notebook.repeat.monthly": {"EN": "Monthly", "PL": "Co miesiąc", "ZH": "每月", "DE": "Monatlich"},
+    "notebook.repeat.off": {"EN": "Don't repeat", "PL": "Nie powtarzaj", "ZH": "不重复", "DE": "Nicht wiederholen"},
+    "notebook.qty_label": {"EN": "Actual quantity", "PL": "Rzeczywista ilość", "ZH": "实际数量", "DE": "Tatsächliche Menge"},
+    "notebook.qty_title": {"EN": "How many units were actually ordered?", "PL": "Ile sztuk faktycznie zamówiono?", "ZH": "实际订购了多少件？", "DE": "Wie viele Stück wurden tatsächlich bestellt?"},
+    "notebook.repeat.tt_daily": {"EN": "Repeats: daily", "PL": "Powtarza się: codziennie", "ZH": "重复：每天", "DE": "Wiederholt: täglich"},
+    "notebook.repeat.tt_weekly": {"EN": "Repeats: weekly", "PL": "Powtarza się: co tydzień", "ZH": "重复：每周", "DE": "Wiederholt: wöchentlich"},
+    "notebook.repeat.tt_monthly": {"EN": "Repeats: monthly", "PL": "Powtarza się: co miesiąc", "ZH": "重复：每月", "DE": "Wiederholt: monatlich"},
+    # extensions.gsm_shops_appeared_max_age* — GSM Parser "shops appeared" age limit setting (views/extensions_view.py)
+    "extensions.gsm_shops_appeared_max_age": {"EN": "Item age limit, mo.", "PL": "Limit wieku produktu, mies.", "ZH": "商品年龄上限（月）", "DE": "Artikel-Altersgrenze, Mon."},
+    "extensions.gsm_shops_appeared_max_age_hint": {
+        "EN": "— \"Appeared for sale\" (sidebar panel and Telegram) only counts items whose E-Katalog publish date (\"Date added\") is no older than this many months.",
+        "PL": "— \"Pojawiły się w sprzedaży\" (panel boczny i Telegram) uwzględnia tylko produkty, których data publikacji na E-Katalog (\"Data dodania\") nie jest starsza niż tyle miesięcy.",
+        "ZH": "—\"已上架销售\"（侧边栏和Telegram）仅统计E-Katalog发布日期（\"添加日期\"）不超过此月数的商品。",
+        "DE": "— \"Zum Verkauf erschienen\" (Seitenleiste und Telegram) berücksichtigt nur Artikel, deren E-Katalog-Veröffentlichungsdatum (\"Hinzugefügt am\") nicht älter als so viele Monate ist.",
+    },
+    "extensions.ek_on_sale_statuses": {
+        "EN": "\"On sale\" status(es) on E-Katalog",
+        "PL": "Status(y) \"w sprzedaży\" na E-Katalog",
+        "ZH": "E-Katalog上的\"在售\"状态",
+        "DE": "\"Im Verkauf\"-Status(e) auf E-Katalog",
+    },
+    "extensions.ek_on_sale_statuses_hint": {
+        "EN": "— comma-separated. \"Appeared for sale\" fires ONCE per device: when its E-Katalog status first becomes one of these values (matched by the start of the string, case-insensitive). If the device was ever on sale before, disappearing/reappearing again no longer notifies.",
+        "PL": "— oddzielone przecinkami. \"Pojawiło się w sprzedaży\" uruchamia się RAZ na urządzenie: gdy jego status na E-Katalog po raz pierwszy staje się jedną z tych wartości (dopasowanie po początku ciągu, bez rozróżniania wielkości liter). Jeśli urządzenie było kiedyś w sprzedaży, ponowne zniknięcie/pojawienie się już nie powiadamia.",
+        "ZH": "—用逗号分隔。\"已上架销售\"每个设备仅触发一次：当其E-Katalog状态首次变为这些值之一时（按字符串开头匹配，不区分大小写）。如果设备曾经上架销售过，再次消失/重新出现将不再通知。",
+        "DE": "— durch Komma getrennt. \"Zum Verkauf erschienen\" löst EINMAL pro Gerät aus: wenn sein E-Katalog-Status erstmals einem dieser Werte entspricht (Abgleich am Stringanfang, ohne Groß-/Kleinschreibung). War das Gerät schon einmal im Verkauf, benachrichtigt ein erneutes Verschwinden/Erscheinen nicht mehr.",
+    },
+    # extensions.tg.* — Telegram bot/report config fields (message editor, views/extensions_view.py)
+    "extensions.tg.bot_token": {"EN": "Bot token", "PL": "Token bota", "ZH": "机器人令牌", "DE": "Bot-Token"},
+    "extensions.tg.chat_id": {"EN": "Chat ID", "PL": "ID czatu", "ZH": "聊天ID", "DE": "Chat-ID"},
+    "extensions.tg.chat_link": {"EN": "Chat link", "PL": "Link do czatu", "ZH": "聊天链接", "DE": "Chat-Link"},
+    "extensions.tg.spreadsheet_url": {"EN": "Spreadsheet link", "PL": "Link do arkusza", "ZH": "表格链接", "DE": "Tabellen-Link"},
+    "extensions.tg.chat_link_hint": {
+        "EN": "Chat link: open the target chat in Telegram -> Share/Copy link. For private groups, add the bot to the group and use Chat ID instead.",
+        "PL": "Link do czatu: otwórz odpowiedni czat w Telegramie -> Udostępnij/Kopiuj link. Dla prywatnych grup dodaj bota do grupy i użyj Chat ID.",
+        "ZH": "聊天链接：在Telegram中打开目标聊天 -> 分享/复制链接。对于私密群组，请将机器人添加到群组并使用聊天ID。",
+        "DE": "Chat-Link: Öffnen Sie den gewünschten Chat in Telegram -> Teilen/Link kopieren. Für private Gruppen fügen Sie den Bot der Gruppe hinzu und verwenden Sie stattdessen die Chat-ID.",
+    },
+    # extensions.sysmsg.* — system message titles (intro/stats/final/no_new_devices)
+    "extensions.sysmsg.intro": {"EN": "Intro", "PL": "Wstęp", "ZH": "开场白", "DE": "Einleitung"},
+    "extensions.sysmsg.no_new_devices": {"EN": "No new devices", "PL": "Brak nowych urządzeń", "ZH": "没有新设备", "DE": "Keine neuen Geräte"},
+    "extensions.sysmsg.stats": {"EN": "Update statistics", "PL": "Statystyki aktualizacji", "ZH": "更新统计", "DE": "Aktualisierungsstatistik"},
+    "extensions.sysmsg.final": {"EN": "Final message", "PL": "Wiadomość końcowa", "ZH": "最终消息", "DE": "Abschlussnachricht"},
+    # extensions.msg_editor.* — per-category block editor (add/remove/reorder header & device-card blocks)
+    "extensions.msg_editor.active_msg": {"EN": "Active", "PL": "Aktywne", "ZH": "启用", "DE": "Aktiv"},
+    "extensions.msg_editor.active_block": {"EN": "Active", "PL": "Aktywny", "ZH": "启用", "DE": "Aktiv"},
+    "extensions.msg_editor.move_up": {"EN": "Move up", "PL": "Przenieś wyżej", "ZH": "上移", "DE": "Nach oben verschieben"},
+    "extensions.msg_editor.move_down": {"EN": "Move down", "PL": "Przenieś niżej", "ZH": "下移", "DE": "Nach unten verschieben"},
+    "extensions.msg_editor.delete_block": {"EN": "Delete", "PL": "Usuń", "ZH": "删除", "DE": "Löschen"},
+    "extensions.msg_editor.header_text": {"EN": "Header text", "PL": "Tekst nagłówka", "ZH": "标题文本", "DE": "Überschriftstext"},
+    "extensions.msg_editor.header_photo": {"EN": "Photo (optional)", "PL": "Zdjęcie (opcjonalnie)", "ZH": "照片（可选）", "DE": "Foto (optional)"},
+    "extensions.msg_editor.upload_photo": {"EN": "Upload photo", "PL": "Prześlij zdjęcie", "ZH": "上传照片", "DE": "Foto hochladen"},
+    "extensions.msg_editor.badge_header": {"EN": "Header", "PL": "Nagłówek", "ZH": "标题", "DE": "Überschrift"},
+    "extensions.msg_editor.badge_card": {"EN": "Device card", "PL": "Karta urządzenia", "ZH": "设备卡片", "DE": "Gerätekarte"},
+    "extensions.msg_editor.no_blocks": {
+        "EN": "No blocks yet — add a header or a device card.",
+        "PL": "Brak bloków — dodaj nagłówek lub kartę urządzenia.",
+        "ZH": "暂无区块——添加标题或设备卡片。",
+        "DE": "Noch keine Blöcke — fügen Sie eine Überschrift oder eine Gerätekarte hinzu.",
+    },
+    "extensions.msg_editor.add_header": {"EN": "+ Header", "PL": "+ Nagłówek", "ZH": "+ 标题", "DE": "+ Überschrift"},
+    "extensions.msg_editor.add_card": {"EN": "+ Device card", "PL": "+ Karta urządzenia", "ZH": "+ 设备卡片", "DE": "+ Gerätekarte"},
+    "extensions.msg_editor.category_blocks_intro": {
+        "EN": "For each category — any number of blocks in any order: \"Header\" (text + optional photo — separates devices in the chat) and \"Device card\" (just check the boxes for what info to show — no template typing required).",
+        "PL": "Dla każdej kategorii — dowolna liczba bloków w dowolnej kolejności: \"Nagłówek\" (tekst + opcjonalne zdjęcie — oddziela urządzenia na czacie) i \"Karta urządzenia\" (po prostu zaznacz, jakie informacje pokazać — bez wpisywania szablonów).",
+        "ZH": "每个类别可有任意数量、任意顺序的区块：\"标题\"（文本+可选照片——在聊天中分隔设备）和\"设备卡片\"（只需勾选要显示的信息——无需输入模板）。",
+        "DE": "Für jede Kategorie — beliebig viele Blöcke in beliebiger Reihenfolge: \"Überschrift\" (Text + optionales Foto — trennt Geräte im Chat) und \"Gerätekarte\" (einfach ankreuzen, welche Infos angezeigt werden sollen — keine Vorlagen nötig).",
+    },
+    # extensions.category.* — per-category (gsm_new/ekatalog_new/ekatalog_shops/regions_appeared) titles+subtitles
+    "extensions.category.gsm_new.title": {"EN": "🌐 New GSM Arena devices", "PL": "🌐 Nowe urządzenia GSM Arena", "ZH": "🌐 新GSM Arena设备", "DE": "🌐 Neue GSM Arena-Geräte"},
+    "extensions.category.gsm_new.subtitle": {
+        "EN": "Headers, device cards — everything sent to Telegram when a new device appears on GSM Arena.",
+        "PL": "Nagłówki, karty urządzeń — wszystko, co jest wysyłane na Telegram, gdy pojawia się nowe urządzenie na GSM Arena.",
+        "ZH": "标题、设备卡片——GSM Arena出现新设备时发送到Telegram的所有内容。",
+        "DE": "Überschriften, Gerätekarten — alles, was an Telegram gesendet wird, wenn ein neues Gerät auf GSM Arena erscheint.",
+    },
+    "extensions.category.ekatalog_new.title": {"EN": "🛒 New E-Katalog devices", "PL": "🛒 Nowe urządzenia E-Katalog", "ZH": "🛒 新E-Katalog设备", "DE": "🛒 Neue E-Katalog-Geräte"},
+    "extensions.category.ekatalog_new.subtitle": {
+        "EN": "Same as above, for new listings on E-Katalog.",
+        "PL": "To samo dla nowych ofert na E-Katalog.",
+        "ZH": "同上，适用于E-Katalog的新上架商品。",
+        "DE": "Dasselbe für neue Angebote auf E-Katalog.",
+    },
+    "extensions.category.ekatalog_shops.title": {"EN": "🛍️ Appeared for sale (E-Katalog)", "PL": "🛍️ Pojawiły się w sprzedaży (E-Katalog)", "ZH": "🛍️ 已上架销售（E-Katalog）", "DE": "🛍️ Zum Verkauf erschienen (E-Katalog)"},
+    "extensions.category.ekatalog_shops.subtitle": {
+        "EN": "When an existing device's shop count changes from 0 to more.",
+        "PL": "Gdy liczba sklepów istniejącego urządzenia zmienia się z 0 na więcej.",
+        "ZH": "当现有设备的商店数量从0变为更多时。",
+        "DE": "Wenn sich die Shop-Anzahl eines bestehenden Geräts von 0 auf mehr ändert.",
+    },
+    "extensions.category.regions_appeared.title": {"EN": "🌍 Regions appeared (Xiaomi)", "PL": "🌍 Pojawiły się regiony (Xiaomi)", "ZH": "🌍 出现地区（小米）", "DE": "🌍 Regionen erschienen (Xiaomi)"},
+    "extensions.category.regions_appeared.subtitle": {
+        "EN": "When regional variants are first found for a Xiaomi device — and it is NOT already a new device / \"appeared for sale\" card this same run.",
+        "PL": "Gdy dla urządzenia Xiaomi po raz pierwszy znaleziono warianty regionalne — i nie jest to już karta nowego urządzenia / \"pojawiło się w sprzedaży\" w tym samym uruchomieniu.",
+        "ZH": "首次为小米设备找到地区变体时——且本次运行中该设备尚未作为新设备/\"已上架销售\"卡片出现。",
+        "DE": "Wenn für ein Xiaomi-Gerät erstmals regionale Varianten gefunden werden — und es in diesem Lauf noch nicht als neues Gerät / \"Zum Verkauf erschienen\"-Karte erscheint.",
+    },
+    # extensions.field.* — device-card checkbox labels (FIELD_CATALOG, gsm_parser_runner.py)
+    "extensions.field.brand": {"EN": "Brand", "PL": "Marka", "ZH": "品牌", "DE": "Marke"},
+    "extensions.field.model_name": {"EN": "Model", "PL": "Model", "ZH": "型号", "DE": "Modell"},
+    "extensions.field.device_type": {"EN": "Device type", "PL": "Typ urządzenia", "ZH": "设备类型", "DE": "Gerätetyp"},
+    "extensions.field.network_full": {"EN": "Network", "PL": "Sieć", "ZH": "网络", "DE": "Netzwerk"},
+    "extensions.field.dimensions": {"EN": "Dimensions", "PL": "Wymiary", "ZH": "尺寸", "DE": "Abmessungen"},
+    "extensions.field.diagonal": {"EN": "Screen diagonal", "PL": "Przekątna ekranu", "ZH": "屏幕对角线", "DE": "Bildschirmdiagonale"},
+    "extensions.field.price_uah": {"EN": "Price, UAH (GSM Arena)", "PL": "Cena, UAH (GSM Arena)", "ZH": "价格，格里夫纳（GSM Arena）", "DE": "Preis, UAH (GSM Arena)"},
+    "extensions.field.status": {"EN": "Status (E-Katalog)", "PL": "Status (E-Katalog)", "ZH": "状态（E-Katalog）", "DE": "Status (E-Katalog)"},
+    "extensions.field.price_min_max": {"EN": "Min/Max price (E-Katalog)", "PL": "Cena min/maks (E-Katalog)", "ZH": "最低/最高价格（E-Katalog）", "DE": "Min./Max.-Preis (E-Katalog)"},
+    "extensions.field.shops_count": {"EN": "Shop count (E-Katalog)", "PL": "Liczba sklepów (E-Katalog)", "ZH": "商店数量（E-Katalog）", "DE": "Shop-Anzahl (E-Katalog)"},
+    "extensions.field.regions": {"EN": "Regions (Xiaomi)", "PL": "Regiony (Xiaomi)", "ZH": "地区（小米）", "DE": "Regionen (Xiaomi)"},
+    "extensions.field.link": {"EN": "\"Open\" link", "PL": "Link \"Otwórz\"", "ZH": "\"打开\"链接", "DE": "\"Öffnen\"-Link"},
+    # extensions.tile.* — settings tab expansion-tile titles/subtitles
+    "extensions.tile.sys_messages.title": {"EN": "System messages", "PL": "Wiadomości systemowe", "ZH": "系统消息", "DE": "Systemnachrichten"},
+    "extensions.tile.sys_messages.subtitle": {
+        "EN": "Intro, final summary stats, final message, and the \"nothing new\" text.",
+        "PL": "Wstęp, końcowe statystyki, wiadomość końcowa i tekst \"nic nowego\".",
+        "ZH": "开场白、最终统计、结束语和\"没有新内容\"文本。",
+        "DE": "Einleitung, Abschlussstatistik, Abschlussnachricht und der Text \"nichts Neues\".",
+    },
+    "extensions.tile.category_blocks.title": {"EN": "Messages by category", "PL": "Wiadomości według kategorii", "ZH": "按类别的消息", "DE": "Nachrichten nach Kategorie"},
+    "extensions.tile.category_blocks.subtitle": {
+        "EN": "Headers and device cards for GSM Arena / E-Katalog — add, remove, reorder without code.",
+        "PL": "Nagłówki i karty urządzeń dla GSM Arena / E-Katalog — dodawaj, usuwaj, zmieniaj kolejność bez kodu.",
+        "ZH": "GSM Arena / E-Katalog的标题和设备卡片——无需代码即可添加、删除、重新排序。",
+        "DE": "Überschriften und Gerätekarten für GSM Arena / E-Katalog — hinzufügen, entfernen, neu anordnen ohne Code.",
+    },
+}
+
+
+def seed_ui_translations_if_new(db=None) -> None:
+    """Seed non-UA UI translations into the DB (DO NOTHING on conflict).
+    Safe to call every app start вЂ” never overwrites admin edits."""
+    _db = db or _DB
+    if _db is None or not hasattr(_db, "seed_translation_values_bulk_if_new"):
+        return
+    with contextlib.suppress(Exception):
+        by_lang: dict[str, dict[str, str]] = {}
+        for key, lang_map in _UI_SEEDS.items():
+            for lang, value in lang_map.items():
+                by_lang.setdefault(lang, {})[key] = value
+        for lang_code, values in by_lang.items():
+            _db.seed_translation_values_bulk_if_new(lang_code, values)
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Active language — per manager (post-login) or session-level (pre-login)
+# ─────────────────────────────────────────────────────────────────────────
+
+def set_active_language(manager_id: str, lang_code: str | None) -> None:
+    if manager_id:
+        _active_languages[manager_id] = (lang_code or DEFAULT_LANGUAGE).upper()
+
+
+def get_active_language_code(manager_id: str) -> str:
+    return _active_languages.get(manager_id) or DEFAULT_LANGUAGE
+
+
+def set_session_language(lang_code: str | None) -> None:
+    """Used by the login/registration screen, before any manager_id exists."""
+    global _session_language
+    _session_language = (lang_code or DEFAULT_LANGUAGE).upper()
+
+
+def get_session_language() -> str:
+    return _session_language
+
+
+def get_active_languages_list(db=None, force_refresh: bool = False) -> list[dict]:
+    """Enabled languages, ordered — for the switcher menu / 'Додати мову'
+    screen. Cached in-memory; refresh after the SA edits the language list."""
+    global _languages_list_cache
+    _db = db or _DB
+    if _db is None:
+        return list(DEFAULT_LANGUAGES_SEED)
+    if force_refresh or _languages_list_cache is None:
+        with _languages_list_lock:
+            if force_refresh or _languages_list_cache is None:
+                with contextlib.suppress(Exception):
+                    rows = _db.get_translation_languages() or []
+                    _languages_list_cache = [r for r in rows if r.get("enabled", True)]
+    return _languages_list_cache or list(DEFAULT_LANGUAGES_SEED)
+
+
+def invalidate_languages_cache() -> None:
+    global _languages_list_cache
+    _languages_list_cache = None
+
+
+def get_language_flag(lang_code: str, db=None) -> str:
+    for row in get_active_languages_list(db):
+        if str(row.get("code") or "").upper() == str(lang_code or "").upper():
+            return str(row.get("flag_emoji") or "")
+    return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Persistence glue — mirrors themes.py's _load()/_save_theme() exactly,
+# using manager_workspace_state.payload["ui_language"] (vs "ui_theme").
+# ─────────────────────────────────────────────────────────────────────────
+
+def load_manager_language(db, manager_id: str) -> str:
+    """Read the manager's saved language from workspace state and prime the
+    in-memory active-language cache. Call once when a session starts (login
+    / dashboard init) — same moment themes.py's theme gets loaded."""
+    if not manager_id:
+        return DEFAULT_LANGUAGE
+    code = DEFAULT_LANGUAGE
+    with contextlib.suppress(Exception):
+        payload = db.get_manager_workspace_state(manager_id) or {}
+        code = str(payload.get("ui_language") or DEFAULT_LANGUAGE).upper()
+    set_active_language(manager_id, code)
+    return code
+
+
+def save_manager_language(db, manager_id: str, lang_code: str) -> None:
+    """Persist + apply a manager's language choice."""
+    if not manager_id:
+        return
+    with contextlib.suppress(Exception):
+        payload = db.get_manager_workspace_state(manager_id) or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload["ui_language"] = (lang_code or DEFAULT_LANGUAGE).upper()
+        db.save_manager_workspace_state(manager_id, payload)
+    set_active_language(manager_id, lang_code)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Key registration + value lookup
+# ─────────────────────────────────────────────────────────────────────────
+
+def _ensure_known_keys_loaded() -> None:
+    global _known_keys_loaded
+    if _known_keys_loaded or _DB is None:
+        return
+    with _known_keys_lock:
+        if _known_keys_loaded:
+            return
+        with contextlib.suppress(Exception):
+            _known_keys.update(_DB.get_all_translation_keys() or set())
+        _known_keys_loaded = True
+
+
+def _register_key_if_new(key: str, uk_text: str) -> None:
+    _ensure_known_keys_loaded()
+    if key in _known_keys:
+        return
+    _known_keys.add(key)
+    if _DB is not None:
+        with contextlib.suppress(Exception):
+            _DB.register_translation_key(key, uk_text)
+
+
+def _ensure_lang_values_loaded(lang_code: str) -> None:
+    if lang_code in _translations_loaded_langs or _DB is None:
+        return
+    with _cache_lock:
+        if lang_code in _translations_loaded_langs:
+            return
+        with contextlib.suppress(Exception):
+            _translations_cache[lang_code] = _DB.get_translations_for_lang(lang_code) or {}
+        _translations_loaded_langs.add(lang_code)
+
+
+def invalidate_translations_cache(lang_code: str | None = None) -> None:
+    """Call after the SA saves new translation values so the next t() call
+    picks them up instead of stale cached ones."""
+    if lang_code:
+        _translations_loaded_langs.discard(lang_code.upper())
+        _translations_cache.pop(lang_code.upper(), None)
+    else:
+        _translations_loaded_langs.clear()
+        _translations_cache.clear()
+
+
+def t(key: str, uk_text: str, manager_id: str = "") -> str:
+    """Translate `key`. `uk_text` is the Ukrainian original — used as the
+    fallback when no translation exists, AND auto-registered into the DB key
+    registry the first time this exact key is seen (so the 'Мови' screen
+    always has a complete, up-to-date key list without a separate catalog)."""
+    _register_key_if_new(key, uk_text)
+    lang = (get_active_language_code(manager_id) if manager_id else get_session_language())
+    if lang == DEFAULT_LANGUAGE:
+        return uk_text
+    _ensure_lang_values_loaded(lang)
+    value = _translations_cache.get(lang, {}).get(key)
+    return value if value else uk_text
+
+
+def bind(manager_id: str):
+    """Returns a `t`-like callable already bound to one manager — assign as
+    `self.t = i18n.bind(self.manager_id)` in a view's __init__, then call
+    `self.t("orders.title", "Замовлення")` throughout that view."""
+    return lambda key, uk_text: t(key, uk_text, manager_id)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Reusable switcher widget — flag as a soft background, code text in front
+# (e.g. 🇺🇦 behind, "UA" on top). Used on the login screen and on every
+# dashboard, right before the logout button.
+# ─────────────────────────────────────────────────────────────────────────
+
+def build_language_switcher(
+    db,
+    on_select,
+    manager_id: str = "",
+    bg_color: str | None = None,
+) -> ft.Container:
+    """`on_select(code)` is called when the user picks a language from the
+    dropdown menu. Pass manager_id="" for the pre-login session-level
+    switcher (auth_screen.py); pass a real manager_id everywhere else.
+
+    Note: Unicode regional-indicator emoji (🇺🇦 etc.) do NOT render as
+    coloured flag images in Flet desktop on Windows — they appear as plain
+    letter pairs. We therefore use a clean globe + code design instead."""
+    code = get_active_language_code(manager_id) if manager_id else get_session_language()
+    langs = get_active_languages_list(db)
+
+    def _item(lang: dict):
+        lcode = str(lang.get("code") or "").upper()
+        name  = str(lang.get("name") or lcode)
+        return ft.PopupMenuItem(
+            content=ft.Row(
+                [
+                    ft.Container(
+                        width=28, height=18, border_radius=3,
+                        bgcolor="#1D4ED8",
+                        alignment=ft.Alignment(0, 0),
+                        content=ft.Text(lcode, size=10, weight=ft.FontWeight.W_700, color="#FFFFFF"),
+                    ),
+                    ft.Text(name, size=12),
+                ],
+                spacing=8,
+            ),
+            on_click=lambda _e, c=lcode: on_select(c),
+        )
+
+    button = ft.PopupMenuButton(
+        content=ft.Column(
+            [
+                ft.Icon(ft.Icons.LANGUAGE, size=14, color="#1E293B"),
+                ft.Text(code, size=10, weight=ft.FontWeight.W_800, color="#1E293B"),
+            ],
+            spacing=0,
+            tight=True,
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            alignment=ft.MainAxisAlignment.CENTER,
+        ),
+        tooltip="Мова інтерфейсу",
+        menu_position=ft.PopupMenuPosition.UNDER,
+        items=[_item(lang) for lang in langs],
+    )
+    return ft.Container(
+        width=52,
+        height=44,
+        border_radius=12,
+        bgcolor=bg_color or "#F1F5F9",
+        alignment=ft.Alignment(0, 0),
+        content=button,
+        padding=ft.padding.symmetric(horizontal=4),
+    )

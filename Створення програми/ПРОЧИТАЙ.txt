@@ -1,0 +1,26 @@
+Як зібрати програму (CatManPro.exe)
+====================================
+
+1. Двічі клацніть файл "Зібрати програму.bat" у цій папці.
+   Відкриється вікно "CatManPro Release Builder".
+
+2. У полі "Version" впишіть номер нової версії у форматі MAJOR.MINOR.PATCH
+   (наприклад: 1.1.3).
+
+3. Позначте, що саме зібрати:
+   - Installer (Setup .exe) — інсталятор для Windows
+   - Portable (.exe) — окремий файл без встановлення
+   - Android APK — збірка для Android
+
+4. Натисніть "Build selected" і зачекайте — весь процес і його лог
+   показуються прямо у вікні. Зазвичай Setup + Portable займають кілька
+   хвилин, залежно від ПК.
+
+5. Коли з'явиться "Build finished successfully" — готові файли лежать тут:
+   ..\.program\CatManPro-<версія>\.setup\CatManPro-Setup-<версія>.exe
+   ..\.program\CatManPro-<версія>\.portable\CatManPro-portable.exe
+   ..\.program\CatManPro-<версія>\.apk\CatManPro-android.apk (якщо позначали APK)
+
+Примітка: сам скрипт збірки (build_release.ps1) та інсталятор (.iss)
+залишились у папці "scripts" в корені проєкту — цей інструмент лише
+зручно їх запускає, нічого дублювати не потрібно.
