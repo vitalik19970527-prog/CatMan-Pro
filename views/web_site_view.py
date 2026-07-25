@@ -1806,11 +1806,33 @@ class WebSiteView:
                 status_text.update()
 
             ok, err = await asyncio.to_thread(self._publisher.publish_build, tag, name, assets)
+
+            # Publishing the files alone doesn't make the in-app updater find
+            # them — main.py checks app_update_policy (min_required +
+            # download_url/download_url_android) in the DB, completely
+            # separate from GitHub. Wiring both in one click here is exactly
+            # so this never again drifts out of sync with what got published
+            # (see [[project]]: min_required was bumped to 1.2.8 by hand
+            # while download_url still pointed at a non-existent asset).
+            if ok:
+                owner = getattr(self._publisher, "owner", "") or "vitalik19970527-prog"
+                repo = getattr(self._publisher, "repo", "") or "CatMan-Pro"
+                base = f"https://github.com/{owner}/{repo}/releases/latest/download"
+                policy = {"min_required": entry["version"]}
+                if entry["exe"]:
+                    policy["download_url"] = f"{base}/CatManPro-Setup.exe"
+                if entry["apk"]:
+                    policy["download_url_android"] = f"{base}/CatManPro-android.apk"
+                policy_ok = await asyncio.to_thread(self.db.set_app_update_policy, policy)
+                if not policy_ok:
+                    ok = False
+                    err = "Реліз опубліковано, але не вдалося оновити політику оновлення в БД"
+
             status_text.value = "Готово ✓" if ok else f"Помилка: {err}"
             with contextlib.suppress(Exception):
                 status_text.update()
             self._snack(
-                "Реліз опубліковано на GitHub" if ok else f"Помилка публікації релізу: {err}",
+                "Реліз опубліковано на GitHub, оновлення налаштовано" if ok else f"Помилка публікації релізу: {err}",
                 "green" if ok else "red",
             )
 
