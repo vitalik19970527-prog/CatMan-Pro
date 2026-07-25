@@ -274,6 +274,8 @@ def parse_pricing_tokens(text: str) -> list[dict]:
                 "start": m.start(),
                 "end": m.end(),
                 "label": display_label,
+                "group_key": last_label,
+                "col_index": repeat_count,
                 "uah": m.group("uah"),
                 "has_usd": usd_inner is not None,
                 "usd_value": usd_value,
@@ -282,6 +284,44 @@ def parse_pricing_tokens(text: str) -> list[dict]:
             }
         )
     return tokens
+
+
+def group_pricing_tokens(tokens: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Splits tokens into (grouped_rows, flat_tokens):
+    grouped_rows are runs of exactly 4 consecutive tokens sharing the same
+    group_key at col_index 0,1,2,3 — the "1/5/10/15 people" price tables —
+    collapsed into one {"label", "cols": [tok0..tok3]} row each. Everything
+    else (GSM, one-time services, bundle cards) stays as single-column
+    flat_tokens, since it has no such fixed 4-wide structure."""
+    grouped: list[dict] = []
+    flat: list[dict] = []
+    i, n = 0, len(tokens)
+    while i < n:
+        if (
+            i + 3 < n
+            and tokens[i]["col_index"] == 0
+            and all(
+                tokens[i + k]["group_key"] == tokens[i]["group_key"]
+                and tokens[i + k]["col_index"] == k
+                for k in range(1, 4)
+            )
+        ):
+            grouped.append({"label": tokens[i]["group_key"], "cols": tokens[i : i + 4]})
+            i += 4
+        else:
+            flat.append(tokens[i])
+            i += 1
+    return grouped, flat
+
+
+def apply_price_token_edits(text: str, edits: list[dict]) -> str:
+    """Batch version of apply_price_token_edit — each item in `edits` is a
+    token dict merged with its edit fields (discount/new_uah/new_usd_value,
+    plus old_uah/old_usd_value when discount=True). Spliced back-to-front by
+    position so earlier offsets stay valid while later ones get replaced."""
+    for edit in sorted(edits, key=lambda e: e["start"], reverse=True):
+        text = apply_price_token_edit(text, edit, edit)
+    return text
 
 
 def _render_price_html(uah: str, has_usd: bool, usd_prefix: str, usd_value: str, usd_suffix: str) -> str:
@@ -399,7 +439,6 @@ class WebSiteView:
         self._price_html_loaded = False
         self._prices_loading = False
         self._price_filter = ""
-        self._price_page = 0
 
         self._raw_selected_file = SITE_ALL_FILES[0]
 
@@ -788,6 +827,7 @@ class WebSiteView:
     def _build_price_section(self):
         text = self._read_site_file(PRICE_HTML_FILE)
         tokens = parse_pricing_tokens(text)
+        grouped_rows, flat_tokens = group_pricing_tokens(tokens)
 
         filter_field = ft.TextField(
             label="Пошук за назвою",
@@ -798,172 +838,216 @@ class WebSiteView:
         )
 
         needle = (self._price_filter or "").strip().lower()
-        shown_tokens = (
-            [tok for tok in tokens if needle in tok["label"].lower()] if needle else tokens
-        )
+        if needle:
+            grouped_rows = [r for r in grouped_rows if needle in r["label"].lower()]
+            flat_tokens = [t for t in flat_tokens if needle in t["label"].lower()]
 
-        page_size = 40
-        total_pages = max(1, (len(shown_tokens) + page_size - 1) // page_size)
-        self._price_page = max(0, min(self._price_page, total_pages - 1))
-        start = self._price_page * page_size
-        page_tokens = shown_tokens[start : start + page_size]
-        rows = [self._build_price_row(tok) for tok in page_tokens]
-
-        info: list[ft.Control] = [
-            ft.Text(f"Знайдено цін на сторінці: {len(tokens)}", size=12, color="grey600")
+        content: list[ft.Control] = [
+            ft.Text(
+                f"{len(tokens)} цін на сторінці: {len(grouped_rows)} рядків у таблиці "
+                f"«Вкладки/люди», {len(flat_tokens)} — окремих позицій нижче.",
+                size=12,
+                color="grey600",
+            ),
+            filter_field,
         ]
 
-        pager: list[ft.Control] = []
-        if total_pages > 1:
-            pager.append(
-                ft.Row(
-                    [
-                        ft.IconButton(
-                            ft.Icons.CHEVRON_LEFT,
-                            on_click=self._prev_price_page,
-                            disabled=self._price_page == 0,
-                        ),
-                        ft.Text(
-                            f"{start + 1}–{min(start + page_size, len(shown_tokens))} з {len(shown_tokens)}"
-                            f" (сторінка {self._price_page + 1}/{total_pages})",
-                            size=12,
-                        ),
-                        ft.IconButton(
-                            ft.Icons.CHEVRON_RIGHT,
-                            on_click=self._next_price_page,
-                            disabled=self._price_page >= total_pages - 1,
-                        ),
-                    ],
-                    alignment=ft.MainAxisAlignment.CENTER,
-                    spacing=6,
-                )
-            )
+        if grouped_rows:
+            content.append(ft.Text("Вкладки / кількість людей", size=13, weight="bold"))
+            content.append(self._build_price_table_grouped(grouped_rows))
+        if flat_tokens:
+            content.append(ft.Text("GSM, одноразові послуги, тарифні пакети", size=13, weight="bold"))
+            content.append(self._build_price_table_flat(flat_tokens))
+        if not grouped_rows and not flat_tokens:
+            content.append(ft.Text("Нічого не знайдено", size=12, color="grey600"))
 
-        return ft.Column(
-            [*info, filter_field, *pager, ft.Column(rows, spacing=6), *pager],
-            spacing=10,
-        )
+        return ft.Column(content, spacing=10)
 
     def _on_price_filter_change(self, e):
         self._price_filter = e.control.value or ""
-        self._price_page = 0
         self.build()
 
-    def _prev_price_page(self, e):
-        self._price_page = max(0, self._price_page - 1)
-        self.build()
-
-    def _next_price_page(self, e):
-        self._price_page += 1
-        self.build()
-
-    def _build_price_row(self, token: dict):
-        has_usd = token["has_usd"]
-
-        uah_field = ft.TextField(
-            label="Ціна ₴", value=token["uah"], width=110, dense=True, border_radius=8
-        )
-        usd_field = ft.TextField(
-            label="Ціна $",
-            value=token["usd_value"],
-            width=100,
+    @staticmethod
+    def _price_money_field(value: str, width: int, visible: bool = True) -> ft.TextField:
+        return ft.TextField(
+            value=value,
+            width=width,
             dense=True,
-            border_radius=8,
-            visible=has_usd,
-        )
-        discount_cb = ft.Checkbox(label="Знижка (стара ціна закреслена + нова)", value=False)
-        new_uah_field = ft.TextField(
-            label="Нова ціна ₴", value="", width=110, dense=True, border_radius=8, visible=False
-        )
-        new_usd_field = ft.TextField(
-            label="Нова ціна $",
-            value="",
-            width=100,
-            dense=True,
-            border_radius=8,
-            visible=False,
+            content_padding=ft.padding.symmetric(horizontal=6, vertical=6),
+            text_size=12,
+            border_radius=6,
+            visible=visible,
         )
 
-        def _on_discount_toggle(_e):
-            show = bool(discount_cb.value)
-            new_uah_field.visible = show
-            new_usd_field.visible = show and has_usd
-            if show and not new_uah_field.value:
-                new_uah_field.value = uah_field.value
-                new_usd_field.value = usd_field.value
-            with contextlib.suppress(Exception):
-                new_uah_field.update()
-                new_usd_field.update()
+    def _parse_price_money(self, field: ft.TextField, label: str) -> str | None:
+        raw = (field.value or "").strip().replace(",", ".")
+        try:
+            float(raw)
+        except ValueError:
+            self._snack(f"«{label}»: ціна має бути числом", "red")
+            return None
+        return raw
 
-        discount_cb.on_change = _on_discount_toggle
+    async def _publish_price_edits(self, edits: list[dict], summary_label: str):
+        if not edits:
+            self._snack("Немає змін", "grey")
+            return
 
-        def _parse_money(field: ft.TextField, label: str) -> str | None:
-            raw = (field.value or "").strip().replace(",", ".")
-            try:
-                float(raw)
-            except ValueError:
-                self._snack(f"{label}: ціна має бути числом", "red")
-                return None
-            return raw
+        def _apply():
+            current_text = self._read_site_file(PRICE_HTML_FILE)
+            return apply_price_token_edits(current_text, edits)
 
-        async def _do_save(_tok=token, _e=None):
-            new_uah = _parse_money(uah_field, "Ціна ₴")
-            if new_uah is None:
-                return
-            new_usd = ""
-            if has_usd:
-                new_usd = _parse_money(usd_field, "Ціна $")
-                if new_usd is None:
+        new_text = await asyncio.to_thread(_apply)
+        items = [(PRICE_HTML_FILE, new_text.encode("utf-8"))]
+        await self._save_and_publish(
+            items, f"Web сайт: оновлено {len(edits)} цін ({summary_label})", on_done=self.build
+        )
+
+    # Grouped table: one row per item, 1/5/10/15-people prices as 4 column pairs.
+    def _build_price_table_grouped(self, rows: list[dict]) -> ft.Column:
+        columns = [ft.DataColumn(ft.Text("Назва", size=11, weight="bold"))]
+        for col_label in _PRICE_COLUMN_LABELS:
+            columns.append(ft.DataColumn(ft.Text(f"{col_label}, ₴", size=10, weight="bold")))
+            columns.append(ft.DataColumn(ft.Text("$", size=10, weight="bold")))
+
+        field_map: list[tuple[dict, ft.TextField, ft.TextField]] = []
+        data_rows = []
+        for row in rows:
+            cells = [ft.DataCell(ft.Text(row["label"], size=11, no_wrap=False, width=140))]
+            for tok in row["cols"]:
+                uah_f = self._price_money_field(tok["uah"], 60)
+                usd_f = self._price_money_field(tok["usd_value"], 46, visible=tok["has_usd"])
+                field_map.append((tok, uah_f, usd_f))
+                cells.append(ft.DataCell(uah_f))
+                cells.append(ft.DataCell(usd_f))
+            data_rows.append(ft.DataRow(cells=cells))
+
+        async def _save_all(_e=None):
+            edits: list[dict] = []
+            for tok, uah_f, usd_f in field_map:
+                new_uah = self._parse_price_money(uah_f, tok["label"])
+                if new_uah is None:
                     return
-
-            is_discount = bool(discount_cb.value)
-            edit: dict = {"discount": is_discount}
-            if is_discount:
-                disc_uah = _parse_money(new_uah_field, "Нова ціна ₴")
-                if disc_uah is None:
-                    return
-                disc_usd = ""
-                if has_usd:
-                    disc_usd = _parse_money(new_usd_field, "Нова ціна $")
-                    if disc_usd is None:
+                new_usd = tok["usd_value"]
+                if tok["has_usd"]:
+                    new_usd = self._parse_price_money(usd_f, tok["label"])
+                    if new_usd is None:
                         return
-                edit.update(
-                    old_uah=new_uah, old_usd_value=new_usd,
-                    new_uah=disc_uah, new_usd_value=disc_usd,
-                )
-            else:
-                edit.update(new_uah=new_uah, new_usd_value=new_usd)
-
-            def _apply():
-                current_text = self._read_site_file(PRICE_HTML_FILE)
-                return apply_price_token_edit(current_text, _tok, edit)
-
-            new_text = await asyncio.to_thread(_apply)
-            items = [(PRICE_HTML_FILE, new_text.encode("utf-8"))]
-            await self._save_and_publish(items, f"Web сайт: ціна «{_tok['label']}»")
+                if new_uah == tok["uah"] and new_usd == tok["usd_value"]:
+                    continue
+                edits.append({**tok, "discount": False, "new_uah": new_uah, "new_usd_value": new_usd})
+            await self._publish_price_edits(edits, "таблиця вкладок/людей")
 
         def _on_click(_e):
             page = self._page()
             if page:
-                page.run_task(_do_save)
+                page.run_task(_save_all)
 
-        return ft.Card(
-            ft.Container(
-                padding=12,
-                content=ft.Column(
-                    [
-                        ft.Text(token["label"], size=12, weight="bold", color="grey800"),
-                        ft.Row([uah_field, usd_field], spacing=8),
-                        discount_cb,
-                        ft.Row([new_uah_field, new_usd_field], spacing=8),
-                        ft.Row(
-                            [ft.FilledButton("Зберегти", icon=ft.Icons.SAVE, on_click=_on_click)],
-                            alignment=ft.MainAxisAlignment.END,
-                        ),
-                    ],
-                    spacing=6,
+        return ft.Column(
+            [
+                ft.Row(
+                    [ft.DataTable(columns=columns, rows=data_rows, column_spacing=6,
+                                   data_row_min_height=34, heading_row_height=34)],
+                    scroll=ft.ScrollMode.ALWAYS,
                 ),
+                ft.Row(
+                    [ft.FilledButton("Зберегти зміни в таблиці", icon=ft.Icons.SAVE, on_click=_on_click)],
+                    alignment=ft.MainAxisAlignment.END,
+                ),
+            ],
+            spacing=6,
+        )
+
+    # Flat table: everything without the 4-column shape — one row per price,
+    # with an inline discount checkbox + a "new price" pair of fields.
+    def _build_price_table_flat(self, tokens: list[dict]) -> ft.Column:
+        columns = [
+            ft.DataColumn(ft.Text("Назва", size=11, weight="bold")),
+            ft.DataColumn(ft.Text("Ціна ₴", size=10, weight="bold")),
+            ft.DataColumn(ft.Text("$", size=10, weight="bold")),
+            ft.DataColumn(ft.Text("Знижка", size=10, weight="bold")),
+            ft.DataColumn(ft.Text("Нова ₴", size=10, weight="bold")),
+            ft.DataColumn(ft.Text("Нова $", size=10, weight="bold")),
+        ]
+
+        row_state: list[tuple[dict, ft.TextField, ft.TextField, ft.Checkbox, ft.TextField, ft.TextField]] = []
+        data_rows = []
+        for tok in tokens:
+            uah_f = self._price_money_field(tok["uah"], 60)
+            usd_f = self._price_money_field(tok["usd_value"], 46, visible=tok["has_usd"])
+            discount_cb = ft.Checkbox(value=False)
+            new_uah_f = self._price_money_field("", 60)
+            new_usd_f = self._price_money_field("", 46, visible=tok["has_usd"])
+            row_state.append((tok, uah_f, usd_f, discount_cb, new_uah_f, new_usd_f))
+            data_rows.append(
+                ft.DataRow(
+                    cells=[
+                        ft.DataCell(ft.Text(tok["label"], size=11, width=160)),
+                        ft.DataCell(uah_f),
+                        ft.DataCell(usd_f),
+                        ft.DataCell(discount_cb),
+                        ft.DataCell(new_uah_f),
+                        ft.DataCell(new_usd_f),
+                    ]
+                )
             )
+
+        async def _save_all(_e=None):
+            edits: list[dict] = []
+            for tok, uah_f, usd_f, discount_cb, new_uah_f, new_usd_f in row_state:
+                is_discount = bool(discount_cb.value)
+                cur_uah = self._parse_price_money(uah_f, tok["label"])
+                if cur_uah is None:
+                    return
+                cur_usd = tok["usd_value"]
+                if tok["has_usd"]:
+                    cur_usd = self._parse_price_money(usd_f, tok["label"])
+                    if cur_usd is None:
+                        return
+
+                if is_discount:
+                    if not (new_uah_f.value or "").strip():
+                        continue
+                    disc_uah = self._parse_price_money(new_uah_f, tok["label"])
+                    if disc_uah is None:
+                        return
+                    disc_usd = cur_usd
+                    if tok["has_usd"]:
+                        disc_usd = self._parse_price_money(new_usd_f, tok["label"])
+                        if disc_usd is None:
+                            return
+                    edits.append(
+                        {
+                            **tok,
+                            "discount": True,
+                            "old_uah": cur_uah,
+                            "old_usd_value": cur_usd,
+                            "new_uah": disc_uah,
+                            "new_usd_value": disc_usd,
+                        }
+                    )
+                elif cur_uah != tok["uah"] or cur_usd != tok["usd_value"]:
+                    edits.append({**tok, "discount": False, "new_uah": cur_uah, "new_usd_value": cur_usd})
+            await self._publish_price_edits(edits, "решта цін")
+
+        def _on_click(_e):
+            page = self._page()
+            if page:
+                page.run_task(_save_all)
+
+        return ft.Column(
+            [
+                ft.Row(
+                    [ft.DataTable(columns=columns, rows=data_rows, column_spacing=6,
+                                   data_row_min_height=34, heading_row_height=34)],
+                    scroll=ft.ScrollMode.ALWAYS,
+                ),
+                ft.Row(
+                    [ft.FilledButton("Зберегти зміни в таблиці", icon=ft.Icons.SAVE, on_click=_on_click)],
+                    alignment=ft.MainAxisAlignment.END,
+                ),
+            ],
+            spacing=6,
         )
 
     # -------------------------------------------------------------- 2. Зображення
