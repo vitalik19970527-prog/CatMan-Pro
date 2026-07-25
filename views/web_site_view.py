@@ -803,18 +803,28 @@ class WebSiteView:
         for key in keys:
             original_values = dict(self._i18n_values.get(key, {}))
             fields: dict[str, ft.TextField] = {}
-            cells = [ft.DataCell(ft.Text(key, size=11, selectable=True, width=200, no_wrap=False))]
+            cells = [
+                ft.DataCell(
+                    ft.Container(
+                        width=180,
+                        content=ft.Text(key, size=11, selectable=True, no_wrap=False),
+                    )
+                )
+            ]
             for lang in LANGS:
                 field = ft.TextField(
                     value=original_values.get(lang, ""),
                     width=200,
+                    multiline=True,
+                    min_lines=1,
+                    max_lines=8,
                     dense=True,
                     content_padding=ft.padding.symmetric(horizontal=8, vertical=6),
                     text_size=12,
                     border_radius=6,
                 )
                 fields[lang] = field
-                cells.append(ft.DataCell(field))
+                cells.append(ft.DataCell(ft.Container(width=200, content=field)))
             row_state.append((key, fields, original_values))
             data_rows.append(ft.DataRow(cells=cells))
 
