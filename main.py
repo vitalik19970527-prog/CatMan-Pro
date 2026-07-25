@@ -1313,6 +1313,17 @@ def main(page: ft.Page):
                 page.update()
                 return
 
+            if page.platform.is_mobile():
+                # The desktop flow below downloads the file itself and then
+                # subprocess.Popen()'s the Inno Setup installer with silent-
+                # install flags — none of that exists on Android. Handing the
+                # .apk URL to the OS instead lets it download and prompt its
+                # own "Install this app?" dialog, which is the only install
+                # path available on the platform anyway.
+                with suppress(Exception):
+                    page.launch_url(url)
+                return
+
             page.run_task(_download_and_install, url)
 
         download_button.on_click = open_download
@@ -1751,9 +1762,14 @@ def main(page: ft.Page):
                 lambda: DataManager().get_app_update_policy()
             )
             min_required = (policy.get("min_required") or "").strip()
-            download_url = (policy.get("download_url") or "").strip() or (
-                Config.UPDATE_DOWNLOAD_URL or ""
-            ).strip()
+            if page.platform.is_mobile():
+                download_url = (policy.get("download_url_android") or "").strip() or (
+                    policy.get("download_url") or ""
+                ).strip()
+            else:
+                download_url = (policy.get("download_url") or "").strip() or (
+                    Config.UPDATE_DOWNLOAD_URL or ""
+                ).strip()
             if min_required and _version_is_outdated(Config.APP_VERSION, min_required):
                 show_update_required_screen(min_required, download_url)
         except Exception:
