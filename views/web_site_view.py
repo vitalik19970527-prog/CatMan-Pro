@@ -27,6 +27,7 @@ import re
 
 import flet as ft
 
+import fx_rates
 import i18n
 from github_publisher import GitHubPublisher, load_publish_config, save_publish_config
 from logger import logger
@@ -214,6 +215,88 @@ _PRICE_COLUMN_LABELS = ["1 людина", "5 людей", "10 людей", "15 �
 # card title, sub-row heading) is used instead.
 _LABEL_EXCLUDE = {"обов'язково", "одноразово", "написати менеджеру", "/міс", "міс"}
 
+# Bundle cards (section 5, "16 готових тарифів") have their own clean h3
+# title that the generic nearest-text-node heuristic can't reliably reach —
+# it grabs the description paragraph, or a dual-row's OWN sub-label without
+# the bundle name attached, or (past the last card) the repeated CTA button.
+# Parsed separately with real markup anchors and spliced in over the
+# generic tokens for that section instead.
+_BUNDLE_H3_RE = re.compile(r'<h3[^>]*data-i18n="bundle\.\d+\.name"[^>]*>([^<]+)</h3>')
+_BUNDLE_SINGLE_PRICE_RE = re.compile(
+    r'<p class="price-value">(?P<uah>\d+(?:[.,]\d+)?)&nbsp;₴\s*<span class="price-usd">(?P<usd_inner>[^<]*)</span>'
+)
+_BUNDLE_DUAL_ROW_RE = re.compile(
+    r'<span[^>]*>(?P<sublabel>[^<]+)</span><span class="price-dual-value">'
+    r'(?P<uah>\d+(?:[.,]\d+)?)&nbsp;₴\s*<span class="price-usd">(?P<usd_inner>[^<]*)</span>'
+)
+
+
+def _split_usd_inner(usd_inner: str | None) -> tuple[str, str, str]:
+    """(usd_value, usd_prefix, usd_suffix) — usd_inner is a price-usd span's
+    raw inner text ("$1", "/ $4.5", ...); prefix/suffix are whatever
+    surrounds the bare number so it round-trips exactly on re-render."""
+    if usd_inner is None:
+        return "", "", ""
+    um = _USD_NUM_RE.search(usd_inner)
+    if not um:
+        return "", usd_inner, ""
+    return um.group(1), usd_inner[: um.start()], usd_inner[um.end():]
+
+
+def _parse_bundle_tokens(text: str) -> tuple[list[dict], int]:
+    """Returns (tokens, section_start). section_start is the position of the
+    first bundle <h3> — the caller drops every generically-scanned token at
+    or after that point and splices these in instead (-1 / [] if the page
+    has no bundle cards at all)."""
+    h3_matches = list(_BUNDLE_H3_RE.finditer(text))
+    if not h3_matches:
+        return [], -1
+
+    tokens: list[dict] = []
+    for i, h3 in enumerate(h3_matches):
+        name = h3.group(1).strip()
+        window_end = h3_matches[i + 1].start() if i + 1 < len(h3_matches) else len(text)
+        window = text[h3.end() : window_end]
+        offset = h3.end()
+
+        dual_matches = list(_BUNDLE_DUAL_ROW_RE.finditer(window))
+        if dual_matches:
+            for dm in dual_matches:
+                usd_value, usd_prefix, usd_suffix = _split_usd_inner(dm.group("usd_inner"))
+                tokens.append(
+                    {
+                        "start": offset + dm.start("uah"),
+                        "end": offset + dm.end(),
+                        "label": f"{name} · {dm.group('sublabel').strip()}",
+                        "group_key": name,
+                        "col_index": 0,
+                        "uah": dm.group("uah"),
+                        "has_usd": True,
+                        "usd_value": usd_value,
+                        "usd_prefix": usd_prefix,
+                        "usd_suffix": usd_suffix,
+                    }
+                )
+        else:
+            sm = _BUNDLE_SINGLE_PRICE_RE.search(window)
+            if sm:
+                usd_value, usd_prefix, usd_suffix = _split_usd_inner(sm.group("usd_inner"))
+                tokens.append(
+                    {
+                        "start": offset + sm.start("uah"),
+                        "end": offset + sm.end(),
+                        "label": name,
+                        "group_key": name,
+                        "col_index": 0,
+                        "uah": sm.group("uah"),
+                        "has_usd": True,
+                        "usd_value": usd_value,
+                        "usd_prefix": usd_prefix,
+                        "usd_suffix": usd_suffix,
+                    }
+                )
+    return tokens, h3_matches[0].start()
+
 
 def parse_pricing_tokens(text: str) -> list[dict]:
     """Returns every editable price on the page, in document order, each as
@@ -231,11 +314,19 @@ def parse_pricing_tokens(text: str) -> list[dict]:
             continue
         text_nodes.append((m.start(1), content))
 
+    bundle_tokens, bundle_section_start = _parse_bundle_tokens(text)
+
     tokens: list[dict] = []
     last_label = ""
     repeat_count = 0
     ti = 0
     for m in _PRICE_TOKEN_RE.finditer(text):
+        if bundle_section_start >= 0 and m.start() >= bundle_section_start:
+            # Everything from here on is either a bundle price (replaced by
+            # bundle_tokens below) or footnote prose after the cards — stop
+            # the generic scan so it doesn't duplicate/mislabel either.
+            break
+
         label = last_label
         while ti < len(text_nodes) and text_nodes[ti][0] < m.start():
             label = text_nodes[ti][1]
@@ -259,15 +350,7 @@ def parse_pricing_tokens(text: str) -> list[dict]:
             display_label = short_label or "(без назви)"
 
         usd_inner = m.group("usd_inner")
-        usd_value, usd_prefix, usd_suffix = "", "", ""
-        if usd_inner is not None:
-            um = _USD_NUM_RE.search(usd_inner)
-            if um:
-                usd_value = um.group(1)
-                usd_prefix = usd_inner[: um.start()]
-                usd_suffix = usd_inner[um.end():]
-            else:
-                usd_prefix = usd_inner
+        usd_value, usd_prefix, usd_suffix = _split_usd_inner(usd_inner)
 
         tokens.append(
             {
@@ -283,6 +366,8 @@ def parse_pricing_tokens(text: str) -> list[dict]:
                 "usd_suffix": usd_suffix,
             }
         )
+
+    tokens.extend(bundle_tokens)
     return tokens
 
 
@@ -646,6 +731,7 @@ class WebSiteView:
     async def _prefetch_prices(self):
         try:
             await asyncio.to_thread(self._read_site_file, PRICE_HTML_FILE)
+            await asyncio.to_thread(fx_rates.ensure_rates_loaded)
             self._price_html_loaded = True
         except Exception:
             logger.exception("WebSiteView: prefetch prices failed")
@@ -826,7 +912,7 @@ class WebSiteView:
     # -------------------------------------------------------------- 1b. Прайс
     def _build_price_section(self):
         text = self._read_site_file(PRICE_HTML_FILE)
-        tokens = parse_pricing_tokens(text)
+        tokens = [t for t in parse_pricing_tokens(text) if t["has_usd"]]
         grouped_rows, flat_tokens = group_pricing_tokens(tokens)
 
         filter_field = ft.TextField(
@@ -845,7 +931,8 @@ class WebSiteView:
         content: list[ft.Control] = [
             ft.Text(
                 f"{len(tokens)} цін на сторінці: {len(grouped_rows)} рядків у таблиці "
-                f"«Вкладки/люди», {len(flat_tokens)} — окремих позицій нижче.",
+                f"«Вкладки/люди», {len(flat_tokens)} — окремих позицій нижче. "
+                f"Долар рахується сам із курсу НБУ — вводьте лише гривню.",
                 size=12,
                 color="grey600",
             ),
@@ -880,15 +967,34 @@ class WebSiteView:
         )
 
     @staticmethod
-    def _price_usd_cell(has_usd: bool, value: str, width: int) -> tuple[ft.Control, ft.TextField | None]:
-        """A DataCell's content must be a string or a VISIBLE control — an
-        invisible TextField in a cell raises "content must be a string or a
-        visible Control" (found via live testing). Columns without a USD
-        price show a plain dash instead of a hidden field."""
-        if not has_usd:
-            return ft.Text("—", size=12, color="grey400"), None
-        field = WebSiteView._price_money_field(value, width)
-        return field, field
+    def _price_usd_text(uah_value: str) -> str:
+        """USD is never typed by hand — it's always today's NBU-rate
+        conversion of whatever UAH price is currently entered."""
+        try:
+            amount = float((uah_value or "").strip().replace(",", "."))
+        except ValueError:
+            return "—"
+        usd = fx_rates.convert(amount, "UAH", "USD")
+        if usd is None:
+            return "—"
+        usd = round(usd, 1)
+        return str(int(usd)) if usd == int(usd) else f"{usd:g}"
+
+    def _price_field_with_usd(self, initial_uah: str, uah_width: int = 60, usd_width: int = 46) -> tuple[ft.TextField, ft.Text]:
+        """A UAH TextField paired with a live, read-only USD ft.Text next to
+        it — typing a new UAH price recomputes the $ display immediately,
+        no separate $ input to keep in sync by hand."""
+        usd_text = ft.Text(self._price_usd_text(initial_uah), size=12, color="grey700", width=usd_width,
+                            text_align=ft.TextAlign.CENTER)
+
+        def _on_change(e):
+            usd_text.value = self._price_usd_text(e.control.value)
+            with contextlib.suppress(Exception):
+                usd_text.update()
+
+        uah_field = self._price_money_field(initial_uah, uah_width)
+        uah_field.on_change = _on_change
+        return uah_field, usd_text
 
     def _parse_price_money(self, field: ft.TextField, label: str) -> str | None:
         raw = (field.value or "").strip().replace(",", ".")
@@ -915,10 +1021,11 @@ class WebSiteView:
         )
 
     # Grouped table: one row per item, 1/5/10/15-people prices as 4 column
-    # pairs, plus one "Знижка" checkbox per row — checked, it applies to
-    # every column in that row: whatever's typed becomes the new (red)
-    # price, the value the row loaded with becomes the struck-through old
-    # price. One checkbox instead of 4 keeps the row from doubling in width.
+    # pairs (₴ input + auto $ display), plus one "Знижка" checkbox per row —
+    # checked, it applies to every column in that row: whatever's typed
+    # becomes the new (red) price, the value the row loaded with becomes the
+    # struck-through old price. One checkbox instead of 4 keeps the row from
+    # doubling in width.
     def _build_price_table_grouped(self, rows: list[dict]) -> ft.Column:
         columns = [ft.DataColumn(ft.Text("Назва", size=11, weight="bold"))]
         for col_label in _PRICE_COLUMN_LABELS:
@@ -926,17 +1033,16 @@ class WebSiteView:
             columns.append(ft.DataColumn(ft.Text("$", size=10, weight="bold")))
         columns.append(ft.DataColumn(ft.Text("Знижка", size=10, weight="bold")))
 
-        row_state: list[tuple[list[tuple[dict, ft.TextField, ft.TextField | None]], ft.Checkbox]] = []
+        row_state: list[tuple[list[tuple[dict, ft.TextField]], ft.Checkbox]] = []
         data_rows = []
         for row in rows:
             cells = [ft.DataCell(ft.Text(row["label"], size=11, no_wrap=False, width=140))]
-            col_fields: list[tuple[dict, ft.TextField, ft.TextField | None]] = []
+            col_fields: list[tuple[dict, ft.TextField]] = []
             for tok in row["cols"]:
-                uah_f = self._price_money_field(tok["uah"], 60)
-                usd_content, usd_f = self._price_usd_cell(tok["has_usd"], tok["usd_value"], 46)
-                col_fields.append((tok, uah_f, usd_f))
+                uah_f, usd_text = self._price_field_with_usd(tok["uah"])
+                col_fields.append((tok, uah_f))
                 cells.append(ft.DataCell(uah_f))
-                cells.append(ft.DataCell(usd_content))
+                cells.append(ft.DataCell(usd_text))
             discount_cb = ft.Checkbox(value=False)
             cells.append(ft.DataCell(discount_cb))
             row_state.append((col_fields, discount_cb))
@@ -946,17 +1052,13 @@ class WebSiteView:
             edits: list[dict] = []
             for col_fields, discount_cb in row_state:
                 is_discount = bool(discount_cb.value)
-                for tok, uah_f, usd_f in col_fields:
+                for tok, uah_f in col_fields:
                     new_uah = self._parse_price_money(uah_f, tok["label"])
                     if new_uah is None:
                         return
-                    new_usd = tok["usd_value"]
-                    if tok["has_usd"]:
-                        new_usd = self._parse_price_money(usd_f, tok["label"])
-                        if new_usd is None:
-                            return
-                    if new_uah == tok["uah"] and new_usd == tok["usd_value"]:
+                    if new_uah == tok["uah"]:
                         continue
+                    new_usd = self._price_usd_text(new_uah)
                     if is_discount:
                         edits.append(
                             {
@@ -992,8 +1094,9 @@ class WebSiteView:
             spacing=6,
         )
 
-    # Flat table: everything without the 4-column shape — one row per price,
-    # with an inline discount checkbox + a "new price" pair of fields.
+    # Flat table: everything without the 4-column shape — one row per price
+    # (₴ input + auto $ display), with an inline discount checkbox + a "new
+    # price" ₴ input (also with its own auto $ display).
     def _build_price_table_flat(self, tokens: list[dict]) -> ft.Column:
         columns = [
             ft.DataColumn(ft.Text("Назва", size=11, weight="bold")),
@@ -1004,40 +1107,34 @@ class WebSiteView:
             ft.DataColumn(ft.Text("Нова $", size=10, weight="bold")),
         ]
 
-        row_state: list[tuple[dict, ft.TextField, ft.TextField | None, ft.Checkbox, ft.TextField, ft.TextField | None]] = []
+        row_state: list[tuple[dict, ft.TextField, ft.Checkbox, ft.TextField]] = []
         data_rows = []
         for tok in tokens:
-            uah_f = self._price_money_field(tok["uah"], 60)
-            usd_content, usd_f = self._price_usd_cell(tok["has_usd"], tok["usd_value"], 46)
+            uah_f, usd_text = self._price_field_with_usd(tok["uah"])
             discount_cb = ft.Checkbox(value=False)
-            new_uah_f = self._price_money_field("", 60)
-            new_usd_content, new_usd_f = self._price_usd_cell(tok["has_usd"], "", 46)
-            row_state.append((tok, uah_f, usd_f, discount_cb, new_uah_f, new_usd_f))
+            new_uah_f, new_usd_text = self._price_field_with_usd("")
+            row_state.append((tok, uah_f, discount_cb, new_uah_f))
             data_rows.append(
                 ft.DataRow(
                     cells=[
                         ft.DataCell(ft.Text(tok["label"], size=11, width=160)),
                         ft.DataCell(uah_f),
-                        ft.DataCell(usd_content),
+                        ft.DataCell(usd_text),
                         ft.DataCell(discount_cb),
                         ft.DataCell(new_uah_f),
-                        ft.DataCell(new_usd_content),
+                        ft.DataCell(new_usd_text),
                     ]
                 )
             )
 
         async def _save_all(_e=None):
             edits: list[dict] = []
-            for tok, uah_f, usd_f, discount_cb, new_uah_f, new_usd_f in row_state:
+            for tok, uah_f, discount_cb, new_uah_f in row_state:
                 is_discount = bool(discount_cb.value)
                 cur_uah = self._parse_price_money(uah_f, tok["label"])
                 if cur_uah is None:
                     return
-                cur_usd = tok["usd_value"]
-                if tok["has_usd"]:
-                    cur_usd = self._parse_price_money(usd_f, tok["label"])
-                    if cur_usd is None:
-                        return
+                cur_usd = self._price_usd_text(cur_uah)
 
                 if is_discount:
                     if not (new_uah_f.value or "").strip():
@@ -1045,11 +1142,7 @@ class WebSiteView:
                     disc_uah = self._parse_price_money(new_uah_f, tok["label"])
                     if disc_uah is None:
                         return
-                    disc_usd = cur_usd
-                    if tok["has_usd"]:
-                        disc_usd = self._parse_price_money(new_usd_f, tok["label"])
-                        if disc_usd is None:
-                            return
+                    disc_usd = self._price_usd_text(disc_uah)
                     edits.append(
                         {
                             **tok,
@@ -1060,7 +1153,7 @@ class WebSiteView:
                             "new_usd_value": disc_usd,
                         }
                     )
-                elif cur_uah != tok["uah"] or cur_usd != tok["usd_value"]:
+                elif cur_uah != tok["uah"]:
                     edits.append({**tok, "discount": False, "new_uah": cur_uah, "new_usd_value": cur_usd})
             await self._publish_price_edits(edits, "решта цін")
 
