@@ -875,6 +875,7 @@ class WebSiteView:
             dense=True,
             content_padding=ft.padding.symmetric(horizontal=6, vertical=6),
             text_size=12,
+            text_align=ft.TextAlign.CENTER,
             border_radius=6,
         )
 
@@ -913,39 +914,62 @@ class WebSiteView:
             items, f"Web сайт: оновлено {len(edits)} цін ({summary_label})", on_done=self.build
         )
 
-    # Grouped table: one row per item, 1/5/10/15-people prices as 4 column pairs.
+    # Grouped table: one row per item, 1/5/10/15-people prices as 4 column
+    # pairs, plus one "Знижка" checkbox per row — checked, it applies to
+    # every column in that row: whatever's typed becomes the new (red)
+    # price, the value the row loaded with becomes the struck-through old
+    # price. One checkbox instead of 4 keeps the row from doubling in width.
     def _build_price_table_grouped(self, rows: list[dict]) -> ft.Column:
         columns = [ft.DataColumn(ft.Text("Назва", size=11, weight="bold"))]
         for col_label in _PRICE_COLUMN_LABELS:
             columns.append(ft.DataColumn(ft.Text(f"{col_label}, ₴", size=10, weight="bold")))
             columns.append(ft.DataColumn(ft.Text("$", size=10, weight="bold")))
+        columns.append(ft.DataColumn(ft.Text("Знижка", size=10, weight="bold")))
 
-        field_map: list[tuple[dict, ft.TextField, ft.TextField | None]] = []
+        row_state: list[tuple[list[tuple[dict, ft.TextField, ft.TextField | None]], ft.Checkbox]] = []
         data_rows = []
         for row in rows:
             cells = [ft.DataCell(ft.Text(row["label"], size=11, no_wrap=False, width=140))]
+            col_fields: list[tuple[dict, ft.TextField, ft.TextField | None]] = []
             for tok in row["cols"]:
                 uah_f = self._price_money_field(tok["uah"], 60)
                 usd_content, usd_f = self._price_usd_cell(tok["has_usd"], tok["usd_value"], 46)
-                field_map.append((tok, uah_f, usd_f))
+                col_fields.append((tok, uah_f, usd_f))
                 cells.append(ft.DataCell(uah_f))
                 cells.append(ft.DataCell(usd_content))
+            discount_cb = ft.Checkbox(value=False)
+            cells.append(ft.DataCell(discount_cb))
+            row_state.append((col_fields, discount_cb))
             data_rows.append(ft.DataRow(cells=cells))
 
         async def _save_all(_e=None):
             edits: list[dict] = []
-            for tok, uah_f, usd_f in field_map:
-                new_uah = self._parse_price_money(uah_f, tok["label"])
-                if new_uah is None:
-                    return
-                new_usd = tok["usd_value"]
-                if tok["has_usd"]:
-                    new_usd = self._parse_price_money(usd_f, tok["label"])
-                    if new_usd is None:
+            for col_fields, discount_cb in row_state:
+                is_discount = bool(discount_cb.value)
+                for tok, uah_f, usd_f in col_fields:
+                    new_uah = self._parse_price_money(uah_f, tok["label"])
+                    if new_uah is None:
                         return
-                if new_uah == tok["uah"] and new_usd == tok["usd_value"]:
-                    continue
-                edits.append({**tok, "discount": False, "new_uah": new_uah, "new_usd_value": new_usd})
+                    new_usd = tok["usd_value"]
+                    if tok["has_usd"]:
+                        new_usd = self._parse_price_money(usd_f, tok["label"])
+                        if new_usd is None:
+                            return
+                    if new_uah == tok["uah"] and new_usd == tok["usd_value"]:
+                        continue
+                    if is_discount:
+                        edits.append(
+                            {
+                                **tok,
+                                "discount": True,
+                                "old_uah": tok["uah"],
+                                "old_usd_value": tok["usd_value"],
+                                "new_uah": new_uah,
+                                "new_usd_value": new_usd,
+                            }
+                        )
+                    else:
+                        edits.append({**tok, "discount": False, "new_uah": new_uah, "new_usd_value": new_usd})
             await self._publish_price_edits(edits, "таблиця вкладок/людей")
 
         def _on_click(_e):
