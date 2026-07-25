@@ -868,7 +868,7 @@ class WebSiteView:
         self.build()
 
     @staticmethod
-    def _price_money_field(value: str, width: int, visible: bool = True) -> ft.TextField:
+    def _price_money_field(value: str, width: int) -> ft.TextField:
         return ft.TextField(
             value=value,
             width=width,
@@ -876,8 +876,18 @@ class WebSiteView:
             content_padding=ft.padding.symmetric(horizontal=6, vertical=6),
             text_size=12,
             border_radius=6,
-            visible=visible,
         )
+
+    @staticmethod
+    def _price_usd_cell(has_usd: bool, value: str, width: int) -> tuple[ft.Control, ft.TextField | None]:
+        """A DataCell's content must be a string or a VISIBLE control — an
+        invisible TextField in a cell raises "content must be a string or a
+        visible Control" (found via live testing). Columns without a USD
+        price show a plain dash instead of a hidden field."""
+        if not has_usd:
+            return ft.Text("—", size=12, color="grey400"), None
+        field = WebSiteView._price_money_field(value, width)
+        return field, field
 
     def _parse_price_money(self, field: ft.TextField, label: str) -> str | None:
         raw = (field.value or "").strip().replace(",", ".")
@@ -910,16 +920,16 @@ class WebSiteView:
             columns.append(ft.DataColumn(ft.Text(f"{col_label}, ₴", size=10, weight="bold")))
             columns.append(ft.DataColumn(ft.Text("$", size=10, weight="bold")))
 
-        field_map: list[tuple[dict, ft.TextField, ft.TextField]] = []
+        field_map: list[tuple[dict, ft.TextField, ft.TextField | None]] = []
         data_rows = []
         for row in rows:
             cells = [ft.DataCell(ft.Text(row["label"], size=11, no_wrap=False, width=140))]
             for tok in row["cols"]:
                 uah_f = self._price_money_field(tok["uah"], 60)
-                usd_f = self._price_money_field(tok["usd_value"], 46, visible=tok["has_usd"])
+                usd_content, usd_f = self._price_usd_cell(tok["has_usd"], tok["usd_value"], 46)
                 field_map.append((tok, uah_f, usd_f))
                 cells.append(ft.DataCell(uah_f))
-                cells.append(ft.DataCell(usd_f))
+                cells.append(ft.DataCell(usd_content))
             data_rows.append(ft.DataRow(cells=cells))
 
         async def _save_all(_e=None):
@@ -970,24 +980,24 @@ class WebSiteView:
             ft.DataColumn(ft.Text("Нова $", size=10, weight="bold")),
         ]
 
-        row_state: list[tuple[dict, ft.TextField, ft.TextField, ft.Checkbox, ft.TextField, ft.TextField]] = []
+        row_state: list[tuple[dict, ft.TextField, ft.TextField | None, ft.Checkbox, ft.TextField, ft.TextField | None]] = []
         data_rows = []
         for tok in tokens:
             uah_f = self._price_money_field(tok["uah"], 60)
-            usd_f = self._price_money_field(tok["usd_value"], 46, visible=tok["has_usd"])
+            usd_content, usd_f = self._price_usd_cell(tok["has_usd"], tok["usd_value"], 46)
             discount_cb = ft.Checkbox(value=False)
             new_uah_f = self._price_money_field("", 60)
-            new_usd_f = self._price_money_field("", 46, visible=tok["has_usd"])
+            new_usd_content, new_usd_f = self._price_usd_cell(tok["has_usd"], "", 46)
             row_state.append((tok, uah_f, usd_f, discount_cb, new_uah_f, new_usd_f))
             data_rows.append(
                 ft.DataRow(
                     cells=[
                         ft.DataCell(ft.Text(tok["label"], size=11, width=160)),
                         ft.DataCell(uah_f),
-                        ft.DataCell(usd_f),
+                        ft.DataCell(usd_content),
                         ft.DataCell(discount_cb),
                         ft.DataCell(new_uah_f),
-                        ft.DataCell(new_usd_f),
+                        ft.DataCell(new_usd_content),
                     ]
                 )
             )
