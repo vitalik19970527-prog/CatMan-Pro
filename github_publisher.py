@@ -278,14 +278,22 @@ class GitHubPublisher:
         headers = self._headers()
         headers["Content-Type"] = "application/octet-stream"
         try:
+            # Passing an open file object as `data=` lets requests fall back to
+            # chunked transfer encoding when it can't cheaply determine the
+            # size — GitHub's asset-upload endpoint rejects chunked uploads
+            # with a bare HTML "Bad request" (not a JSON API error) instead of
+            # honoring them, which large release assets (exe/apk, 100MB+) hit
+            # every time. Reading the bytes upfront gives requests a concrete
+            # Content-Length instead.
             with open(file_path, "rb") as f:
-                resp = requests.post(
-                    upload_url,
-                    headers=headers,
-                    params={"name": asset_name},
-                    data=f,
-                    timeout=600,
-                )
+                file_bytes = f.read()
+            resp = requests.post(
+                upload_url,
+                headers=headers,
+                params={"name": asset_name},
+                data=file_bytes,
+                timeout=600,
+            )
         except (requests.RequestException, OSError) as e:
             return False, f"Помилка завантаження {asset_name}: {e}"
 
