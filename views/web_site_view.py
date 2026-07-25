@@ -761,14 +761,6 @@ class WebSiteView:
             text = self._read_site_file(I18N_JS_REL)
             self._i18n_keys, self._i18n_values = load_i18n_index(text)
 
-        filter_field = ft.TextField(
-            label="Пошук за ключем або текстом",
-            value=self._text_filter,
-            on_change=self._on_text_filter_change,
-            border_radius=10,
-            prefix_icon=ft.Icons.SEARCH,
-        )
-
         needle = (self._text_filter or "").strip().lower()
         if needle:
             keys = [
@@ -787,19 +779,43 @@ class WebSiteView:
             color="grey600",
         )
 
-        return ft.Column([info, filter_field, self._build_texts_table(keys)], spacing=10)
+        filter_field = ft.TextField(
+            label="Пошук за ключем або текстом",
+            value=self._text_filter,
+            on_change=self._on_text_filter_change,
+            border_radius=10,
+            prefix_icon=ft.Icons.SEARCH,
+            expand=True,
+        )
+
+        header_row, rows_scroller, save_button = self._build_texts_table(keys)
+
+        # Search + Save pinned above the scrolling rows (not inside the
+        # scroll) so both stay visible however far down the 284-row list
+        # you've scrolled — same request already applied to Прайс's
+        # column titles, now also covering the filter/save row itself.
+        return ft.Column(
+            [
+                info,
+                ft.Row([filter_field, save_button], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                header_row,
+                ft.Divider(height=1),
+                rows_scroller,
+            ],
+            spacing=8,
+        )
 
     def _on_text_filter_change(self, e):
         self._text_filter = e.control.value or ""
         self.build()
 
-    def _build_texts_table(self, keys: list[str]) -> ft.Column:
+    def _build_texts_table(self, keys: list[str]) -> tuple[ft.Row, ft.Container, ft.FilledButton]:
         # Plain Row/Column grid, not ft.DataTable — DataTable's rows don't
         # grow to fit multiline content (found via live testing: long
         # translations kept getting clipped no matter how high max_lines
         # was set). A Row of fixed-width Containers has no such limit and
         # grows exactly as tall as its content needs.
-        header = ft.Row(
+        header_row = ft.Row(
             [
                 ft.Container(width=180, content=ft.Text("Ключ", size=11, weight="bold")),
                 *[
@@ -811,7 +827,7 @@ class WebSiteView:
         )
 
         row_state: list[tuple[str, dict[str, ft.TextField], dict[str, str]]] = []
-        grid_rows: list[ft.Control] = [header, ft.Divider(height=1)]
+        grid_rows: list[ft.Control] = []
         for key in keys:
             original_values = dict(self._i18n_values.get(key, {}))
             fields: dict[str, ft.TextField] = {}
@@ -892,16 +908,20 @@ class WebSiteView:
             if page:
                 page.run_task(_save_all)
 
-        return ft.Column(
-            [
-                ft.Row([ft.Column(grid_rows, spacing=6)], scroll=ft.ScrollMode.ALWAYS),
-                ft.Row(
-                    [ft.FilledButton("Зберегти зміни в таблиці", icon=ft.Icons.SAVE, on_click=_on_click)],
-                    alignment=ft.MainAxisAlignment.END,
-                ),
-            ],
-            spacing=6,
+        save_button = ft.FilledButton("Зберегти зміни", icon=ft.Icons.SAVE, on_click=_on_click)
+
+        # Fixed height (not expand=True) is deliberate: this Column already
+        # sits inside content_area, which itself scrolls — a child of a
+        # scrolling container has no bounded height for "expand" to fill,
+        # so only an explicit height gives this box its OWN internal scroll
+        # instead of just growing forever and dragging the header along
+        # with it (defeats the point of pinning the header above it).
+        rows_scroller = ft.Container(
+            height=560,
+            content=ft.Column(grid_rows, spacing=6, scroll=ft.ScrollMode.ALWAYS),
         )
+
+        return header_row, rows_scroller, save_button
 
     # -------------------------------------------------------------- 1b. Прайс
     def _build_price_section(self):
