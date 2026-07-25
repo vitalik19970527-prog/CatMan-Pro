@@ -7,7 +7,12 @@ import psycopg
 import telebot
 from dotenv import load_dotenv
 from telebot import util
-from telebot.types import KeyboardButton, ReplyKeyboardMarkup, WebAppInfo
+from telebot.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 load_dotenv(sys.argv[1] if len(sys.argv) > 1 else ".env")
 
@@ -44,7 +49,7 @@ HISTORY_FILE = Path(__file__).parent / f"history_{BOT_NAME}.json"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-site_button = KeyboardButton(SITE_LABEL, web_app=WebAppInfo(url=SITE_URL))
+site_button = KeyboardButton(SITE_LABEL)
 
 visitor_markup = ReplyKeyboardMarkup(resize_keyboard=True)
 visitor_markup.row(KeyboardButton(START_LABEL), KeyboardButton(FINISH_LABEL))
@@ -135,6 +140,13 @@ def handle_visitor_finish_button(message):
     session_state[str(message.from_user.id)] = "finished"
     save_json(STATE_FILE, session_state)
     send(message.chat.id, FINISH_TEXT, reply_markup=visitor_markup)
+
+
+@bot.message_handler(func=lambda m: m.text == SITE_LABEL, content_types=["text"])
+def handle_site_button(message):
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("Відкрити у браузері", url=SITE_URL))
+    send(message.chat.id, "Натисніть кнопку нижче:", reply_markup=markup)
 
 
 @bot.message_handler(func=lambda m: m.text == CLEAR_LABEL, content_types=["text"])
