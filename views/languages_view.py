@@ -167,7 +167,7 @@ class LanguagesView:
             modal=True,
             title=ft.Text(self.t("orders.sync.synced", "Збережено")),
             content=ft.Text(str(message or self.t("orders.sync.synced", "Збережено"))),
-            actions=[ft.FilledButton("OK", on_click=lambda _e: page.close(dlg))],
+            actions=[ft.FilledButton("OK", on_click=lambda _e: page.pop_dialog())],
             actions_alignment=ft.MainAxisAlignment.END,
         )
         page.show_dialog(dlg)
@@ -716,7 +716,7 @@ class LanguagesView:
                     tf.value = val
                 self._on_cell_changed(key, lang_code, val, tf)
                 applied += 1
-            page.close(dlg)
+            page.pop_dialog()
             self._show_snack(f"Вставлено {applied} значень для {lang_code}", "green")
 
         def _paste_help(_):
@@ -742,7 +742,7 @@ class LanguagesView:
                 content=ft.Column([info, paste_field], spacing=10, tight=True),
             ),
             actions=[
-                ft.TextButton("Скасувати", on_click=lambda _e: page.close(dlg)),
+                ft.TextButton("Скасувати", on_click=lambda _e: page.pop_dialog()),
                 ft.FilledButton("Застосувати", on_click=_apply),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
@@ -864,7 +864,7 @@ class LanguagesView:
                 self._show_snack("Не вдалося додати мову", "red")
                 return
             i18n.invalidate_languages_cache()
-            page.close(dlg)
+            page.pop_dialog()
             self._show_snack(f"Мову {name} ({code}) додано", "green")
             self.build()
 
@@ -896,7 +896,7 @@ class LanguagesView:
                 ),
             ),
             actions=[
-                ft.TextButton("Скасувати", on_click=lambda _e: page.close(dlg)),
+                ft.TextButton("Скасувати", on_click=lambda _e: page.pop_dialog()),
                 ft.FilledButton("Додати", on_click=_submit),
             ],
             actions_alignment=ft.MainAxisAlignment.END,

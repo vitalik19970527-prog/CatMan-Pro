@@ -3222,7 +3222,7 @@ class PaymentsView:
 
         def _close(_=None):
             with contextlib.suppress(Exception):
-                page.close(dialog)
+                page.pop_dialog()
 
         def _save(_=None):
             rh = _safe_float(row_h_f.value, None)
@@ -6994,7 +6994,7 @@ class PaymentsView:
                         self._refresh_sync_indicator_state()
                         self._start_sync_timer()
                         try:
-                            page.close(dlg)
+                            page.pop_dialog()
                         except Exception:
                             with contextlib.suppress(Exception):
                                 page.pop_dialog()
@@ -7015,9 +7015,7 @@ class PaymentsView:
                             ft.TextButton(
                                 self.t("common.cancel", "Скасувати"),
                                 on_click=lambda _x: (
-                                    page.close(dlg)
-                                    if hasattr(page, "close")
-                                    else page.pop_dialog()
+                                    page.pop_dialog()
                                 ),
                             ),
                             ft.FilledButton(self.t("common.delete", "Видалити"), on_click=_do_del),
@@ -7471,7 +7469,7 @@ class PaymentsView:
                 "updated_at": datetime.utcnow().isoformat(),
             }
             try:
-                page.close(dlg)
+                page.pop_dialog()
             except Exception:
                 try:
                     page.pop_dialog()
@@ -7501,7 +7499,7 @@ class PaymentsView:
                 ft.TextButton(
                     self.t("common.cancel", "Скасувати"),
                     on_click=lambda _e: (
-                        page.close(dlg) if hasattr(page, "close") else page.pop_dialog()
+                        page.pop_dialog()
                     ),
                 ),
                 ft.FilledButton(self.t("common.save", "Зберегти"), on_click=_save),
@@ -8052,7 +8050,7 @@ class PaymentsView:
                 "updated_at": datetime.utcnow().isoformat(),
             }
             try:
-                page.close(dlg)
+                page.pop_dialog()
             except Exception:
                 try:
                     page.pop_dialog()
@@ -8094,7 +8092,7 @@ class PaymentsView:
                 ft.TextButton(
                     self.t("common.cancel", "Скасувати"),
                     on_click=lambda _e: (
-                        page.close(dlg) if hasattr(page, "close") else page.pop_dialog()
+                        page.pop_dialog()
                     ),
                 ),
                 ft.FilledButton(self.t("common.save", "Зберегти") if is_edit else self.t("common.add", "Додати"), on_click=_save),

@@ -3553,7 +3553,7 @@ class ProductsView:
             def _close_photo_dlg(_=None):
                 page.on_keyboard_event = _prev_kb_handler[0]
                 with contextlib.suppress(Exception):
-                    page.close(_dlg_ref[0])
+                    page.pop_dialog()
 
             _prev_kb_handler = [getattr(page, "on_keyboard_event", None)]
 
@@ -3832,7 +3832,7 @@ class ProductsView:
             getattr(dlg, "open", None),
             len(getattr(page, "overlay", []) or []),
         )
-        page.close(dlg)
+        page.pop_dialog()
         logger.info(
             "[modal:products] close:finish dlg=%s@%s open=%s overlay_after=%s",
             type(dlg).__name__,

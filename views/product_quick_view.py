@@ -55,7 +55,7 @@ def open_product_quick_view(
         dlg = dlg_ref[0]
         if dlg is not None:
             try:
-                page.close(dlg)
+                page.pop_dialog()
             except Exception:
                 pass
             dlg_ref[0] = None

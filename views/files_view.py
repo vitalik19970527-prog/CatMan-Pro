@@ -598,7 +598,7 @@ class FilesView:
             if not name:
                 return
             with contextlib.suppress(Exception):
-                pg.close(dlg[0])
+                pg.pop_dialog()
             gid = self.db.create_user_file_group(
                 self.company_id, self.manager_id, self.region_id, name, parent_id=parent_id
             )
@@ -614,7 +614,7 @@ class FilesView:
             title=ft.Text(self.t("files.dlg.new_subfolder", "Нова підпапка"), size=14, weight="bold"),
             content=ft.Container(width=320, content=tf),
             actions=[
-                ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=lambda _: pg.close(dlg[0])),
+                ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=lambda _: pg.pop_dialog()),
                 ft.FilledButton(self.t("common.create", "Створити"), on_click=_save),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
@@ -636,10 +636,10 @@ class FilesView:
             name = (tf.value or "").strip()
             if not name or name == current_name:
                 with contextlib.suppress(Exception):
-                    pg.close(dlg[0])
+                    pg.pop_dialog()
                 return
             with contextlib.suppress(Exception):
-                pg.close(dlg[0])
+                pg.pop_dialog()
             ok = self.db.rename_user_file_group(folder_id, name)
             if ok:
                 for f in self._folders:
@@ -660,7 +660,7 @@ class FilesView:
             title=ft.Text(self.t("files.dlg.rename_folder", "Перейменувати папку"), size=14, weight="bold"),
             content=ft.Container(width=320, content=tf),
             actions=[
-                ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=lambda _: pg.close(dlg[0])),
+                ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=lambda _: pg.pop_dialog()),
                 ft.FilledButton(self.t("common.save", "Зберегти"), on_click=_save),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
@@ -675,7 +675,7 @@ class FilesView:
 
         def _do(_):
             with contextlib.suppress(Exception):
-                pg.close(dlg[0])
+                pg.pop_dialog()
             ok = self.db.delete_user_file_group(folder_id)
             if ok:
                 if self._sel_folder_id == folder_id:
@@ -715,7 +715,7 @@ class FilesView:
                 size=12, color=_MUTED,
             ),
             actions=[
-                ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=lambda _: pg.close(dlg[0])),
+                ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=lambda _: pg.pop_dialog()),
                 ft.FilledButton(
                     self.t("common.delete", "Видалити"),
                     icon=ft.Icons.DELETE_OUTLINE,
@@ -942,7 +942,7 @@ class FilesView:
 
             def _do(_):
                 with contextlib.suppress(Exception):
-                    pg.close(dlg[0])
+                    pg.pop_dialog()
                 ok = self.db.delete_user_file(_fid)
                 if ok:
                     self._files = [x for x in self._files if str(x.get("id") or "") != _fid]
@@ -958,7 +958,7 @@ class FilesView:
                     size=14, weight="bold",
                 ),
                 actions=[
-                    ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=lambda _: pg.close(dlg[0])),
+                    ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=lambda _: pg.pop_dialog()),
                     ft.FilledButton(
                         self.t("common.delete", "Видалити"),
                         icon=ft.Icons.DELETE_OUTLINE,
@@ -1068,10 +1068,10 @@ class FilesView:
             new_name = f"{new_base}{ext}"
             if not new_base or new_name == current_name:
                 with contextlib.suppress(Exception):
-                    pg.close(dlg[0])
+                    pg.pop_dialog()
                 return
             with contextlib.suppress(Exception):
-                pg.close(dlg[0])
+                pg.pop_dialog()
             ok = self.db.rename_user_file(file_id, new_name)
             if ok:
                 for f in self._files:
@@ -1089,7 +1089,7 @@ class FilesView:
             title=ft.Text(self.t("files.dlg.rename_file", "Перейменувати файл"), size=14, weight="bold"),
             content=ft.Container(width=320, content=tf),
             actions=[
-                ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=lambda _: pg.close(dlg[0])),
+                ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=lambda _: pg.pop_dialog()),
                 ft.FilledButton(self.t("common.save", "Зберегти"), on_click=_save),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
@@ -1142,7 +1142,7 @@ class FilesView:
             if not dd.value:
                 return
             with contextlib.suppress(Exception):
-                pg.close(dlg[0])
+                pg.pop_dialog()
             ok = self.db.move_user_file(file_id, dd.value)
             if ok:
                 self._snack(
@@ -1161,7 +1161,7 @@ class FilesView:
             ),
             content=ft.Container(width=340, content=dd),
             actions=[
-                ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=lambda _: pg.close(dlg[0])),
+                ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=lambda _: pg.pop_dialog()),
                 ft.FilledButton(self.t("files.move_btn", "Перемістити"), on_click=_do),
             ],
             actions_alignment=ft.MainAxisAlignment.END,

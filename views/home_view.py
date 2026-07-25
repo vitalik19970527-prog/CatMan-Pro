@@ -3850,7 +3850,7 @@ class HomeView:
                 if bool(getattr(cb, "value", False))
             ]
             try:
-                page.close(dlg)
+                page.pop_dialog()
             except Exception:
                 try:
                     dlg.open = False
@@ -3874,7 +3874,7 @@ class HomeView:
 
         def _cancel(_e=None):
             try:
-                page.close(dlg)
+                page.pop_dialog()
             except Exception:
                 try:
                     dlg.open = False
@@ -3972,7 +3972,7 @@ class HomeView:
                 if bool(getattr(cb, "value", False))
             ]
             try:
-                page.close(dlg)
+                page.pop_dialog()
             except Exception:
                 try:
                     dlg.open = False
@@ -3996,7 +3996,7 @@ class HomeView:
 
         def _cancel(_e=None):
             try:
-                page.close(dlg)
+                page.pop_dialog()
             except Exception:
                 try:
                     dlg.open = False
@@ -4337,7 +4337,7 @@ class HomeView:
                 if bool(getattr(cb, "value", False))
             ]
             try:
-                page.close(dlg)
+                page.pop_dialog()
             except Exception:
                 try:
                     dlg.open = False
@@ -4363,7 +4363,7 @@ class HomeView:
 
         def _cancel(_e=None):
             try:
-                page.close(dlg)
+                page.pop_dialog()
             except Exception:
                 try:
                     dlg.open = False
@@ -4700,7 +4700,7 @@ class HomeView:
                 if bool(getattr(cb, "value", False))
             ]
             try:
-                page.close(dlg)
+                page.pop_dialog()
             except Exception:
                 try:
                     dlg.open = False
@@ -4724,7 +4724,7 @@ class HomeView:
 
         def _cancel(_e=None):
             try:
-                page.close(dlg)
+                page.pop_dialog()
             except Exception:
                 try:
                     dlg.open = False
@@ -5116,7 +5116,7 @@ class HomeView:
                 if bool(getattr(cb, "value", False))
             ]
             try:
-                page.close(dlg)
+                page.pop_dialog()
             except Exception:
                 try:
                     dlg.open = False
@@ -5142,7 +5142,7 @@ class HomeView:
 
         def _cancel(_e=None):
             try:
-                page.close(dlg)
+                page.pop_dialog()
             except Exception:
                 try:
                     dlg.open = False
@@ -5559,7 +5559,7 @@ class HomeView:
                 if bool(getattr(cb, "value", False))
             ]
             try:
-                page.close(dlg)
+                page.pop_dialog()
             except Exception:
                 try:
                     dlg.open = False
@@ -5585,7 +5585,7 @@ class HomeView:
 
         def _cancel(_e=None):
             try:
-                page.close(dlg)
+                page.pop_dialog()
             except Exception:
                 try:
                     dlg.open = False

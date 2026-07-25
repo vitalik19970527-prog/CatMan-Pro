@@ -814,7 +814,7 @@ class WebSiteView:
         def _close(_e=None):
             page.on_keyboard_event = prev_kb[0]
             with contextlib.suppress(Exception):
-                page.close(dlg_ref[0])
+                page.pop_dialog()
 
         def _on_kb(e):
             if e.key == "Arrow Left":
@@ -946,7 +946,7 @@ class WebSiteView:
 
             def _confirm(_e2):
                 with contextlib.suppress(Exception):
-                    page.close(dlg_ref[0])
+                    page.pop_dialog()
                 page.run_task(_do_delete)
 
             dlg_ref[0] = ft.AlertDialog(
@@ -956,7 +956,7 @@ class WebSiteView:
                     f"Слот img/{_filename} стане порожнім — на сайті знову покаже плейсхолдер."
                 ),
                 actions=[
-                    ft.TextButton("Скасувати", on_click=lambda _e3: page.close(dlg_ref[0])),
+                    ft.TextButton("Скасувати", on_click=lambda _e3: page.pop_dialog()),
                     ft.FilledButton(
                         "Видалити", icon=ft.Icons.DELETE, on_click=_confirm, bgcolor="red"
                     ),
@@ -1060,7 +1060,7 @@ class WebSiteView:
 
             def _confirm(_e2):
                 with contextlib.suppress(Exception):
-                    page.close(dlg_ref[0])
+                    page.pop_dialog()
                 page.run_task(_do_delete)
 
             dlg_ref[0] = ft.AlertDialog(
@@ -1068,7 +1068,7 @@ class WebSiteView:
                 title=ft.Text(f"Видалити {_name}?"),
                 content=ft.Text("Цей файл не прив'язаний до жодного слота на сторінках сайту."),
                 actions=[
-                    ft.TextButton("Скасувати", on_click=lambda _e3: page.close(dlg_ref[0])),
+                    ft.TextButton("Скасувати", on_click=lambda _e3: page.pop_dialog()),
                     ft.FilledButton(
                         "Видалити", icon=ft.Icons.DELETE, on_click=_confirm, bgcolor="red"
                     ),

@@ -77,7 +77,7 @@ def show_modal_help(page, title: str, items: list[str | tuple]) -> None:
             content=ft.Column(spaced, spacing=6, scroll=ft.ScrollMode.ADAPTIVE),
         ),
         actions=[
-            ft.FilledButton("Зрозуміло", on_click=lambda _: page.close(dlg)),
+            ft.FilledButton("Зрозуміло", on_click=lambda _: page.pop_dialog()),
         ],
         actions_alignment=ft.MainAxisAlignment.END,
     )

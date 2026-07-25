@@ -4407,7 +4407,7 @@ class PackagingStockView:
                 ),
             ),
             actions=[
-                ft.TextButton("Скасувати", on_click=lambda _e: page.close(dialog)),
+                ft.TextButton("Скасувати", on_click=lambda _e: page.pop_dialog()),
                 ft.FilledButton(
                     "Зберегти",
                     on_click=lambda _e: (
@@ -4428,7 +4428,7 @@ class PackagingStockView:
                             str(display_from_dd.value or "").strip(),
                         ),
                         self._save_pack_table_layout_state(),
-                        page.close(dialog),
+                        page.pop_dialog(),
                         self._restart_tab(),
                     ),
                 ),
@@ -7118,7 +7118,7 @@ class PackagingStockView:
         if not page:
             return
         try:
-            page.close(dlg)
+            page.pop_dialog()
         except Exception:
             with contextlib.suppress(Exception):
                 page.close_dialog(dlg)

@@ -1784,7 +1784,7 @@ class MediaPlanView:
         dlg = ft.AlertDialog(modal=True)
 
         def _close(_=None):
-            pg.close(dlg)
+            pg.pop_dialog()
 
         def _save(_=None):
             if not selected:
@@ -1829,7 +1829,7 @@ class MediaPlanView:
 
             self._save_sorting_settings()
 
-            pg.close(dlg)
+            pg.pop_dialog()
             self._schedule_rebuild()
 
         def _cols_help(_):
@@ -1893,7 +1893,7 @@ class MediaPlanView:
             return
 
         def _close(_=None):
-            pg.close(dlg)
+            pg.pop_dialog()
 
         def _num(txt, default):
             try:
@@ -2150,7 +2150,7 @@ class MediaPlanView:
             new_days = {i for i, cb in _day_checks if bool(cb.value)}
             self._allowed_post_weekdays = new_days or {0, 1, 2, 3, 4, 5, 6}
             self._save_post_days_settings()
-            pg.close(combined_dlg)
+            pg.pop_dialog()
             self._restart_tab()
 
         tab1_content = ft.Container(
@@ -2272,7 +2272,7 @@ class MediaPlanView:
             except Exception:
                 pass
             self._save_table_layout_state()
-            pg.close(combined_dlg)
+            pg.pop_dialog()
             self._schedule_rebuild()
 
         tab2_content = ft.Container(
@@ -2301,7 +2301,7 @@ class MediaPlanView:
         combined_dlg = ft.AlertDialog(modal=True)
 
         def _close_combined(_=None):
-            pg.close(combined_dlg)
+            pg.pop_dialog()
 
         def _tbl_help(_):
             from views.help_utils import show_modal_help
@@ -3452,7 +3452,7 @@ class MediaPlanView:
 
         def _close(_e=None):
             with contextlib.suppress(Exception):
-                pg.close(dlg)
+                pg.pop_dialog()
 
         def _apply_label(new_label: str):
             row["display_label"] = new_label
@@ -3504,7 +3504,7 @@ class MediaPlanView:
         dlg = ft.AlertDialog(modal=True)
 
         def _close(_e=None):
-            pg.close(dlg)
+            pg.pop_dialog()
 
         def _save(_e=None):
             title = str(name_f.value or "").strip()
@@ -3544,7 +3544,7 @@ class MediaPlanView:
                 }
             )
             self._save_row_async(new_row)
-            pg.close(dlg)
+            pg.pop_dialog()
             self._schedule_rebuild()
             self._snack(self.t("media.extra_post_created", "Додатковий пост створено"), _OK_C)
 
@@ -5584,7 +5584,7 @@ class MediaPlanView:
 
         def _close(_=None):
             try:
-                pg.close(dlg)
+                pg.pop_dialog()
             except Exception:
                 pass
 

@@ -864,12 +864,13 @@ def main(page: ft.Page):
         try:
             if not page.platform.is_mobile():
                 return
-            # Portrait dropped on purpose — the layout doesn't fit in it.
-            # Restricting to only the two landscape orientations also makes
-            # the OS rotate the app into landscape on launch if the device
-            # was held upright, since portrait is no longer an allowed state.
+            # All four orientations allowed — portrait used to be dropped
+            # because the layout didn't fit it, but the mobile-wide 20% size
+            # reduction (fonts/padding/spacing) makes portrait usable too.
             await page.set_allowed_device_orientations(
                 [
+                    ft.DeviceOrientation.PORTRAIT_UP,
+                    ft.DeviceOrientation.PORTRAIT_DOWN,
                     ft.DeviceOrientation.LANDSCAPE_LEFT,
                     ft.DeviceOrientation.LANDSCAPE_RIGHT,
                 ]

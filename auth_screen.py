@@ -1675,7 +1675,7 @@ class AuthScreen:
             actions=[
                 ft.FilledButton(
                     self.t("common.help.close", "Зрозуміло"),
-                    on_click=lambda _e: self.page.close(dlg),
+                    on_click=lambda _e: self.page.pop_dialog(),
                 ),
             ],
             actions_alignment=ft.MainAxisAlignment.END,

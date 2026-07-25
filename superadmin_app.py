@@ -148,6 +148,23 @@ def main(page: ft.Page):
     page.window.resizable = True
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
 
+    async def _enable_mobile_rotation():
+        try:
+            if not page.platform.is_mobile():
+                return
+            await page.set_allowed_device_orientations(
+                [
+                    ft.DeviceOrientation.PORTRAIT_UP,
+                    ft.DeviceOrientation.PORTRAIT_DOWN,
+                    ft.DeviceOrientation.LANDSCAPE_LEFT,
+                    ft.DeviceOrientation.LANDSCAPE_RIGHT,
+                ]
+            )
+        except Exception:
+            logger.exception("Failed to enable mobile screen rotation")
+
+    page.run_task(_enable_mobile_rotation)
+
     db = DataManager()
 
     def show_login(reason: str = "", transition_token=None):

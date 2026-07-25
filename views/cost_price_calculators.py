@@ -174,15 +174,8 @@ def _show_dialog(page, dialog: ft.AlertDialog):
 
 def _close_dialog(page, dialog: ft.AlertDialog):
     try:
-        if hasattr(page, "close"):
-            page.close(dialog)
-            return
-    except Exception:
-        pass
-    try:
-        if hasattr(page, "close_dialog"):
-            page.close_dialog()
-            return
+        page.pop_dialog()
+        return
     except Exception:
         pass
     dialog.open = False

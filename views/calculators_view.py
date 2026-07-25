@@ -259,7 +259,7 @@ def _show_save_dialog(page, db, manager_id: str, calc_type: str, data: dict):
         nm = str(name_f.value or "").strip() or _CALC_LABELS.get(calc_type, calc_type)
         _save_calc_entry(db, manager_id, calc_type, nm, data)
         with contextlib.suppress(Exception):
-            page.close(sdlg)
+            page.pop_dialog()
 
     def _save_dlg_help(_):
         from views.help_utils import show_modal_help
@@ -274,7 +274,7 @@ def _show_save_dialog(page, db, manager_id: str, calc_type: str, data: dict):
     ], vertical_alignment=ft.CrossAxisAlignment.CENTER, tight=True)
     sdlg.content = ft.Container(width=320, padding=16, content=name_f)
     sdlg.actions = [
-        ft.TextButton(_t("common.cancel", "Скасувати"), on_click=lambda _: page.close(sdlg)),
+        ft.TextButton(_t("common.cancel", "Скасувати"), on_click=lambda _: page.pop_dialog()),
         ft.FilledButton(_t("common.save", "Зберегти"), on_click=_do),
     ]
     sdlg.actions_alignment = ft.MainAxisAlignment.END
