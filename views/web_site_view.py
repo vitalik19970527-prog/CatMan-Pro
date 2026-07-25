@@ -55,6 +55,7 @@ LANGS = ["uk", "en", "pl", "zh", "de"]
 LANG_LABELS = {"uk": "UA", "en": "EN", "pl": "PL", "zh": "中文", "de": "DE"}
 
 I18N_JS_REL = "js/i18n.js"
+PRICE_HTML_FILE = "pages/pricing.html"
 
 PAGE_TITLES = {
     "index.html": "Головна",
@@ -190,6 +191,127 @@ def set_i18n_entry(text: str, lang: str, key: str, value: str) -> tuple[str, boo
 
 
 # ==================================================================
+# pages/pricing.html — generic price-token scanner/editor. One regex finds
+# every "NNN&nbsp;₴[<span class="price-usd">...$MM...</span>]" occurrence
+# on the page (price tables, GSM card, one-time services list, bundle
+# cards) instead of one hand-written pattern per markup shape. Each token's
+# label is the nearest preceding HTML text node that isn't itself a price
+# ("₴" or a bare number) — for the two 4-column tables this naturally
+# reuses the row's own label cell for every column, since the price cells
+# in between get filtered out as label candidates.
+# ==================================================================
+
+_PRICE_TOKEN_RE = re.compile(
+    r'(?P<uah>\d+(?:[.,]\d+)?)&nbsp;₴'
+    r'(?:\s*<span class="price-usd">(?P<usd_inner>[^<]*)</span>)?'
+)
+_USD_NUM_RE = re.compile(r'\$(\d+(?:[.,]\d+)?)')
+_TEXT_NODE_RE = re.compile(r'>([^<>]+)<')
+_PRICE_COLUMN_LABELS = ["1 людина", "5 людей", "10 людей", "15 людей"]
+# UI chrome that sits right before some price occurrences but is never a
+# useful label on its own (a mandatory-tab badge, a repeated CTA button,
+# a bare "/міс" suffix, ...) — skipped so the nearest REAL label (row name,
+# card title, sub-row heading) is used instead.
+_LABEL_EXCLUDE = {"обов'язково", "одноразово", "написати менеджеру", "/міс", "міс"}
+
+
+def parse_pricing_tokens(text: str) -> list[dict]:
+    """Returns every editable price on the page, in document order, each as
+    {start, end, label, uah, has_usd, usd_value, usd_prefix, usd_suffix}.
+    start/end are exact offsets into `text` for the whole "NNN&nbsp;₴[...]"
+    match — apply_price_tokens() splices replacements at those offsets."""
+    text_nodes: list[tuple[int, str]] = []
+    for m in _TEXT_NODE_RE.finditer(text):
+        content = m.group(1).strip()
+        if not content or "₴" in content or "$" in content:
+            continue
+        if re.fullmatch(r"\d+(?:[.,]\d+)?", content):
+            continue
+        if content.lower() in _LABEL_EXCLUDE:
+            continue
+        text_nodes.append((m.start(1), content))
+
+    tokens: list[dict] = []
+    last_label = ""
+    repeat_count = 0
+    ti = 0
+    for m in _PRICE_TOKEN_RE.finditer(text):
+        label = last_label
+        while ti < len(text_nodes) and text_nodes[ti][0] < m.start():
+            label = text_nodes[ti][1]
+            ti += 1
+
+        if label == last_label:
+            repeat_count += 1
+        else:
+            repeat_count = 0
+            last_label = label
+
+        short_label = label[:44]
+        if repeat_count:
+            suffix = (
+                _PRICE_COLUMN_LABELS[repeat_count]
+                if repeat_count < len(_PRICE_COLUMN_LABELS)
+                else f"#{repeat_count + 1}"
+            )
+            display_label = f"{short_label} · {suffix}"
+        else:
+            display_label = short_label or "(без назви)"
+
+        usd_inner = m.group("usd_inner")
+        usd_value, usd_prefix, usd_suffix = "", "", ""
+        if usd_inner is not None:
+            um = _USD_NUM_RE.search(usd_inner)
+            if um:
+                usd_value = um.group(1)
+                usd_prefix = usd_inner[: um.start()]
+                usd_suffix = usd_inner[um.end():]
+            else:
+                usd_prefix = usd_inner
+
+        tokens.append(
+            {
+                "start": m.start(),
+                "end": m.end(),
+                "label": display_label,
+                "uah": m.group("uah"),
+                "has_usd": usd_inner is not None,
+                "usd_value": usd_value,
+                "usd_prefix": usd_prefix,
+                "usd_suffix": usd_suffix,
+            }
+        )
+    return tokens
+
+
+def _render_price_html(uah: str, has_usd: bool, usd_prefix: str, usd_value: str, usd_suffix: str) -> str:
+    out = f"{uah}&nbsp;₴"
+    if has_usd:
+        out += f' <span class="price-usd">{usd_prefix}{usd_value}{usd_suffix}</span>'
+    return out
+
+
+def apply_price_token_edit(text: str, token: dict, edit: dict) -> str:
+    """Splices a single token's replacement into `text` at token['start':'end'].
+    edit either sets a plain new price ({"discount": False, "new_uah",
+    "new_usd_value"}) or a discount pair — old price struck through, new
+    price in red right after it ({"discount": True, "old_uah",
+    "old_usd_value", "new_uah", "new_usd_value"})."""
+    has_usd = token["has_usd"]
+    usd_prefix, usd_suffix = token["usd_prefix"], token["usd_suffix"]
+    if edit.get("discount"):
+        old_html = _render_price_html(edit["old_uah"], has_usd, usd_prefix, edit["old_usd_value"], usd_suffix)
+        new_html = _render_price_html(edit["new_uah"], has_usd, usd_prefix, edit["new_usd_value"], usd_suffix)
+        replacement = (
+            f'<del style="text-decoration:line-through;color:#94a3b8;">{old_html}</del> '
+            f'<strong style="color:#DC2626;">{new_html}</strong>'
+        )
+    else:
+        replacement = _render_price_html(edit["new_uah"], has_usd, usd_prefix, edit["new_usd_value"], usd_suffix)
+    return text[: token["start"]] + replacement + text[token["end"] :]
+
+
+# ==================================================================
 # HTML data-i18n / data-i18n-html / data-i18n-attr синхронізація
 # ==================================================================
 
@@ -262,7 +384,7 @@ class WebSiteView:
         self.manager_id = str(self.user_data.get("id") or "")
         self.t = i18n.bind(self.manager_id)
 
-        self.sub_tab = "texts"  # texts | images | files | build | settings
+        self.sub_tab = "texts"  # texts | images | price | files | build | settings
         self._publisher = GitHubPublisher()
 
         self._i18n_keys: list[str] = []
@@ -274,6 +396,10 @@ class WebSiteView:
         self._shot_containers_cache: list[dict] | None = None
         self._texts_loading = False
         self._images_loading = False
+        self._price_html_loaded = False
+        self._prices_loading = False
+        self._price_filter = ""
+        self._price_page = 0
 
         self._raw_selected_file = SITE_ALL_FILES[0]
 
@@ -370,6 +496,7 @@ class WebSiteView:
             [
                 self._nav_btn("texts", "Тексти", ft.Icons.TRANSLATE),
                 self._nav_btn("images", "Зображення", ft.Icons.IMAGE_OUTLINED),
+                self._nav_btn("price", "Прайс", ft.Icons.SELL_OUTLINED),
                 self._nav_btn("files", "Файли сайту", ft.Icons.CODE),
                 self._nav_btn("build", "Білд і публікація", ft.Icons.ROCKET_LAUNCH_OUTLINED),
                 self._nav_btn("settings", "Налаштування", ft.Icons.SETTINGS_OUTLINED),
@@ -402,8 +529,11 @@ class WebSiteView:
         needs_images_prefetch = (
             self.sub_tab == "images" and self._img_listing_cache is None and self._publisher.configured
         )
+        needs_price_prefetch = (
+            self.sub_tab == "price" and not self._price_html_loaded and self._publisher.configured
+        )
 
-        if needs_texts_prefetch or needs_images_prefetch:
+        if needs_texts_prefetch or needs_images_prefetch or needs_price_prefetch:
             controls.append(
                 ft.Row(
                     [ft.ProgressRing(width=20, height=20, stroke_width=2), ft.Text("Завантаження з GitHub…")],
@@ -418,6 +548,9 @@ class WebSiteView:
                 elif needs_images_prefetch and not self._images_loading:
                     self._images_loading = True
                     page.run_task(self._prefetch_images)
+                elif needs_price_prefetch and not self._prices_loading:
+                    self._prices_loading = True
+                    page.run_task(self._prefetch_prices)
         elif not self._publisher.configured and self.sub_tab != "settings":
             # Orange banner above already explains why — building texts/images/
             # files/build here would just hit GitHub and raise (no token), which
@@ -430,6 +563,8 @@ class WebSiteView:
                     controls.append(self._build_texts_section())
                 elif self.sub_tab == "images":
                     controls.append(self._build_images_section())
+                elif self.sub_tab == "price":
+                    controls.append(self._build_price_section())
                 elif self.sub_tab == "files":
                     controls.append(self._build_files_section())
                 elif self.sub_tab == "build":
@@ -467,6 +602,16 @@ class WebSiteView:
             logger.exception("WebSiteView: prefetch images failed")
         finally:
             self._images_loading = False
+            self.build()
+
+    async def _prefetch_prices(self):
+        try:
+            await asyncio.to_thread(self._read_site_file, PRICE_HTML_FILE)
+            self._price_html_loaded = True
+        except Exception:
+            logger.exception("WebSiteView: prefetch prices failed")
+        finally:
+            self._prices_loading = False
             self.build()
 
     def _nav_btn(self, key: str, label: str, icon):
@@ -629,6 +774,188 @@ class WebSiteView:
                     [
                         ft.Text(key, size=12, weight="bold", color="grey800", selectable=True),
                         *fields.values(),
+                        ft.Row(
+                            [ft.FilledButton("Зберегти", icon=ft.Icons.SAVE, on_click=_on_click)],
+                            alignment=ft.MainAxisAlignment.END,
+                        ),
+                    ],
+                    spacing=6,
+                ),
+            )
+        )
+
+    # -------------------------------------------------------------- 1b. Прайс
+    def _build_price_section(self):
+        text = self._read_site_file(PRICE_HTML_FILE)
+        tokens = parse_pricing_tokens(text)
+
+        filter_field = ft.TextField(
+            label="Пошук за назвою",
+            value=self._price_filter,
+            on_change=self._on_price_filter_change,
+            border_radius=10,
+            prefix_icon=ft.Icons.SEARCH,
+        )
+
+        needle = (self._price_filter or "").strip().lower()
+        shown_tokens = (
+            [tok for tok in tokens if needle in tok["label"].lower()] if needle else tokens
+        )
+
+        page_size = 40
+        total_pages = max(1, (len(shown_tokens) + page_size - 1) // page_size)
+        self._price_page = max(0, min(self._price_page, total_pages - 1))
+        start = self._price_page * page_size
+        page_tokens = shown_tokens[start : start + page_size]
+        rows = [self._build_price_row(tok) for tok in page_tokens]
+
+        info: list[ft.Control] = [
+            ft.Text(f"Знайдено цін на сторінці: {len(tokens)}", size=12, color="grey600")
+        ]
+
+        pager: list[ft.Control] = []
+        if total_pages > 1:
+            pager.append(
+                ft.Row(
+                    [
+                        ft.IconButton(
+                            ft.Icons.CHEVRON_LEFT,
+                            on_click=self._prev_price_page,
+                            disabled=self._price_page == 0,
+                        ),
+                        ft.Text(
+                            f"{start + 1}–{min(start + page_size, len(shown_tokens))} з {len(shown_tokens)}"
+                            f" (сторінка {self._price_page + 1}/{total_pages})",
+                            size=12,
+                        ),
+                        ft.IconButton(
+                            ft.Icons.CHEVRON_RIGHT,
+                            on_click=self._next_price_page,
+                            disabled=self._price_page >= total_pages - 1,
+                        ),
+                    ],
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    spacing=6,
+                )
+            )
+
+        return ft.Column(
+            [*info, filter_field, *pager, ft.Column(rows, spacing=6), *pager],
+            spacing=10,
+        )
+
+    def _on_price_filter_change(self, e):
+        self._price_filter = e.control.value or ""
+        self._price_page = 0
+        self.build()
+
+    def _prev_price_page(self, e):
+        self._price_page = max(0, self._price_page - 1)
+        self.build()
+
+    def _next_price_page(self, e):
+        self._price_page += 1
+        self.build()
+
+    def _build_price_row(self, token: dict):
+        has_usd = token["has_usd"]
+
+        uah_field = ft.TextField(
+            label="Ціна ₴", value=token["uah"], width=110, dense=True, border_radius=8
+        )
+        usd_field = ft.TextField(
+            label="Ціна $",
+            value=token["usd_value"],
+            width=100,
+            dense=True,
+            border_radius=8,
+            visible=has_usd,
+        )
+        discount_cb = ft.Checkbox(label="Знижка (стара ціна закреслена + нова)", value=False)
+        new_uah_field = ft.TextField(
+            label="Нова ціна ₴", value="", width=110, dense=True, border_radius=8, visible=False
+        )
+        new_usd_field = ft.TextField(
+            label="Нова ціна $",
+            value="",
+            width=100,
+            dense=True,
+            border_radius=8,
+            visible=False,
+        )
+
+        def _on_discount_toggle(_e):
+            show = bool(discount_cb.value)
+            new_uah_field.visible = show
+            new_usd_field.visible = show and has_usd
+            if show and not new_uah_field.value:
+                new_uah_field.value = uah_field.value
+                new_usd_field.value = usd_field.value
+            with contextlib.suppress(Exception):
+                new_uah_field.update()
+                new_usd_field.update()
+
+        discount_cb.on_change = _on_discount_toggle
+
+        def _parse_money(field: ft.TextField, label: str) -> str | None:
+            raw = (field.value or "").strip().replace(",", ".")
+            try:
+                float(raw)
+            except ValueError:
+                self._snack(f"{label}: ціна має бути числом", "red")
+                return None
+            return raw
+
+        async def _do_save(_tok=token, _e=None):
+            new_uah = _parse_money(uah_field, "Ціна ₴")
+            if new_uah is None:
+                return
+            new_usd = ""
+            if has_usd:
+                new_usd = _parse_money(usd_field, "Ціна $")
+                if new_usd is None:
+                    return
+
+            is_discount = bool(discount_cb.value)
+            edit: dict = {"discount": is_discount}
+            if is_discount:
+                disc_uah = _parse_money(new_uah_field, "Нова ціна ₴")
+                if disc_uah is None:
+                    return
+                disc_usd = ""
+                if has_usd:
+                    disc_usd = _parse_money(new_usd_field, "Нова ціна $")
+                    if disc_usd is None:
+                        return
+                edit.update(
+                    old_uah=new_uah, old_usd_value=new_usd,
+                    new_uah=disc_uah, new_usd_value=disc_usd,
+                )
+            else:
+                edit.update(new_uah=new_uah, new_usd_value=new_usd)
+
+            def _apply():
+                current_text = self._read_site_file(PRICE_HTML_FILE)
+                return apply_price_token_edit(current_text, _tok, edit)
+
+            new_text = await asyncio.to_thread(_apply)
+            items = [(PRICE_HTML_FILE, new_text.encode("utf-8"))]
+            await self._save_and_publish(items, f"Web сайт: ціна «{_tok['label']}»")
+
+        def _on_click(_e):
+            page = self._page()
+            if page:
+                page.run_task(_do_save)
+
+        return ft.Card(
+            ft.Container(
+                padding=12,
+                content=ft.Column(
+                    [
+                        ft.Text(token["label"], size=12, weight="bold", color="grey800"),
+                        ft.Row([uah_field, usd_field], spacing=8),
+                        discount_cb,
+                        ft.Row([new_uah_field, new_usd_field], spacing=8),
                         ft.Row(
                             [ft.FilledButton("Зберегти", icon=ft.Icons.SAVE, on_click=_on_click)],
                             alignment=ft.MainAxisAlignment.END,
