@@ -515,7 +515,6 @@ class WebSiteView:
         self._i18n_keys: list[str] = []
         self._i18n_values: dict[str, dict[str, str]] = {}
         self._text_filter = ""
-        self._text_page = 0
         self._file_cache: dict[str, bytes] = {}
         self._img_listing_cache: list[dict] | None = None
         self._shot_containers_cache: list[dict] | None = None
@@ -781,132 +780,110 @@ class WebSiteView:
         else:
             keys = self._i18n_keys
 
-        page_size = 60
-        total_pages = max(1, (len(keys) + page_size - 1) // page_size)
-        self._text_page = max(0, min(self._text_page, total_pages - 1))
-        start = self._text_page * page_size
-        shown = keys[start : start + page_size]
-        rows = [self._build_text_key_row(k) for k in shown]
-
-        info: list[ft.Control] = [
-            ft.Text(f"Ключів перекладу: {len(self._i18n_keys)}", size=12, color="grey600")
-        ]
-
-        pager: list[ft.Control] = []
-        if total_pages > 1:
-            pager.append(
-                ft.Row(
-                    [
-                        ft.IconButton(
-                            ft.Icons.CHEVRON_LEFT,
-                            on_click=self._prev_text_page,
-                            disabled=self._text_page == 0,
-                        ),
-                        ft.Text(
-                            f"{start + 1}–{min(start + page_size, len(keys))} з {len(keys)}"
-                            f" (сторінка {self._text_page + 1}/{total_pages})",
-                            size=12,
-                        ),
-                        ft.IconButton(
-                            ft.Icons.CHEVRON_RIGHT,
-                            on_click=self._next_text_page,
-                            disabled=self._text_page >= total_pages - 1,
-                        ),
-                    ],
-                    alignment=ft.MainAxisAlignment.CENTER,
-                    spacing=6,
-                )
-            )
-
-        return ft.Column(
-            [*info, filter_field, *pager, ft.Column(rows, spacing=6), *pager],
-            spacing=10,
+        info = ft.Text(
+            f"Ключів перекладу: {len(self._i18n_keys)}"
+            + (f" (показано {len(keys)} за пошуком)" if needle else ""),
+            size=12,
+            color="grey600",
         )
+
+        return ft.Column([info, filter_field, self._build_texts_table(keys)], spacing=10)
 
     def _on_text_filter_change(self, e):
         self._text_filter = e.control.value or ""
-        self._text_page = 0
         self.build()
 
-    def _prev_text_page(self, e):
-        self._text_page = max(0, self._text_page - 1)
-        self.build()
-
-    def _next_text_page(self, e):
-        self._text_page += 1
-        self.build()
-
-    def _build_text_key_row(self, key: str):
-        original_values = dict(self._i18n_values.get(key, {}))
-        fields: dict[str, ft.TextField] = {}
+    def _build_texts_table(self, keys: list[str]) -> ft.Column:
+        columns = [ft.DataColumn(ft.Text("Ключ", size=11, weight="bold"))]
         for lang in LANGS:
-            fields[lang] = ft.TextField(
-                label=LANG_LABELS.get(lang, lang),
-                value=original_values.get(lang, ""),
-                multiline=True,
-                min_lines=1,
-                max_lines=4,
-                dense=True,
-                border_radius=8,
-            )
+            columns.append(ft.DataColumn(ft.Text(LANG_LABELS.get(lang, lang), size=11, weight="bold")))
 
-        async def _do_save(_key=key, _fields=fields, _orig=original_values):
-            changed_langs = {
-                lang: (field.value or "")
-                for lang, field in _fields.items()
-                if (field.value or "") != (_orig.get(lang, "") or "")
-            }
-            if not changed_langs:
+        row_state: list[tuple[str, dict[str, ft.TextField], dict[str, str]]] = []
+        data_rows = []
+        for key in keys:
+            original_values = dict(self._i18n_values.get(key, {}))
+            fields: dict[str, ft.TextField] = {}
+            cells = [ft.DataCell(ft.Text(key, size=11, selectable=True, width=200, no_wrap=False))]
+            for lang in LANGS:
+                field = ft.TextField(
+                    value=original_values.get(lang, ""),
+                    width=200,
+                    dense=True,
+                    content_padding=ft.padding.symmetric(horizontal=8, vertical=6),
+                    text_size=12,
+                    border_radius=6,
+                )
+                fields[lang] = field
+                cells.append(ft.DataCell(field))
+            row_state.append((key, fields, original_values))
+            data_rows.append(ft.DataRow(cells=cells))
+
+        async def _save_all(_e=None):
+            changed: dict[str, dict[str, str]] = {}
+            for key, fields, orig in row_state:
+                row_changed = {
+                    lang: (f.value or "")
+                    for lang, f in fields.items()
+                    if (f.value or "") != (orig.get(lang, "") or "")
+                }
+                if row_changed:
+                    changed[key] = row_changed
+            if not changed:
                 self._snack("Немає змін", "grey")
                 return
 
             def _apply():
                 text = self._read_site_file(I18N_JS_REL)
                 touched_i18n = False
-                for lang, new_val in changed_langs.items():
-                    text, ch = set_i18n_entry(text, lang, _key, new_val)
-                    touched_i18n = touched_i18n or ch
+                uk_changes: dict[str, str] = {}
+                for key, langs in changed.items():
+                    for lang, new_val in langs.items():
+                        text, ch = set_i18n_entry(text, lang, key, new_val)
+                        touched_i18n = touched_i18n or ch
+                        if lang == "uk":
+                            uk_changes[key] = new_val
 
                 items: list[tuple[str, bytes]] = []
                 if touched_i18n:
                     items.append((I18N_JS_REL, text.encode("utf-8")))
-                if "uk" in changed_langs:
+                if uk_changes:
                     for rel in SITE_HTML_FILES:
                         html_text = self._read_site_file(rel)
-                        new_html, ch = sync_uk_key_into_html(html_text, _key, changed_langs["uk"])
-                        if ch:
-                            items.append((rel, new_html.encode("utf-8")))
+                        any_ch = False
+                        for key, new_val in uk_changes.items():
+                            html_text, ch = sync_uk_key_into_html(html_text, key, new_val)
+                            any_ch = any_ch or ch
+                        if any_ch:
+                            items.append((rel, html_text.encode("utf-8")))
                 return items
 
             items = await asyncio.to_thread(_apply)
             if not items:
-                self._snack("Ключ не знайдено у файлі — змін не застосовано", "orange")
+                self._snack("Ключі не знайдено у файлі — змін не застосовано", "orange")
                 return
-            for lang, new_val in changed_langs.items():
-                original_values[lang] = new_val
-                self._i18n_values.setdefault(_key, {})[lang] = new_val
-            await self._save_and_publish(items, f"Web сайт: оновлено текст «{_key}»")
+            for key, langs in changed.items():
+                for lang, new_val in langs.items():
+                    self._i18n_values.setdefault(key, {})[lang] = new_val
+            await self._save_and_publish(items, f"Web сайт: оновлено {len(changed)} текст(ів)", on_done=self.build)
 
-        def _on_click(_e, _s=_do_save):
+        def _on_click(_e):
             page = self._page()
             if page:
-                page.run_task(_s)
+                page.run_task(_save_all)
 
-        return ft.Card(
-            ft.Container(
-                padding=12,
-                content=ft.Column(
-                    [
-                        ft.Text(key, size=12, weight="bold", color="grey800", selectable=True),
-                        *fields.values(),
-                        ft.Row(
-                            [ft.FilledButton("Зберегти", icon=ft.Icons.SAVE, on_click=_on_click)],
-                            alignment=ft.MainAxisAlignment.END,
-                        ),
-                    ],
-                    spacing=6,
+        return ft.Column(
+            [
+                ft.Row(
+                    [ft.DataTable(columns=columns, rows=data_rows, column_spacing=8,
+                                   data_row_min_height=44, heading_row_height=34)],
+                    scroll=ft.ScrollMode.ALWAYS,
                 ),
-            )
+                ft.Row(
+                    [ft.FilledButton("Зберегти зміни в таблиці", icon=ft.Icons.SAVE, on_click=_on_click)],
+                    alignment=ft.MainAxisAlignment.END,
+                ),
+            ],
+            spacing=6,
         )
 
     # -------------------------------------------------------------- 1b. Прайс
