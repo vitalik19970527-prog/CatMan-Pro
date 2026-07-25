@@ -418,6 +418,12 @@ class WebSiteView:
                 elif needs_images_prefetch and not self._images_loading:
                     self._images_loading = True
                     page.run_task(self._prefetch_images)
+        elif not self._publisher.configured and self.sub_tab != "settings":
+            # Orange banner above already explains why — building texts/images/
+            # files/build here would just hit GitHub and raise (no token), which
+            # used to also show a scary "Сталася помилка" under the banner for
+            # what is really just "not configured yet", not a crash.
+            pass
         else:
             try:
                 if self.sub_tab == "texts":

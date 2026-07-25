@@ -297,8 +297,52 @@ def _install_global_crash_hooks() -> None:
     except Exception:
         logger.exception("[crash] failed to install threading.excepthook")
 
+    _install_flet_session_error_guard()
+
     _CRASH_HOOKS_INSTALLED = True
     logger.info("[crash] global crash hooks installed")
+
+
+def _install_flet_session_error_guard() -> None:
+    """Stop one well-known, long-standing timing race (a background/deferred
+    task's control.update() firing after the user already navigated away and
+    Flet removed that control from the page — "Control must be added to the
+    page first", seen across many views in catman.log since May 2026: orders,
+    categories, packaging stock, bulk product template, and the quick-account
+    dropdown on the login screen) from tearing down the whole session.
+
+    flet.messaging.session.Session.dispatch_event reports ANY exception
+    raised by ANY event handler to the client as SESSION_CRASHED via
+    Session.error(), which blanks the entire page behind a fatal "The
+    application encountered an error" banner — even though the app itself
+    is otherwise fine and the same exception is already being caught and
+    logged locally at dozens of call sites. Only this specific, already-
+    understood exception shape is downgraded to a log-and-continue here;
+    everything else still reaches the client normally so real bugs stay
+    visible instead of being silently swallowed."""
+    try:
+        from flet.messaging.session import Session
+
+        if getattr(Session, "_catman_error_guard_installed", False):
+            return
+
+        _original_session_error = Session.error
+
+        def _guarded_session_error(self, message: str):
+            first_line = str(message or "").splitlines()[0] if message else ""
+            if "Control must be added to the page first" in first_line:
+                logger.warning(
+                    "[crash-guard] suppressed session-crash for stale control update: %s",
+                    first_line,
+                )
+                return
+            _original_session_error(self, message)
+
+        Session.error = _guarded_session_error
+        Session._catman_error_guard_installed = True
+        logger.info("[crash] flet session error guard installed")
+    except Exception:
+        logger.exception("[crash] failed to install flet session error guard")
 
 
 def _install_selectable_text_registry() -> None:
