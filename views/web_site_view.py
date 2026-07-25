@@ -794,22 +794,29 @@ class WebSiteView:
         self.build()
 
     def _build_texts_table(self, keys: list[str]) -> ft.Column:
-        columns = [ft.DataColumn(ft.Text("Ключ", size=11, weight="bold"))]
-        for lang in LANGS:
-            columns.append(ft.DataColumn(ft.Text(LANG_LABELS.get(lang, lang), size=11, weight="bold")))
+        # Plain Row/Column grid, not ft.DataTable — DataTable's rows don't
+        # grow to fit multiline content (found via live testing: long
+        # translations kept getting clipped no matter how high max_lines
+        # was set). A Row of fixed-width Containers has no such limit and
+        # grows exactly as tall as its content needs.
+        header = ft.Row(
+            [
+                ft.Container(width=180, content=ft.Text("Ключ", size=11, weight="bold")),
+                *[
+                    ft.Container(width=200, content=ft.Text(LANG_LABELS.get(lang, lang), size=11, weight="bold"))
+                    for lang in LANGS
+                ],
+            ],
+            spacing=10,
+        )
 
         row_state: list[tuple[str, dict[str, ft.TextField], dict[str, str]]] = []
-        data_rows = []
+        grid_rows: list[ft.Control] = [header, ft.Divider(height=1)]
         for key in keys:
             original_values = dict(self._i18n_values.get(key, {}))
             fields: dict[str, ft.TextField] = {}
-            cells = [
-                ft.DataCell(
-                    ft.Container(
-                        width=180,
-                        content=ft.Text(key, size=11, selectable=True, no_wrap=False),
-                    )
-                )
+            row_cells: list[ft.Control] = [
+                ft.Container(width=180, content=ft.Text(key, size=11, selectable=True, no_wrap=False))
             ]
             for lang in LANGS:
                 field = ft.TextField(
@@ -817,16 +824,20 @@ class WebSiteView:
                     width=200,
                     multiline=True,
                     min_lines=1,
-                    max_lines=8,
                     dense=True,
                     content_padding=ft.padding.symmetric(horizontal=8, vertical=6),
                     text_size=12,
                     border_radius=6,
                 )
                 fields[lang] = field
-                cells.append(ft.DataCell(ft.Container(width=200, content=field)))
+                row_cells.append(ft.Container(width=200, content=field))
             row_state.append((key, fields, original_values))
-            data_rows.append(ft.DataRow(cells=cells))
+            grid_rows.append(
+                ft.Container(
+                    padding=ft.padding.symmetric(vertical=4),
+                    content=ft.Row(row_cells, spacing=10, vertical_alignment=ft.CrossAxisAlignment.START),
+                )
+            )
 
         async def _save_all(_e=None):
             changed: dict[str, dict[str, str]] = {}
@@ -883,11 +894,7 @@ class WebSiteView:
 
         return ft.Column(
             [
-                ft.Row(
-                    [ft.DataTable(columns=columns, rows=data_rows, column_spacing=8,
-                                   data_row_min_height=44, heading_row_height=34)],
-                    scroll=ft.ScrollMode.ALWAYS,
-                ),
+                ft.Row([ft.Column(grid_rows, spacing=6)], scroll=ft.ScrollMode.ALWAYS),
                 ft.Row(
                     [ft.FilledButton("Зберегти зміни в таблиці", icon=ft.Icons.SAVE, on_click=_on_click)],
                     alignment=ft.MainAxisAlignment.END,
