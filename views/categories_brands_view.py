@@ -20,6 +20,7 @@ def _th_from_view(view) -> dict:
 
 
 from logger import logger
+from views.mobile_layout_helpers import apply_no_wrap_subtitle, is_mobile
 
 
 def _normalize_role(role):
@@ -1513,20 +1514,34 @@ class CategoriesBrandsView:
             "[categories-debug] _create_category_card using safe container renderer"
         )
 
+        _cat_title_text = ft.Text(
+            self._category_label(category),
+            weight="bold",
+            size=15,
+            selectable=True,
+        )
+        _cat_mode_text = ft.Text(mode_hint, size=11, color="grey700")
+        _cat_order_text = ft.Text(order_hint, size=11, color="grey700")
+        if is_mobile(self.content_area.page if self.content_area else None):
+            # These 3 lines live in an expand=True Container squeezed by up
+            # to 5 sibling buttons in a non-wrapping Row below — on a narrow
+            # phone that can collapse to near-zero width and Flutter falls
+            # back to one-character-per-line wrapping (the same bug already
+            # fixed on other list headers). Force single-line ellipsis only
+            # on mobile; desktop keeps the original text controls untouched
+            # (order_hint can legitimately wrap to 2-3 lines there).
+            apply_no_wrap_subtitle(_cat_title_text)
+            apply_no_wrap_subtitle(_cat_mode_text)
+            apply_no_wrap_subtitle(_cat_order_text)
         header_row = ft.Row(
             [
                 ft.Container(
                     expand=True,
                     content=ft.Column(
                         [
-                            ft.Text(
-                                self._category_label(category),
-                                weight="bold",
-                                size=15,
-                                selectable=True,
-                            ),
-                            ft.Text(mode_hint, size=11, color="grey700"),
-                            ft.Text(order_hint, size=11, color="grey700"),
+                            _cat_title_text,
+                            _cat_mode_text,
+                            _cat_order_text,
                         ],
                         spacing=2,
                     ),

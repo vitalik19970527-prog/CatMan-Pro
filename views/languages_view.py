@@ -19,6 +19,7 @@ import flet as ft
 
 import i18n
 from logger import logger
+from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
 
 try:
     from tkinter import Tk, filedialog
@@ -333,39 +334,59 @@ class LanguagesView:
         self.content_area.controls.clear()
 
         # ── Fixed page header: title + buttons + subtitle ─────────────────────
-        toolbar = ft.Row(
-            [
-                ft.Text(self.t("nav.languages", "Мови"), size=22, weight="bold"),
-                ft.IconButton(
-                    icon=ft.Icons.HELP_OUTLINE,
-                    icon_size=18,
-                    tooltip=self.t("common.help.tooltip", "Довідка"),
-                    on_click=lambda _e: self._show_help(),
-                ),
-                ft.Row(expand=True),
-                ft.OutlinedButton(
-                    self.t("languages.add_btn", "Додати мову"),
-                    icon=ft.Icons.ADD,
-                    on_click=self._open_add_language_dialog,
-                ),
-                ft.OutlinedButton(
-                    self.t("languages.export_excel", "Завантажити Excel"),
-                    icon=ft.Icons.DOWNLOAD,
-                    on_click=self._export_excel,
-                ),
-                ft.OutlinedButton(
-                    self.t("languages.import_excel", "Завантажити з Excel"),
-                    icon=ft.Icons.UPLOAD,
-                    on_click=self._import_excel,
-                ),
-                ft.FilledButton(
-                    self.t("common.save", "Зберегти"),
-                    icon=ft.Icons.SAVE,
-                    on_click=self._save_all,
-                ),
-            ],
-            spacing=8,
-        )
+        _lang_title_controls = [
+            ft.Text(self.t("nav.languages", "Мови"), size=22, weight="bold"),
+            ft.IconButton(
+                icon=ft.Icons.HELP_OUTLINE,
+                icon_size=18,
+                tooltip=self.t("common.help.tooltip", "Довідка"),
+                on_click=lambda _e: self._show_help(),
+            ),
+        ]
+        _lang_action_buttons = [
+            ft.OutlinedButton(
+                self.t("languages.add_btn", "Додати мову"),
+                icon=ft.Icons.ADD,
+                on_click=self._open_add_language_dialog,
+            ),
+            ft.OutlinedButton(
+                self.t("languages.export_excel", "Завантажити Excel"),
+                icon=ft.Icons.DOWNLOAD,
+                on_click=self._export_excel,
+            ),
+            ft.OutlinedButton(
+                self.t("languages.import_excel", "Завантажити з Excel"),
+                icon=ft.Icons.UPLOAD,
+                on_click=self._import_excel,
+            ),
+            ft.FilledButton(
+                self.t("common.save", "Зберегти"),
+                icon=ft.Icons.SAVE,
+                on_click=self._save_all,
+            ),
+        ]
+        if is_mobile(self.content_area.page if self.content_area else None):
+            # Title + help icon + 4 action buttons in one un-wrapped,
+            # non-scrolling Row overflows badly on a narrow phone screen.
+            # Put the title on its own line and keep the buttons on a single
+            # horizontally-scrollable line instead.
+            toolbar = ft.Column(
+                [
+                    ft.Row(
+                        _lang_title_controls,
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    make_scrollable_chip_row(_lang_action_buttons, spacing=8),
+                ],
+                spacing=6,
+                tight=True,
+            )
+        else:
+            toolbar = ft.Row(
+                _lang_title_controls + [ft.Row(expand=True)] + _lang_action_buttons,
+                spacing=8,
+            )
         subtitle = ft.Text(
             "Базові написи беруться з коду (українською). Заповніть переклад для"
             " кожної мови — клітинки редагуються напряму. Біля назви мови є кнопка"
@@ -388,24 +409,41 @@ class LanguagesView:
             tooltip=self.t("common.next_page", "Наступна сторінка"),
             on_click=lambda _e: self._change_page(1),
         )
-        filter_row = ft.Row(
-            [
-                ft.TextField(
-                    hint_text=self.t("languages.search_hint", "Пошук за ключем або українським текстом"),
-                    prefix_icon=ft.Icons.SEARCH,
-                    dense=True,
-                    border_radius=8,
-                    width=360,
-                    content_padding=ft.padding.symmetric(horizontal=10, vertical=8),
-                    on_change=self._on_filter_changed,
-                ),
-                ft.Row(expand=True),
-                self._prev_page_btn,
-                self._page_label,
-                self._next_page_btn,
-            ],
-            spacing=8,
+        _lang_search_field = ft.TextField(
+            hint_text=self.t("languages.search_hint", "Пошук за ключем або українським текстом"),
+            prefix_icon=ft.Icons.SEARCH,
+            dense=True,
+            border_radius=8,
+            width=360,
+            content_padding=ft.padding.symmetric(horizontal=10, vertical=8),
+            on_change=self._on_filter_changed,
         )
+        if is_mobile(self.content_area.page if self.content_area else None):
+            # A 360px-wide search field plus a pager, forced into one row via
+            # an expand=True spacer, has no room left for the pager on a
+            # narrow phone screen. Let the pager wrap onto its own line
+            # instead of being squeezed against the field.
+            filter_row = ft.Row(
+                [
+                    _lang_search_field,
+                    self._prev_page_btn,
+                    self._page_label,
+                    self._next_page_btn,
+                ],
+                spacing=8,
+                wrap=True,
+            )
+        else:
+            filter_row = ft.Row(
+                [
+                    _lang_search_field,
+                    ft.Row(expand=True),
+                    self._prev_page_btn,
+                    self._page_label,
+                    self._next_page_btn,
+                ],
+                spacing=8,
+            )
 
         # Fixed top: toolbar + (optional empty-filter banner) + filter/pager + subtitle never scroll
         fixed_top_children = [toolbar]

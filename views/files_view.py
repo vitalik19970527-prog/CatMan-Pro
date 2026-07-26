@@ -10,6 +10,8 @@ from datetime import datetime
 import flet as ft
 import i18n
 
+from views.mobile_layout_helpers import is_mobile
+
 _MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 
 _ACCENT = "#1D4ED8"
@@ -319,22 +321,44 @@ class FilesView:
         )
 
         # ---- Main layout ----
-        layout = ft.Row(
-            [
-                ft.Container(
-                    width=240,
-                    content=left_panel,
-                    border=ft.border.only(right=ft.BorderSide(1, _BORDER)),
-                    padding=ft.padding.only(right=12, top=4, bottom=4),
-                ),
-                ft.Container(
-                    expand=True, content=right_panel,
-                    padding=ft.padding.only(left=16, top=4, bottom=4, right=4),
-                ),
-            ],
-            spacing=0, expand=True,
-            vertical_alignment=ft.CrossAxisAlignment.START,
-        )
+        # A fixed 240px folder-tree column next to an expand=True files column
+        # works on desktop's wide content area, but on a narrow phone screen
+        # 240px alone can eat most/all of the available width, squeezing (or
+        # overflowing) the files panel down to nothing. On mobile, stack the
+        # tree above the files list instead of side-by-side.
+        if is_mobile(getattr(ca, "page", None)):
+            layout = ft.Column(
+                [
+                    ft.Container(
+                        height=260,
+                        content=left_panel,
+                        border=ft.border.only(bottom=ft.BorderSide(1, _BORDER)),
+                        padding=ft.padding.only(bottom=8),
+                    ),
+                    ft.Container(
+                        expand=True, content=right_panel,
+                        padding=ft.padding.only(top=8),
+                    ),
+                ],
+                spacing=0, expand=True,
+            )
+        else:
+            layout = ft.Row(
+                [
+                    ft.Container(
+                        width=240,
+                        content=left_panel,
+                        border=ft.border.only(right=ft.BorderSide(1, _BORDER)),
+                        padding=ft.padding.only(right=12, top=4, bottom=4),
+                    ),
+                    ft.Container(
+                        expand=True, content=right_panel,
+                        padding=ft.padding.only(left=16, top=4, bottom=4, right=4),
+                    ),
+                ],
+                spacing=0, expand=True,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            )
 
         ca.controls.clear()
         ca.controls.append(

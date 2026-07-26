@@ -22,6 +22,7 @@ from views.number_format import (
     row_text_matches,
     safe_float,
 )
+from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
 
 # ---------------------------------------------------------------------------
 # Theme colour shims — module defaults, shadowed by live theme at render time
@@ -1912,6 +1913,9 @@ class PaymentsView:
                                         size=13,
                                         weight=ft.FontWeight.W_500,
                                         color=_TEXT,
+                                        no_wrap=True,
+                                        overflow=ft.TextOverflow.ELLIPSIS,
+                                        max_lines=1,
                                     ),
                                 ],
                                 spacing=2,
@@ -1971,6 +1975,9 @@ class PaymentsView:
                                         size=13,
                                         weight=ft.FontWeight.W_500,
                                         color=_TEXT,
+                                        no_wrap=True,
+                                        overflow=ft.TextOverflow.ELLIPSIS,
+                                        max_lines=1,
                                     ),
                                 ],
                                 spacing=2,
@@ -2004,7 +2011,10 @@ class PaymentsView:
             agg[bk] = agg.get(bk, 0) + 1
         total = sum(agg.values())
 
-        _agg_chips_row = ft.Row([], spacing=4, run_spacing=4, wrap=True)
+        if is_mobile(page):
+            _agg_chips_row = make_scrollable_chip_row([], spacing=4, run_spacing=4)
+        else:
+            _agg_chips_row = ft.Row([], spacing=4, run_spacing=4, wrap=True)
 
         def _sep_chip():
             return ft.Container(
@@ -8391,6 +8401,9 @@ class PaymentsView:
                                         size=13,
                                         weight=ft.FontWeight.W_500,
                                         color=_TEXT,
+                                        no_wrap=True,
+                                        overflow=ft.TextOverflow.ELLIPSIS,
+                                        max_lines=1,
                                     ),
                                 ],
                                 spacing=2,
@@ -8409,7 +8422,10 @@ class PaymentsView:
             padding=ft.padding.only(bottom=12),
         )
 
-        self._counters_row = ft.Row(spacing=4, run_spacing=6, wrap=True)
+        if is_mobile(page):
+            self._counters_row = make_scrollable_chip_row([], spacing=4, run_spacing=6)
+        else:
+            self._counters_row = ft.Row(spacing=4, run_spacing=6, wrap=True)
         counters_bar = ft.Container(
             padding=ft.padding.only(left=2, right=2, top=0, bottom=4),
             content=self._counters_row,

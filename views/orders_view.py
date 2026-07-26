@@ -18,6 +18,7 @@ import i18n
 from logger import logger
 from views.number_format import format_grouped, format_maybe_numeric_text, safe_float
 from views import product_naming
+from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT and _PROJECT_ROOT not in sys.path:
@@ -13180,6 +13181,9 @@ class OrdersView:
                                         size=13,
                                         weight=ft.FontWeight.W_500,
                                         color=_TEXT,
+                                        no_wrap=True,
+                                        overflow=ft.TextOverflow.ELLIPSIS,
+                                        max_lines=1,
                                     ),
                                 ],
                                 spacing=2,
@@ -13208,13 +13212,15 @@ class OrdersView:
             padding=ft.padding.only(bottom=12),
         )
 
-        self._counters_row = ft.Row(
-            [],
+        _counters_row_kwargs = dict(
             spacing=4,
             run_spacing=6,
-            wrap=True,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
+        if is_mobile(page):
+            self._counters_row = make_scrollable_chip_row([], **_counters_row_kwargs)
+        else:
+            self._counters_row = ft.Row([], wrap=True, **_counters_row_kwargs)
         counters_bar = ft.Container(
             padding=ft.padding.only(left=2, right=2, top=0, bottom=4),
             content=self._counters_row,

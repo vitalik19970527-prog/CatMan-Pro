@@ -6085,11 +6085,19 @@ class HomeView:
                 with __import__("contextlib").suppress(Exception):
                     cb.update()
 
-        cb_row = ft.Row(
-            [cb for cb in checkboxes],
-            spacing=4,
-            wrap=True,
-        )
+        from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
+
+        if is_mobile(self.content_area.page):
+            # A wrap=True row of one checkbox per subordinate can grow to
+            # several lines on a narrow phone screen, pushing the KPI grid
+            # far down. Keep it a single horizontally-scrollable line instead.
+            cb_row = make_scrollable_chip_row([cb for cb in checkboxes], spacing=4)
+        else:
+            cb_row = ft.Row(
+                [cb for cb in checkboxes],
+                spacing=4,
+                wrap=True,
+            )
 
         return ft.Container(
             bgcolor=_SOFT,

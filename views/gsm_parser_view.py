@@ -8180,26 +8180,58 @@ class GsmParserView:
         )
 
         # Row 1 — user controls (all users)
-        user_row = ft.Row(
-            [
-                ft.Row(
-                    left_toolbar_controls + [compat_global_btn],
-                    spacing=8,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                ),
-                ft.Container(expand=True),
-                stats_text,
-            ],
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-        )
+        from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
+
+        _gsm_is_mobile = is_mobile(page_ctrl)
+        if _gsm_is_mobile:
+            # This toolbar packs a search field (210px), a presets dropdown
+            # (170px) and half a dozen buttons into one un-wrapped Row — on a
+            # narrow phone screen that overflows badly. Keep it a single
+            # horizontally-scrollable line instead of trying to squeeze it
+            # into a Row alongside an expand=True spacer (which is what was
+            # causing the overflow), and stack stats_text below it so nothing
+            # competes for width.
+            user_row = ft.Column(
+                [
+                    make_scrollable_chip_row(
+                        left_toolbar_controls + [compat_global_btn],
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    stats_text,
+                ],
+                spacing=4,
+                tight=True,
+            )
+        else:
+            user_row = ft.Row(
+                [
+                    ft.Row(
+                        left_toolbar_controls + [compat_global_btn],
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    ft.Container(expand=True),
+                    stats_text,
+                ],
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            )
 
         # Row 2 — SA / run_parser-permission controls
         toolbar_rows: list = [user_row]
         if (self.is_superadmin or self.can_run_parser) and right_toolbar_controls:
-            sa_row = ft.Row(
-                right_toolbar_controls,
-                spacing=8,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            sa_row = (
+                make_scrollable_chip_row(
+                    right_toolbar_controls,
+                    spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                )
+                if _gsm_is_mobile
+                else ft.Row(
+                    right_toolbar_controls,
+                    spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                )
             )
             toolbar_rows.append(sa_row)
 

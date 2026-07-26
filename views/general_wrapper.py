@@ -23,6 +23,7 @@ import flet as ft
 import i18n
 from views import themes as _gw_themes
 from views.general_mode_mixin import build_general_manager_names
+from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
 
 
 def _gw_get_theme(user_data: dict) -> dict:
@@ -211,17 +212,32 @@ def build_general_sections(
             except Exception:
                 pass
 
+        # On mobile a wrap=True chip row breaks onto 2+ lines the moment the
+        # combined chip width exceeds the narrow screen, making every
+        # collapsed section header taller than necessary. Keep it a single
+        # horizontally-scrollable line on mobile instead; desktop keeps the
+        # original wrapping Row untouched.
+        _right_row = (
+            make_scrollable_chip_row(
+                right_children,
+                spacing=6,
+                tight=True,
+                vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+            )
+            if is_mobile(content_area.page)
+            else ft.Row(
+                right_children,
+                spacing=6,
+                tight=True,
+                wrap=True,
+                vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+            )
+        )
         header_content = (
             ft.Row(
                 [
                     ft.Container(content=left_row, expand=True),
-                    ft.Row(
-                        right_children,
-                        spacing=6,
-                        tight=True,
-                        wrap=True,
-                        vertical_alignment=ft.CrossAxisAlignment.STRETCH,
-                    ),
+                    _right_row,
                 ],
                 spacing=8,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -441,17 +457,32 @@ def build_region_sections(
             except Exception:
                 pass
 
+        # On mobile a wrap=True chip row breaks onto 2+ lines the moment the
+        # combined chip width exceeds the narrow screen, making every
+        # collapsed section header taller than necessary. Keep it a single
+        # horizontally-scrollable line on mobile instead; desktop keeps the
+        # original wrapping Row untouched.
+        _right_row = (
+            make_scrollable_chip_row(
+                right_children,
+                spacing=6,
+                tight=True,
+                vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+            )
+            if is_mobile(content_area.page)
+            else ft.Row(
+                right_children,
+                spacing=6,
+                tight=True,
+                wrap=True,
+                vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+            )
+        )
         header_content = (
             ft.Row(
                 [
                     ft.Container(content=left_row, expand=True),
-                    ft.Row(
-                        right_children,
-                        spacing=6,
-                        tight=True,
-                        wrap=True,
-                        vertical_alignment=ft.CrossAxisAlignment.STRETCH,
-                    ),
+                    _right_row,
                 ],
                 spacing=8,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,

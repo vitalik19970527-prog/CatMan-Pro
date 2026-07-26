@@ -1,6 +1,7 @@
 from typing import Optional
 
 import flet as ft
+from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
 from views.number_format import format_maybe_numeric_text, safe_float
 from views.orders_view import _wrap_text_for_width
 
@@ -94,18 +95,21 @@ def build_stock_counters(view, rows: list) -> ft.Row:
             ),
         )
 
-    return ft.Row(
-        [
-            _chip(view.t("stock.chip.total", "Товарів"), "all", len(all_rows), _CHIP_BG, _ACCENT),
-            _chip(view.t("stock.chip.with_qty", "З кількістю"), "with_qty", with_qty, _OK_BG, _OK_T),
-            _chip(view.t("stock.chip.without_qty", "Без кількості"), "without_qty", without_qty, _ERR_BG, _ERR_DK),
-            _chip(view.t("stock.chip.with_cost", "З вартістю"), "with_cost", with_cost, _WARN_BG, _WARN_T),
-            _chip(view.t("stock.chip.without_cost", "Без вартості"), "without_cost", without_cost, _SOFT_O, _ERR_O),
-            _chip(view.t("stock.chip.without_both", "Без обох"), "without_both", without_both, _ALT, _MUTED),
-        ],
-        spacing=6,
-        wrap=True,
-    )
+    _chips = [
+        _chip(view.t("stock.chip.total", "Товарів"), "all", len(all_rows), _CHIP_BG, _ACCENT),
+        _chip(view.t("stock.chip.with_qty", "З кількістю"), "with_qty", with_qty, _OK_BG, _OK_T),
+        _chip(view.t("stock.chip.without_qty", "Без кількості"), "without_qty", without_qty, _ERR_BG, _ERR_DK),
+        _chip(view.t("stock.chip.with_cost", "З вартістю"), "with_cost", with_cost, _WARN_BG, _WARN_T),
+        _chip(view.t("stock.chip.without_cost", "Без вартості"), "without_cost", without_cost, _SOFT_O, _ERR_O),
+        _chip(view.t("stock.chip.without_both", "Без обох"), "without_both", without_both, _ALT, _MUTED),
+    ]
+    # On mobile, wrap=True breaks this counter row onto 2-3 lines the moment
+    # width runs out, stealing vertical space from the stock table below it —
+    # the same layout bug already fixed in the sibling cost-price views. Keep
+    # it a single horizontally-scrollable line on mobile; desktop is unchanged.
+    if is_mobile(getattr(view.content_area, "page", None)):
+        return make_scrollable_chip_row(_chips, spacing=6)
+    return ft.Row(_chips, spacing=6, wrap=True)
 
 
 def build_stock_totals(view, rows: list) -> ft.Row:
@@ -149,22 +153,24 @@ def build_stock_totals(view, rows: list) -> ft.Row:
             ),
         )
 
-    return ft.Row(
-        [
-            _tile(
-                ft.Icons.INVENTORY_2_OUTLINED,
-                view.t("stock.total_qty", "Загальна кількість"),
-                qty_value_text,
-            ),
-            _tile(
-                ft.Icons.PAYMENTS_OUTLINED,
-                view.t("stock.total_sum", "Загальна сума"),
-                sum_value_text,
-            ),
-        ],
-        spacing=10,
-        wrap=True,
-    )
+    _tiles = [
+        _tile(
+            ft.Icons.INVENTORY_2_OUTLINED,
+            view.t("stock.total_qty", "Загальна кількість"),
+            qty_value_text,
+        ),
+        _tile(
+            ft.Icons.PAYMENTS_OUTLINED,
+            view.t("stock.total_sum", "Загальна сума"),
+            sum_value_text,
+        ),
+    ]
+    # Same mobile-only fix as build_stock_counters() above: keep these two
+    # summary tiles on one horizontally-scrollable line on mobile instead of
+    # letting wrap=True stack them and push the table down.
+    if is_mobile(getattr(view.content_area, "page", None)):
+        return make_scrollable_chip_row(_tiles, spacing=10)
+    return ft.Row(_tiles, spacing=10, wrap=True)
 
 
 def build_stock_filter_bar(view) -> ft.Container:

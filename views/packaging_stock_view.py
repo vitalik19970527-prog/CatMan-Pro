@@ -28,6 +28,7 @@ from views.number_format import (
 )
 from views.orders_view import _wrap_text_for_width
 from views import product_naming
+from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
 
 # ---------------------------------------------------------------------------
 # Theme colour shims — module defaults, shadowed by live theme at render time
@@ -4603,6 +4604,9 @@ class PackagingStockView:
                                         size=13,
                                         weight=ft.FontWeight.W_500,
                                         color=self.UI_MUTED_INK,
+                                        no_wrap=True,
+                                        overflow=ft.TextOverflow.ELLIPSIS,
+                                        max_lines=1,
                                     ),
                                 ],
                                 spacing=2,
@@ -4640,13 +4644,15 @@ class PackagingStockView:
             padding=ft.padding.only(bottom=12),
         )
 
-        self._counters_row = ft.Row(
-            [],
+        _counters_row_kwargs = dict(
             spacing=4,
             run_spacing=6,
-            wrap=True,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
+        if is_mobile(self._page()):
+            self._counters_row = make_scrollable_chip_row([], **_counters_row_kwargs)
+        else:
+            self._counters_row = ft.Row([], wrap=True, **_counters_row_kwargs)
         counters_bar = ft.Container(
             padding=ft.padding.symmetric(horizontal=2, vertical=2),
             content=self._counters_row,

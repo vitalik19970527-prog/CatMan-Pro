@@ -1148,11 +1148,23 @@ class SuperAdminDashboard:
             )
             _confirm_switch_account(_)
 
+        from views.mobile_layout_helpers import (
+            is_mobile as _is_mobile_device,
+            is_mobile_landscape as _is_mobile_landscape,
+            register_resize_listener as _register_resize_listener,
+        )
+
         page_w = int(getattr(self.page, "width", 0) or 0)
         if page_w <= 0:
             win = getattr(self.page, "window", None)
             page_w = int(getattr(win, "width", 0) or 0) if win else 0
-        is_small_header = bool(page_w > 0 and page_w < 980)
+        # Phones always get the compact header regardless of orientation --
+        # see dashboard.py's identical fix for why page_w<980 alone isn't
+        # enough (landscape width can cross 980 on some devices while still
+        # being far too short vertically for the "large" sizing).
+        is_small_header = bool(
+            _is_mobile_device(self.page) or (page_w > 0 and page_w < 980)
+        )
 
         title_size = 20 if is_small_header else 24
         subtitle_size = 11 if is_small_header else 12
@@ -1269,28 +1281,45 @@ class SuperAdminDashboard:
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
 
-        header = ft.Container(
-            content=ft.Column(
+        def _build_sa_shell_header_row():
+            # Same fix as dashboard.py: lay left/center/right side by side in
+            # mobile landscape instead of letting them keep stacking full
+            # width (ResponsiveRow's 'md' breakpoint is 980, which a phone
+            # rarely crosses even sideways), which was eating most of the
+            # short landscape height.
+            if _is_mobile_landscape(self.page):
+                return ft.Row(
+                    [
+                        ft.Container(content=top_left, expand=4),
+                        ft.Container(content=top_center, expand=2),
+                        ft.Container(content=top_right, expand=6),
+                    ],
+                    spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                )
+            return ft.ResponsiveRow(
                 [
-                    ft.ResponsiveRow(
-                        [
-                            ft.Container(col={"xs": 12, "md": 4}, content=top_left),
-                            ft.Container(col={"xs": 12, "md": 2}, content=top_center),
-                            ft.Container(col={"xs": 12, "md": 6}, content=top_right),
-                        ],
-                        columns=12,
-                        spacing=8,
-                        run_spacing=6,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    ),
-                    modules_row,
+                    ft.Container(col={"xs": 12, "md": 4}, content=top_left),
+                    ft.Container(col={"xs": 12, "md": 2}, content=top_center),
+                    ft.Container(col={"xs": 12, "md": 6}, content=top_right),
                 ],
-                spacing=10,
-                tight=True,
-            ),
+                columns=12,
+                spacing=8,
+                run_spacing=6,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            )
+
+        _sa_header_inner_column = ft.Column(
+            [_build_sa_shell_header_row(), modules_row],
+            spacing=10,
+            tight=True,
+        )
+
+        header = ft.Container(
+            content=_sa_header_inner_column,
             padding=ft.padding.symmetric(
                 horizontal=12,
-                vertical=(8 if is_small_header else 10),
+                vertical=(4 if _is_mobile_landscape(self.page) else (8 if is_small_header else 10)),
             ),
             bgcolor=_bar_color,
             border_radius=12,
@@ -1299,6 +1328,24 @@ class SuperAdminDashboard:
         self._sa_header_ref = header
         self._sa_modules_row_ref = modules_row
         self._rebuild_sa_nav_buttons()
+
+        def _on_sa_shell_resized(_e=None):
+            try:
+                if not _is_mobile_device(self.page):
+                    return
+                _sa_header_inner_column.controls = [
+                    _build_sa_shell_header_row(),
+                    modules_row,
+                ]
+                header.padding = ft.padding.symmetric(
+                    horizontal=12,
+                    vertical=(4 if _is_mobile_landscape(self.page) else 8),
+                )
+                header.update()
+            except Exception:
+                logger.exception("superadmin shell header resize reflow failed")
+
+        _register_resize_listener(self.page, "sa_shell_header", _on_sa_shell_resized)
 
         self.page.add(
             self._wrap_with_background(

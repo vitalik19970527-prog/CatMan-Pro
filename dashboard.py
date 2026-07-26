@@ -2868,11 +2868,24 @@ class MainDashboard:
                 except Exception:
                     logger.exception("Back to superadmin failed")
 
+            from views.mobile_layout_helpers import (
+                is_mobile as _is_mobile_device,
+                is_mobile_landscape as _is_mobile_landscape,
+                register_resize_listener as _register_resize_listener,
+            )
+
             page_w = int(getattr(self.page, "width", 0) or 0)
             if page_w <= 0:
                 win = getattr(self.page, "window", None)
                 page_w = int(getattr(win, "width", 0) or 0) if win else 0
-            is_small_header = bool(page_w > 0 and page_w < 980)
+            # On a phone, always use the compact header sizing regardless of
+            # orientation -- deriving it purely from page_w<980 meant a
+            # landscape phone (width can pass 980 on some devices) would
+            # switch to desktop-sized buttons/fonts that don't fit the much
+            # shorter landscape height.
+            is_small_header = bool(
+                _is_mobile_device(self.page) or (page_w > 0 and page_w < 980)
+            )
 
             title_size = 14 if is_small_header else 16
             subtitle_size = 11 if is_small_header else 12
@@ -3095,37 +3108,68 @@ class MainDashboard:
                 alignment=ft.MainAxisAlignment.END,
             )
 
-            header = ft.Container(
-                content=ft.Column(
+            def _build_shell_header_row():
+                # In mobile landscape the width comfortably fits all three
+                # blocks side by side, but stays under the 980 'md' breakpoint
+                # ResponsiveRow uses -- so left/center/right would otherwise
+                # keep stacking full-width on top of each other (three extra
+                # full-width rows), which is the main reason the shell ate
+                # 80-90% of a short landscape screen. Lay them out in one Row
+                # instead whenever we know it's a mobile device in landscape.
+                if _is_mobile_landscape(self.page):
+                    return ft.Row(
+                        [
+                            ft.Container(content=top_left, expand=4),
+                            ft.Container(content=top_center, expand=2),
+                            ft.Container(content=top_right, expand=6),
+                        ],
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    )
+                return ft.ResponsiveRow(
                     [
-                        ft.ResponsiveRow(
-                            [
-                                ft.Container(col={"xs": 12, "md": 4}, content=top_left),
-                                ft.Container(
-                                    col={"xs": 12, "md": 2}, content=top_center
-                                ),
-                                ft.Container(
-                                    col={"xs": 12, "md": 6}, content=top_right
-                                ),
-                            ],
-                            columns=12,
-                            spacing=8,
-                            run_spacing=6,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        )
+                        ft.Container(col={"xs": 12, "md": 4}, content=top_left),
+                        ft.Container(col={"xs": 12, "md": 2}, content=top_center),
+                        ft.Container(col={"xs": 12, "md": 6}, content=top_right),
                     ],
-                    spacing=6,
-                    tight=True,
-                ),
+                    columns=12,
+                    spacing=8,
+                    run_spacing=6,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                )
+
+            _header_inner_column = ft.Column(
+                [_build_shell_header_row()],
+                spacing=6,
+                tight=True,
+            )
+
+            header = ft.Container(
+                content=_header_inner_column,
                 padding=ft.padding.symmetric(
                     horizontal=14,
-                    vertical=(8 if is_small_header else 10),
+                    vertical=(4 if _is_mobile_landscape(self.page) else (8 if is_small_header else 10)),
                 ),
                 bgcolor=_bar_color,
                 border_radius=15,
                 margin=ft.margin.only(bottom=4),
             )
             self._header_container_ref = header
+
+            def _on_shell_resized(_e=None):
+                try:
+                    if not _is_mobile_device(self.page):
+                        return
+                    _header_inner_column.controls = [_build_shell_header_row()]
+                    header.padding = ft.padding.symmetric(
+                        horizontal=14,
+                        vertical=(4 if _is_mobile_landscape(self.page) else 8),
+                    )
+                    header.update()
+                except Exception:
+                    logger.exception("shell header resize reflow failed")
+
+            _register_resize_listener(self.page, "shell_header", _on_shell_resized)
 
             module_controls = [
                 self._menu_btn(ft.Icons.CATEGORY, self.t("nav.categories", "Категорії"), self.show_categories_brands, nav_key="categories"),

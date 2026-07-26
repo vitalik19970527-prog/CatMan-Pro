@@ -1356,6 +1356,14 @@ class DataManager:
             "CREATE INDEX IF NOT EXISTS ix_supplier_settlements_ts ON supplier_settlements USING btree (ts);",
             # Legacy DBs created before note column was added (CREATE TABLE IF NOT EXISTS skips new columns).
             "ALTER TABLE supplier_settlements ADD COLUMN IF NOT EXISTS note text;",
+            # manager_id pins a settlement row to whoever created it, so a later
+            # category/node ownership transfer (transfer_manager_access) can't
+            # silently reattribute historical balances to the new owner --
+            # visibility is partitioned in get_supplier_settlements() using this
+            # column plus the *current* entity_owners set for the supplier
+            # (shared/joint access = shared pool, exclusive access = solo).
+            "ALTER TABLE supplier_settlements ADD COLUMN IF NOT EXISTS manager_id character varying;",
+            "CREATE INDEX IF NOT EXISTS ix_supplier_settlements_manager_id ON supplier_settlements USING btree (manager_id);",
             # Media Plan entries (product-centric: one row per product/group, multiple dates as jsonb)
             """
             CREATE TABLE IF NOT EXISTS media_plan_entries (
@@ -8991,6 +8999,21 @@ class DataManager:
         has_data = cols_info["has_data"]
         has_manager_id = cols_info["has_manager_id"]
 
+        # Resolve the manager's current scope BEFORE the SQL fetch (not after)
+        # so we can pre-filter to "suppliers I currently see" OR "settlements
+        # I personally created" in one query, instead of fetching every
+        # manager's rows for the company. See the post-fetch partitioning
+        # below for why a plain "manager_id=mid OR manager_id IS NULL" filter
+        # was wrong: it let a since-transferred supplier's history follow
+        # whoever currently owns it, and it hid the original creator's own
+        # rows from their own view once they lost that ownership.
+        visible_ctx = None
+        allowed_supplier_ids: set[str] = set()
+        if mid:
+            visible_ctx = self._get_manager_visible_scope_context(cid, mid, rid or None)
+            if visible_ctx.get("restricted"):
+                allowed_supplier_ids = set(visible_ctx.get("supplier_ids") or set())
+
         with self._pg().cursor() as cur:
             select_cols = [
                 "id",
@@ -9010,6 +9033,8 @@ class DataManager:
                 select_cols.append("data")
             if has_ts:
                 select_cols.append("ts")
+            if has_manager_id:
+                select_cols.append("manager_id")
             select_cols.extend(["created_at", "updated_at"])
 
             q = f"""
@@ -9021,8 +9046,12 @@ class DataManager:
             if rid:
                 q += " AND region_id=%s"
                 params.append(rid)
-            if mid and has_manager_id:
-                q += " AND (manager_id=%s OR manager_id IS NULL)"
+            if mid and has_manager_id and visible_ctx is not None and visible_ctx.get("restricted"):
+                # Own rows are always fetched (own history survives losing the
+                # supplier's scope); everything else only if the supplier is
+                # currently in view (candidates for the joint-pool check below).
+                q += " AND (supplier_id = ANY(%s) OR manager_id = %s)"
+                params.append(sorted(allowed_supplier_ids))
                 params.append(mid)
             if has_ts:
                 q += " ORDER BY ts DESC, updated_at DESC"
@@ -9064,17 +9093,90 @@ class DataManager:
                 if dc:
                     merged["comment"] = dc
             out.append(merged)
-        if mid:
-            visible_ctx = self._get_manager_visible_scope_context(cid, mid, rid or None)
-            if visible_ctx.get("restricted"):
-                allowed_supplier_ids = visible_ctx.get("supplier_ids") or set()
-                out = [
-                    row
-                    for row in out
-                    if isinstance(row, dict)
-                    and str(row.get("supplier_id") or "").strip()
-                    in allowed_supplier_ids
-                ]
+        if mid and visible_ctx is not None and visible_ctx.get("restricted"):
+            candidate_supplier_ids = {
+                str(row.get("supplier_id") or "").strip()
+                for row in out
+                if isinstance(row, dict) and row.get("supplier_id")
+            }
+            owner_sets = (
+                self._get_supplier_owner_sets(cid, candidate_supplier_ids)
+                if has_manager_id
+                else {}
+            )
+            filtered = []
+            for row in out:
+                if not isinstance(row, dict):
+                    continue
+                sid = str(row.get("supplier_id") or "").strip()
+                row_mid = str(row.get("manager_id") or "").strip() if has_manager_id else ""
+                if row_mid == mid:
+                    # Always see your own settlement history, even for a
+                    # supplier/category you no longer currently own (a
+                    # category transfer must not erase who actually paid).
+                    filtered.append(row)
+                    continue
+                if sid not in allowed_supplier_ids:
+                    # Not your own row, and this supplier isn't in your
+                    # current scope at all -- never visible.
+                    continue
+                if not row_mid:
+                    # Legacy row with no creator pin (or manager_id column not
+                    # present yet on this DB) -- fall back to the old
+                    # "follows current scope" behavior so existing data isn't
+                    # hidden outright.
+                    filtered.append(row)
+                    continue
+                owners = owner_sets.get(sid) or set()
+                if len(owners) > 1 and mid in owners and row_mid in owners:
+                    # Supplier is currently under joint/shared access and both
+                    # the viewer and the row's creator are among the current
+                    # co-owners -- shared pool, everyone sees everyone's rows.
+                    filtered.append(row)
+                # Otherwise: sid is in scope but the row belongs to a manager
+                # who isn't a current co-owner (e.g. the previous exclusive
+                # owner after a "move" transfer) -- their history stays
+                # theirs, not visible to the new owner.
+            out = filtered
+        return out
+
+    def _get_supplier_owner_sets(
+        self, company_id: str, supplier_ids: set[str] | list[str]
+    ) -> dict[str, set[str]]:
+        """Current entity_owners manager-id set for each given supplier id.
+
+        Used only to decide settlement-row visibility for shared/joint
+        access (see get_supplier_settlements): a supplier with 2+ current
+        owners is a "joint" supplier whose settlement history is a shared
+        pool between exactly those owners.
+        """
+        ids = sorted({str(x).strip() for x in (supplier_ids or []) if str(x).strip()})
+        if not ids or not self._use_postgres():
+            return {}
+        cid = str(company_id or "").strip()
+        if not cid:
+            return {}
+        out: dict[str, set[str]] = {}
+        try:
+            with self._pg().cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT entity_id, manager_id
+                    FROM entity_owners
+                    WHERE company_id=%s AND entity_type='supplier' AND entity_id = ANY(%s)
+                    """,
+                    (cid, ids),
+                )
+                for row in cur.fetchall() or []:
+                    if not isinstance(row, dict):
+                        continue
+                    eid = str(row.get("entity_id") or "").strip()
+                    mgr = str(row.get("manager_id") or "").strip()
+                    if eid and mgr:
+                        out.setdefault(eid, set()).add(mgr)
+        except Exception:
+            logger.exception("_get_supplier_owner_sets failed")
+            return {}
         return out
 
     def upsert_supplier_settlement(self, payload: dict) -> bool:
@@ -19605,6 +19707,13 @@ class DataManager:
                     "packaging_context", ctx_owner_map
                 )
 
+        # Ownership just changed (assign/remove/replace_scope_owner all funnel
+        # through here) -- drop the cached per-manager scope context so the
+        # next read (including settlement-visibility partitioning in
+        # get_supplier_settlements) sees the new owner set immediately
+        # instead of a stale pre-transfer scope for the rest of this process's
+        # session cache lifetime.
+        self._invalidate_product_scope_cache(cid)
         return result
 
     def assign_scope_owner(

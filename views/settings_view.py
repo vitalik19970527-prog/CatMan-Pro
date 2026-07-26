@@ -7,6 +7,7 @@ import flet as ft
 import i18n
 
 from logger import logger
+from views.mobile_layout_helpers import apply_no_wrap_subtitle
 from views.number_format import format_grouped, safe_float
 from views.themes import (
     THEMES, THEME_GROUPS, DEFAULT_THEME, build_theme_card,
@@ -3214,11 +3215,11 @@ class SettingsView:
                                     weight="bold",
                                     color=_th_text,
                                 ),
-                                ft.Text(
+                                apply_no_wrap_subtitle(ft.Text(
                                     str(self.user_data.get("full_name") or self.user_data.get("email") or ""),
                                     size=12,
                                     color=_th_muted,
-                                ),
+                                )),
                             ],
                             spacing=1,
                         ),

@@ -27,6 +27,7 @@ def _th_from_view(view) -> dict:
 from config import Config
 import i18n
 from logger import logger
+from views.mobile_layout_helpers import is_mobile
 from views.number_format import format_grouped, safe_float
 from views import product_naming
 
@@ -1967,7 +1968,11 @@ class ProductsView:
             border_radius=10,
             prefix_icon=ft.Icons.SEARCH,
             filled=True,
-            width=420,
+            # A fixed 420px field sits on its own line with nothing to
+            # constrain it — on a ~360-390px-wide phone that overflows the
+            # screen horizontally. Let it size to the available width on
+            # mobile instead; desktop keeps the original fixed width.
+            width=None if is_mobile(self.content_area.page) else 420,
             height=36,
             content_padding=ft.padding.symmetric(horizontal=10, vertical=6),
             text_size=12,
