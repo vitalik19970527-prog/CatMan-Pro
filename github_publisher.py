@@ -252,8 +252,16 @@ class GitHubPublisher:
                 return resp.json(), ""
 
             msg = resp.text or ""
-            if resp.status_code == 422 and "already_exists" in msg:
-                continue  # tag burned by an earlier immutable release, retry
+            if resp.status_code == 422 and (
+                "already_exists" in msg or "immutable" in msg
+            ):
+                # Tag burned by an earlier immutable release -- GitHub has
+                # used at least two different error shapes for this over
+                # time ("already_exists" as well as a "custom" code with
+                # "tag_name was used by an immutable release" wording, seen
+                # even after the old release itself was deleted, since the
+                # tag stays locked independently of the release object).
+                continue
             return None, f"GitHub {resp.status_code} під час створення релізу: {msg[:300]}"
 
         return None, f"Не вдалося підібрати вільний тег на основі '{base_tag}'"
