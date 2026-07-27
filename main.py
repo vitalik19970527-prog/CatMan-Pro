@@ -18,10 +18,10 @@ import httpx
 from packaging.version import Version
 
 import i18n
+import local_pg_manager
 from admin_dashboard import AdminDashboard
 from auth_screen import AuthScreen
 from config import Config
-import local_pg_manager
 from dashboard import MainDashboard
 from database import DataManager
 from logger import logger
@@ -61,7 +61,6 @@ class _NullLock:
 
     def close(self):
         pass
-
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -457,7 +456,7 @@ def _resolve_probe_target():
         parsed = urlparse(endpoint)
         host = (parsed.hostname or "").strip()
         if not host:
-            
+
             return None
         if parsed.port:
             port = int(parsed.port)
@@ -542,9 +541,7 @@ def _scan_toggle_upload_flags(control, toggle_flags, upload_flags, visited=None)
     has_upload = False
     if isinstance(control, ft.IconButton):
         icon_value = str(getattr(control, "icon", "") or "").upper()
-        has_upload = any(
-            kw in icon_value for kw in ("UPLOAD", "IMAGE", "PHOTO")
-        )
+        has_upload = any(kw in icon_value for kw in ("UPLOAD", "IMAGE", "PHOTO"))
 
     for attr in _COMPACT_CHILD_ATTRS:
         try:
@@ -641,9 +638,7 @@ def _compact_control_tree(
                 control.spacing = 6
             else:
                 spacing = getattr(control, "spacing", None)
-                if spacing is None:
-                    control.spacing = 8
-                elif isinstance(spacing, (int, float)) and spacing < 8:
+                if spacing is None or isinstance(spacing, (int, float)) and spacing < 8:
                     control.spacing = 8
 
         if in_dialog and isinstance(control, ft.Row):
@@ -678,21 +673,9 @@ def _compact_control_tree(
 
         if isinstance(control, ft.AlertDialog):
             # Uniform small paddings for all modals.
-            setattr(
-                control,
-                "inset_padding",
-                ft.Padding.symmetric(horizontal=10, vertical=10),
-            )
-            setattr(
-                control,
-                "content_padding",
-                ft.Padding.symmetric(horizontal=10, vertical=8),
-            )
-            setattr(
-                control,
-                "actions_padding",
-                ft.Padding.symmetric(horizontal=10, vertical=8),
-            )
+            control.inset_padding = ft.Padding.symmetric(horizontal=10, vertical=10)
+            control.content_padding = ft.Padding.symmetric(horizontal=10, vertical=8)
+            control.actions_padding = ft.Padding.symmetric(horizontal=10, vertical=8)
             in_dialog = True
     except Exception:
         logger.exception("Dialog control compacting step failed")
@@ -758,7 +741,7 @@ def _install_global_compact_dialogs(page: ft.Page):
 def main(page: ft.Page):
     runtime_id = str(uuid.uuid4())[:8]
     try:
-        setattr(page, "_runtime_id", runtime_id)
+        page._runtime_id = runtime_id
     except Exception:
         pass
 
@@ -897,7 +880,10 @@ def main(page: ft.Page):
                                     ft.Icons.WIFI_OFF, color=ft.Colors.RED_700, size=26
                                 ),
                                 ft.Text(
-                                    i18n.t("app.offline.title", "Немає підключення до мережі"),
+                                    i18n.t(
+                                        "app.offline.title",
+                                        "Немає підключення до мережі",
+                                    ),
                                     size=18,
                                     weight="bold",
                                 ),
@@ -923,20 +909,35 @@ def main(page: ft.Page):
 
     # ── Parser progress floating bar ──────────────────────────────────────────
     _prs_close_btn = ft.IconButton(
-        ft.Icons.CLOSE, icon_color=ft.Colors.WHITE70, icon_size=16, padding=0,
+        ft.Icons.CLOSE,
+        icon_color=ft.Colors.WHITE70,
+        icon_size=16,
+        padding=0,
     )
     _prs_spinner = ft.ProgressRing(
-        width=16, height=16, stroke_width=2, color=ft.Colors.WHITE,
+        width=16,
+        height=16,
+        stroke_width=2,
+        color=ft.Colors.WHITE,
     )
     _prs_status_icon = ft.Icon(
-        ft.Icons.CHECK_CIRCLE, color=ft.Colors.WHITE, size=18, visible=False,
+        ft.Icons.CHECK_CIRCLE,
+        color=ft.Colors.WHITE,
+        size=18,
+        visible=False,
     )
     _prs_title = ft.Text(
-        i18n.t("app.parser_bar.running", "Парсинг..."), size=12, weight="bold", color=ft.Colors.WHITE,
+        i18n.t("app.parser_bar.running", "Парсинг..."),
+        size=12,
+        weight="bold",
+        color=ft.Colors.WHITE,
     )
     _prs_message = ft.Text(
-        "", size=11, color=ft.Colors.with_opacity(0.85, ft.Colors.WHITE),
-        max_lines=2, no_wrap=False,
+        "",
+        size=11,
+        color=ft.Colors.with_opacity(0.85, ft.Colors.WHITE),
+        max_lines=2,
+        no_wrap=False,
     )
     _prs_inner = ft.Container(
         width=320,
@@ -951,8 +952,13 @@ def main(page: ft.Page):
         content=ft.Column(
             [
                 ft.Row(
-                    [_prs_spinner, _prs_status_icon, _prs_title,
-                     ft.Container(expand=True), _prs_close_btn],
+                    [
+                        _prs_spinner,
+                        _prs_status_icon,
+                        _prs_title,
+                        ft.Container(expand=True),
+                        _prs_close_btn,
+                    ],
                     spacing=6,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
@@ -984,12 +990,12 @@ def main(page: ft.Page):
 
     page.overlay.append(_prs_positioned)
     page._parser_is_running = False
-    page._prs_overlay  = _prs_positioned
-    page._prs_spinner  = _prs_spinner
+    page._prs_overlay = _prs_positioned
+    page._prs_spinner = _prs_spinner
     page._prs_status_icon = _prs_status_icon
-    page._prs_title    = _prs_title
-    page._prs_message  = _prs_message
-    page._prs_inner    = _prs_inner
+    page._prs_title = _prs_title
+    page._prs_message = _prs_message
+    page._prs_inner = _prs_inner
     page._hide_parser_bar = _hide_parser_bar
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -1016,7 +1022,9 @@ def main(page: ft.Page):
                         offline_overlay.visible = False
                         page.snack_bar = ft.SnackBar(
                             ft.Text(
-                                i18n.t("app.offline.reconnected", "З'єднання відновлено"),
+                                i18n.t(
+                                    "app.offline.reconnected", "З'єднання відновлено"
+                                ),
                                 color=ft.Colors.WHITE,
                                 weight="bold",
                             ),
@@ -1057,7 +1065,9 @@ def main(page: ft.Page):
             "", size=12, color=ft.Colors.BLUE_GREY_700, visible=False
         )
         status_text = ft.Text(
-            i18n.t("app.update.blocked_notice", "Без оновлення вхід у систему заблоковано."),
+            i18n.t(
+                "app.update.blocked_notice", "Без оновлення вхід у систему заблоковано."
+            ),
             size=13,
             color="grey700",
             text_align=ft.TextAlign.CENTER,
@@ -1155,7 +1165,9 @@ def main(page: ft.Page):
             progress_bar.visible = True
             progress_text.visible = True
             progress_bar.value = 0
-            status_text.value = i18n.t("app.update.preparing", "Підготовка до завантаження...")
+            status_text.value = i18n.t(
+                "app.update.preparing", "Підготовка до завантаження..."
+            )
             page.update()
 
             try:
@@ -1167,7 +1179,9 @@ def main(page: ft.Page):
                 async with httpx.AsyncClient(
                     follow_redirects=True, timeout=timeout
                 ) as client:
-                    status_text.value = i18n.t("app.update.searching", "Пошук файлу оновлення...")
+                    status_text.value = i18n.t(
+                        "app.update.searching", "Пошук файлу оновлення..."
+                    )
                     page.update()
 
                     resolved_url = await _resolve_download_url(
@@ -1195,7 +1209,9 @@ def main(page: ft.Page):
 
                         downloaded = 0
                         last_ui_update = 0.0
-                        status_text.value = i18n.t("app.update.downloading", "Завантаження оновлення...")
+                        status_text.value = i18n.t(
+                            "app.update.downloading", "Завантаження оновлення..."
+                        )
                         if total_bytes <= 0:
                             progress_bar.value = None
 
@@ -1216,7 +1232,8 @@ def main(page: ft.Page):
                                         progress_text.value = f"{int(ratio * 100)}% ({_format_bytes(downloaded)} / {_format_bytes(total_bytes)})"
                                     else:
                                         progress_text.value = i18n.t(
-                                            "app.update.downloaded_amount", "Завантажено: {amount}"
+                                            "app.update.downloaded_amount",
+                                            "Завантажено: {amount}",
                                         ).format(amount=_format_bytes(downloaded))
                                     page.update()
                                     last_ui_update = now
@@ -1246,7 +1263,9 @@ def main(page: ft.Page):
                                 content_type,
                             )
 
-                status_text.value = i18n.t("app.update.installing", "Запуск установки...")
+                status_text.value = i18n.t(
+                    "app.update.installing", "Запуск установки..."
+                )
                 progress_text.value = i18n.t(
                     "app.update.installer_launched",
                     "Інсталятор запущено. Підтвердіть UAC і дочекайтесь завершення.",
@@ -1267,11 +1286,13 @@ def main(page: ft.Page):
                         "прямий URL на інсталятор.",
                     )
                 else:
-                    message = i18n.t("app.update.err_http", "HTTP помилка {status}: {exc}").format(
-                        status=status or "?", exc=exc
-                    )
+                    message = i18n.t(
+                        "app.update.err_http", "HTTP помилка {status}: {exc}"
+                    ).format(status=status or "?", exc=exc)
 
-                status_text.value = i18n.t("app.update.err_install_failed", "Не вдалося встановити оновлення")
+                status_text.value = i18n.t(
+                    "app.update.err_install_failed", "Не вдалося встановити оновлення"
+                )
                 progress_text.value = message
                 page.snack_bar = ft.SnackBar(
                     ft.Text(message),
@@ -1284,11 +1305,15 @@ def main(page: ft.Page):
                 download_button.disabled = False
             except Exception as exc:
                 logger.exception("Update download/install failed")
-                status_text.value = i18n.t("app.update.err_install_failed", "Не вдалося встановити оновлення")
+                status_text.value = i18n.t(
+                    "app.update.err_install_failed", "Не вдалося встановити оновлення"
+                )
                 progress_text.value = str(exc)
                 page.snack_bar = ft.SnackBar(
                     ft.Text(
-                        i18n.t("app.update.err_generic", "Помилка оновлення: {exc}").format(exc=exc)
+                        i18n.t(
+                            "app.update.err_generic", "Помилка оновлення: {exc}"
+                        ).format(exc=exc)
                     ),
                     bgcolor=ft.Colors.RED_700,
                     duration=3500,
@@ -1305,7 +1330,11 @@ def main(page: ft.Page):
             url = _normalize_url(download_url)
             if not url:
                 page.snack_bar = ft.SnackBar(
-                    ft.Text(i18n.t("app.update.err_no_link", "Посилання на оновлення відсутнє")),
+                    ft.Text(
+                        i18n.t(
+                            "app.update.err_no_link", "Посилання на оновлення відсутнє"
+                        )
+                    ),
                     bgcolor=ft.Colors.RED_700,
                     duration=1800,
                 )
@@ -1345,7 +1374,10 @@ def main(page: ft.Page):
                                             color=ft.Colors.BLUE_700,
                                         ),
                                         ft.Text(
-                                            i18n.t("app.update.title", "Потрібне оновлення застосунку"),
+                                            i18n.t(
+                                                "app.update.title",
+                                                "Потрібне оновлення застосунку",
+                                            ),
                                             size=24,
                                             weight="bold",
                                         ),
@@ -1353,7 +1385,10 @@ def main(page: ft.Page):
                                             i18n.t(
                                                 "app.update.version_info",
                                                 "Поточна версія: {current}\nМінімально допустима: {required}",
-                                            ).format(current=Config.APP_VERSION, required=min_required),
+                                            ).format(
+                                                current=Config.APP_VERSION,
+                                                required=min_required,
+                                            ),
                                             size=14,
                                             text_align=ft.TextAlign.CENTER,
                                         ),
@@ -1469,7 +1504,7 @@ def main(page: ft.Page):
         )
         try:
             stack_hint = " | ".join(
-                (line.strip() for line in traceback.format_stack(limit=5)[-4:])
+                line.strip() for line in traceback.format_stack(limit=5)[-4:]
             )
         except Exception:
             stack_hint = ""
@@ -1561,7 +1596,10 @@ def main(page: ft.Page):
             page.clean()
             page.add(
                 ft.Text(
-                    i18n.t("app.error.return_to_login", "Помилка повернення до входу: {exc}").format(exc=ex),
+                    i18n.t(
+                        "app.error.return_to_login",
+                        "Помилка повернення до входу: {exc}",
+                    ).format(exc=ex),
                     color="red",
                 )
             )
@@ -1671,6 +1709,7 @@ def main(page: ft.Page):
                     # Start GSM parser local scheduler for SA
                     try:
                         import gsm_scheduler
+
                         _sched_db = DataManager()
 
                         def _get_sched_cfg() -> dict:
