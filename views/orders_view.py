@@ -9581,9 +9581,35 @@ class OrdersView:
                 text_color=status_fg,
             )
 
+            # Narrow to this order's supplier's enabled delivery methods
+            # (set in Постачальники) when it has restricted any — unset on
+            # the supplier means unrestricted, same as before this existed.
+            _dm_supplier_id = str(draft_order.get("supplier_id") or "").strip()
+            _dm_supplier_row = (
+                (self._suppliers_by_id or {}).get(_dm_supplier_id)
+                if _dm_supplier_id
+                else None
+            )
+            _dm_enabled_ids = (
+                _dm_supplier_row.get("enabled_delivery_method_ids")
+                if isinstance(_dm_supplier_row, dict)
+                else None
+            )
+            _dm_restricted = (
+                isinstance(_dm_enabled_ids, list) and len(_dm_enabled_ids) > 0
+            )
+            _dm_methods = (
+                [
+                    m
+                    for m in (self._delivery_methods or [])
+                    if isinstance(m, dict) and m.get("id") in _dm_enabled_ids
+                ]
+                if _dm_restricted
+                else (self._delivery_methods or [])
+            )
             delivery_options = [
                 ft.dropdown.Option(str(m.get("id") or ""), str(m.get("name") or ""))
-                for m in (self._delivery_methods or [])
+                for m in _dm_methods
                 if isinstance(m, dict) and (m.get("id") or "")
             ]
             current_delivery_id = str(
@@ -12219,6 +12245,73 @@ class OrdersView:
                 lookup_state.update(fresh)
             _refresh_region_lookups(region_id, use_existing_lookup_state=True)
 
+        def _refresh_delivery_options_for_supplier(selected_supplier_id: str = None):
+            """Narrow delivery_dd's options to the methods the selected
+            supplier's goods actually ship by (supplier.enabled_delivery_method_ids —
+            set in the Постачальники edit dialog). Unset/empty on the supplier
+            means unrestricted, same as before this existed.
+
+            Never removes the CURRENTLY selected value from the options list,
+            even if it wouldn't otherwise pass the filter — an order that
+            already has a delivery type chosen (created before this
+            restriction, or before the supplier was changed) must never have
+            that selection silently cleared just by opening the dialog.
+            """
+            sid = str(selected_supplier_id or supplier_dd.value or "").strip()
+            supplier_row = (
+                next(
+                    (
+                        s
+                        for s in (lookup_state["suppliers"] or [])
+                        if isinstance(s, dict) and str(s.get("id") or "") == sid
+                    ),
+                    None,
+                )
+                if sid
+                else None
+            )
+            enabled_ids = (
+                supplier_row.get("enabled_delivery_method_ids")
+                if isinstance(supplier_row, dict)
+                else None
+            )
+            restricted = isinstance(enabled_ids, list) and len(enabled_ids) > 0
+            all_methods = lookup_state["delivery_methods"] or []
+            methods = (
+                [
+                    m
+                    for m in all_methods
+                    if isinstance(m, dict) and m.get("id") in enabled_ids
+                ]
+                if restricted
+                else list(all_methods)
+            )
+            current_val = str(delivery_dd.value or "").strip()
+            if current_val and not any(
+                str((m or {}).get("id") or "") == current_val for m in methods
+            ):
+                kept = next(
+                    (
+                        m
+                        for m in all_methods
+                        if isinstance(m, dict)
+                        and str(m.get("id") or "") == current_val
+                    ),
+                    None,
+                )
+                if kept:
+                    methods = [kept] + methods
+            new_options = [ft.dropdown.Option("", "— Тип доставки —")]
+            for m in methods:
+                mid = m.get("id", "")
+                mname = m.get("name", "")
+                price, ccy = self._delivery_method_tariff(m)
+                lbl = f"{mname} ({price} {ccy}/кг)" if price else mname
+                new_options.append(ft.dropdown.Option(mid, lbl))
+            delivery_dd.options = new_options
+            with contextlib.suppress(Exception):
+                delivery_dd.update()
+
         def _refresh_products_for_supplier_selection(selected_supplier_id: str = None):
             _load_products_for_supplier(selected_supplier_id)
             product_options = _product_dd_options()
@@ -12235,6 +12328,7 @@ class OrdersView:
                     idata["ccy_dd"].update()
                 except Exception:
                     pass
+            _refresh_delivery_options_for_supplier(selected_supplier_id)
 
         async def _refresh_products_for_supplier_selection_async(
             selected_supplier_id: str = None,
@@ -12257,6 +12351,7 @@ class OrdersView:
                     idata["ccy_dd"].update()
                 except Exception:
                     pass
+            _refresh_delivery_options_for_supplier(selected_supplier_id)
 
         def supplier_refresh_handler(e):
             selected_supplier_id = str(
@@ -12287,6 +12382,12 @@ class OrdersView:
         supplier_dd.on_select = supplier_refresh_handler
         region_dd.on_change = region_refresh_handler
         region_dd.on_select = region_refresh_handler
+
+        # Initial filter for the currently selected supplier (existing order
+        # being edited, or a supplier pre-filled on a new one) — never clears
+        # delivery_dd.value, only narrows/reorders the option list.
+        with contextlib.suppress(Exception):
+            _refresh_delivery_options_for_supplier(supplier_dd.value)
 
         date_shipped_f = ft.TextField(
             label=self.t("orders.field.ship_date", "Дата відправки"),

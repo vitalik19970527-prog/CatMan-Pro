@@ -3926,12 +3926,28 @@ class ProductsView:
                 spacing=2,
             )
 
+        # Narrow the cost-price/margin table down to only the delivery
+        # methods this product's supplier actually ships by (set on the
+        # supplier, "Якими способами доставки веземо товар цього
+        # постачальника") — an unset/empty list on the supplier means
+        # unrestricted (every region method applies, same as before this
+        # feature existed), so untouched suppliers keep showing everything.
+        _supplier_ctx = (
+            product.get("supplier") if isinstance(product.get("supplier"), dict) else {}
+        )
+        _supplier_enabled_ids = _supplier_ctx.get("enabled_delivery_method_ids")
+        _supplier_restricted = (
+            isinstance(_supplier_enabled_ids, list) and len(_supplier_enabled_ids) > 0
+        )
         selected_delivery_ids = set()
         for method in self.db.get_effective_delivery_methods_for_manager(
             company_id, self.manager_id, product_region_id
         ):
-            if isinstance(method, dict) and method.get("id"):
-                selected_delivery_ids.add(method.get("id"))
+            if not isinstance(method, dict) or not method.get("id"):
+                continue
+            if _supplier_restricted and method.get("id") not in _supplier_enabled_ids:
+                continue
+            selected_delivery_ids.add(method.get("id"))
         profitability_controls = self._profitability_controls(
             product, selected_delivery_ids
         )
