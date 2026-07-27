@@ -68,6 +68,11 @@ class SuppliersView:
     META_TEXT_SIZE = 12
     EMPTY_TEXT_SIZE = 14
     ALL_REGIONS_KEY = "__all_regions__"
+    # Persists the archive-section collapse toggle across SuppliersView
+    # re-instantiation (a fresh instance is created on every tab load and
+    # every background sync-pulse reload, so a plain `self` attribute would
+    # reset to collapsed every time). Keyed by company_id.
+    _archive_collapsed_by_company: dict = {}
 
     @staticmethod
     def _normalize_currency_code(raw, default="USD"):
@@ -842,12 +847,11 @@ class SuppliersView:
             )
             or []
         )
-        collapsed = getattr(self, "_suppliers_archive_collapsed", True)
+        state_key = str(self.company_id or "")
+        collapsed = SuppliersView._archive_collapsed_by_company.get(state_key, True)
 
         def _toggle(_):
-            self._suppliers_archive_collapsed = not getattr(
-                self, "_suppliers_archive_collapsed", True
-            )
+            SuppliersView._archive_collapsed_by_company[state_key] = not collapsed
             self.load_suppliers()
 
         header = ft.Container(

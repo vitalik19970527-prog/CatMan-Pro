@@ -40,6 +40,15 @@ def _can_manage_company_settings(role):
     }
 
 
+# Persists which collapsible blocks the user has expanded across rebuilds of
+# this view (SettingsView is re-instantiated on every tab switch/sync-pulse
+# refresh, so per-instance state would reset to `initially_open` every time —
+# see build_collapsible_block below). Keyed by (company_id, title); resets on
+# app restart, which is fine since the goal is just "stay open until the user
+# collapses it themselves" within a session.
+_collapsible_open_state: dict = {}
+
+
 class SettingsView:
     def __init__(self, content_area, user_data, db):
         self.content_area = content_area
@@ -192,6 +201,51 @@ class SettingsView:
         _th_border = _th["border"]
         _th_ok     = _th["ok"]
         _th_err    = _th["err"]
+
+        def build_collapsible_block(
+            title, controls, initially_open=False, visible=True, key_prefix=""
+        ):
+            # key_prefix disambiguates the persisted open/closed state when the
+            # same visible title (e.g. a bare region name) is reused for
+            # unrelated nested blocks under different parent sections.
+            state_key = (self.company_id, key_prefix, title)
+            is_open = _collapsible_open_state.get(state_key, initially_open)
+            body = ft.Column(controls, spacing=8, visible=is_open)
+            toggle_btn = ft.TextButton(
+                title,
+                icon=(
+                    ft.Icons.KEYBOARD_ARROW_DOWN
+                    if is_open
+                    else ft.Icons.KEYBOARD_ARROW_RIGHT
+                ),
+                style=ft.ButtonStyle(
+                    color=_th_icon,
+                    padding=ft.padding.symmetric(horizontal=0, vertical=0),
+                ),
+            )
+
+            def toggle(_):
+                body.visible = not body.visible
+                _collapsible_open_state[state_key] = body.visible
+                toggle_btn.icon = (
+                    ft.Icons.KEYBOARD_ARROW_DOWN
+                    if body.visible
+                    else ft.Icons.KEYBOARD_ARROW_RIGHT
+                )
+                self.content_area.update()
+
+            toggle_btn.on_click = toggle
+            return ft.Container(
+                visible=visible,
+                padding=14,
+                bgcolor=_th_panel,
+                border=ft.border.all(1, _th_border),
+                border_radius=8,
+                content=ft.Column(
+                    [toggle_btn, body],
+                    spacing=6,
+                ),
+            )
 
         settings_layout = {
             "delivery_name_w": 320,
@@ -637,9 +691,14 @@ class SettingsView:
             else {}
         )
         payment_override_rows = []
-        company_delivery_rows = []
         manager_delivery_rows = []
-        company_delivery_rows_container = ft.Column(spacing=8)
+        # Company-wide delivery methods are configured separately PER REGION —
+        # each region gets its own row list/container, all shown at once (see
+        # delivery_region_blocks below), instead of one shared list scoped to
+        # whichever region the editing admin currently has active. Keyed by
+        # region_id.
+        company_delivery_rows_by_region: dict = {}
+        company_delivery_containers_by_region: dict = {}
 
         def build_company_delivery_row(row):
             controls = []
@@ -656,13 +715,15 @@ class SettingsView:
                 controls.append(row["remove_btn"])
             return ft.Row(controls, spacing=10, wrap=True)
 
-        def refresh_company_delivery_rows():
-            if company_delivery_rows:
-                company_delivery_rows_container.controls = [
-                    build_company_delivery_row(row) for row in company_delivery_rows
-                ]
+        def refresh_company_delivery_rows_for(rid):
+            rows = company_delivery_rows_by_region.get(rid) or []
+            container = company_delivery_containers_by_region.get(rid)
+            if container is None:
+                return
+            if rows:
+                container.controls = [build_company_delivery_row(row) for row in rows]
             else:
-                company_delivery_rows_container.controls = [
+                container.controls = [
                     ft.Text("Способи доставки не налаштовані", color=_th_muted, size=12)
                 ]
             if self.content_area and self.content_area.page:
@@ -676,6 +737,7 @@ class SettingsView:
             base_price,
             price_currency="USD",
             delivery_term_days=None,
+            region_id=None,
         ):
             name_f = ft.TextField(
                 label="Назва способу" if is_custom else "Спосіб",
@@ -746,27 +808,32 @@ class SettingsView:
                     visible=False,  # requested: no delete in this pricing UI
                 )
 
-                def remove_custom_method(_):
-                    if row in company_delivery_rows:
-                        company_delivery_rows.remove(row)
-                        refresh_company_delivery_rows()
+                def remove_custom_method(_, _rid=region_id):
+                    rows = company_delivery_rows_by_region.get(_rid) or []
+                    if row in rows:
+                        rows.remove(row)
+                        refresh_company_delivery_rows_for(_rid)
 
                 remove_btn.on_click = remove_custom_method
                 row["remove_btn"] = remove_btn
             return row
 
-        def add_custom_delivery_method(_):
-            company_delivery_rows.append(
-                make_company_delivery_row(
-                    mid=f"custom_{uuid.uuid4().hex[:10]}",
-                    name="",
-                    is_custom=True,
-                    enabled=False,
-                    base_price=None,
-                    price_currency="USD",
+        def add_custom_delivery_method_for(rid):
+            def _add(_):
+                company_delivery_rows_by_region.setdefault(rid, []).append(
+                    make_company_delivery_row(
+                        mid=f"custom_{uuid.uuid4().hex[:10]}",
+                        name="",
+                        is_custom=True,
+                        enabled=False,
+                        base_price=None,
+                        price_currency="USD",
+                        region_id=rid,
+                    )
                 )
-            )
-            refresh_company_delivery_rows()
+                refresh_company_delivery_rows_for(rid)
+
+            return _add
 
         for method in company_delivery_methods:
             if not isinstance(method, dict) or not method.get("id"):
@@ -787,17 +854,6 @@ class SettingsView:
                 and delivery_term_val is None
             ):
                 continue
-
-            row = make_company_delivery_row(
-                mid=mid,
-                name=name_val,
-                is_custom=is_custom,
-                enabled=enabled_val,
-                base_price=base_price_val,
-                price_currency=price_currency_val,
-                delivery_term_days=delivery_term_val,
-            )
-            company_delivery_rows.append(row)
 
             if enabled_val and name_val:
                 override_entry = manager_delivery_overrides.get(mid)
@@ -874,7 +930,216 @@ class SettingsView:
             weight="bold",
         )
 
-        refresh_company_delivery_rows()
+        def _build_payment_field_rows_block(region_id, region_name):
+            """Inline (non-dialog) payment-field-templates editor for ONE region.
+
+            Payment field templates are configured per region (same reasoning
+            as delivery methods below) — each region gets its own block, all
+            shown at once, instead of one shared dialog scoped to whichever
+            region the editing admin currently has active.
+            """
+            cid = self.company_id
+            templates = (
+                self.db.get_company_payment_field_templates(cid, region_id=region_id)
+                or []
+                if cid
+                else []
+            )
+            rows_col = ft.Column(spacing=8)
+
+            def _add_row(name_val="", has_text=True, has_image=False):
+                name_f = ft.TextField(
+                    label="Назва", border_radius=10, value=name_val, width=320
+                )
+                text_cb = ft.Checkbox(label="Текст", value=bool(has_text))
+                img_cb = ft.Checkbox(label="Картинка", value=bool(has_image))
+                del_btn = ft.IconButton(
+                    ft.Icons.DELETE_OUTLINE,
+                    icon_color=ft.Colors.RED_600,
+                    tooltip=self.t("common.delete", "Видалити"),
+                    disabled=self.read_only_subordinate,
+                )
+                row = ft.Row(
+                    [
+                        name_f,
+                        ft.Row([text_cb, img_cb], spacing=6, wrap=True),
+                        del_btn,
+                    ],
+                    spacing=10,
+                    wrap=True,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                )
+                row.data = {"name": name_f, "text": text_cb, "img": img_cb}
+
+                def _del(_):
+                    if row in rows_col.controls:
+                        rows_col.controls.remove(row)
+                        with contextlib.suppress(Exception):
+                            rows_col.update()
+
+                del_btn.on_click = _del
+                rows_col.controls.append(row)
+
+            for t in templates:
+                if isinstance(t, dict):
+                    _add_row(
+                        t.get("name", ""),
+                        bool(t.get("has_text", True)),
+                        bool(t.get("has_image", False)),
+                    )
+
+            if not rows_col.controls:
+                _add_row("SWIFT", True, False)
+                _add_row("AliPay ID", True, True)
+                _add_row("WeChat ID", True, True)
+
+            def _save(_):
+                if not cid:
+                    self._show_snack("Не визначено компанію", "orange")
+                    return
+                try:
+                    payload = []
+                    seen = set()
+                    for idx, r in enumerate(rows_col.controls):
+                        if not isinstance(r, ft.Row) or not getattr(r, "data", None):
+                            continue
+                        name_f = r.data.get("name")
+                        n = (name_f.value or "").strip()
+                        name_f.error_text = None
+                        if not n:
+                            continue
+                        key = n.lower()
+                        if key in seen:
+                            name_f.error_text = "Повтор назви"
+                            self._show_snack(
+                                "Назви платіжних полів не повинні повторюватися", "orange"
+                            )
+                            with contextlib.suppress(Exception):
+                                name_f.update()
+                            return
+                        seen.add(key)
+                        payload.append(
+                            {
+                                "name": n,
+                                "has_text": bool(r.data.get("text").value),
+                                "has_image": bool(r.data.get("img").value),
+                                "order_index": idx,
+                            }
+                        )
+                    ok = self.db.save_company_payment_field_templates(
+                        cid, payload, region_id=region_id
+                    )
+                    if ok:
+                        self._show_snack("Платіжні поля збережено", "green")
+                    else:
+                        self._show_snack(
+                            self.t(
+                                "settings.err.save_payment_fields",
+                                "Не вдалося зберегти платіжні поля",
+                            ),
+                            "red",
+                        )
+                except Exception:
+                    logger.exception("[settings] payment field templates save failed")
+                    self._show_snack(
+                        self.t("settings.err.save_failed", "Не вдалося зберегти"), "red"
+                    )
+
+            return build_collapsible_block(
+                region_name,
+                [
+                    rows_col,
+                    ft.Row(
+                        [
+                            ft.TextButton(
+                                self.t("settings.add_field_btn", "Додати поле"),
+                                icon=ft.Icons.ADD,
+                                on_click=lambda _: (_add_row(), rows_col.update()),
+                                disabled=self.read_only_subordinate,
+                            ),
+                            ft.FilledButton(
+                                self.t("common.save", "Зберегти"),
+                                icon=ft.Icons.SAVE,
+                                on_click=_save,
+                                disabled=self.read_only_subordinate,
+                            ),
+                        ],
+                        spacing=10,
+                        wrap=True,
+                    ),
+                ],
+                initially_open=False,
+                key_prefix="payment_region",
+            )
+
+        # --- Company-wide delivery methods, configured per region ---
+        company_regions_for_settings = [
+            r
+            for r in (self.db.get_company_regions(self.company_id) or [])
+            if isinstance(r, dict) and r.get("id")
+        ]
+        for _reg in company_regions_for_settings:
+            _rid = _reg.get("id")
+            _rows = company_delivery_rows_by_region.setdefault(_rid, [])
+            company_delivery_containers_by_region[_rid] = ft.Column(spacing=8)
+            for method in self.db.get_company_delivery_methods(self.company_id, _rid) or []:
+                if not isinstance(method, dict) or not method.get("id"):
+                    continue
+                r_is_custom = bool(method.get("is_custom"))
+                r_name_val = (method.get("name") or "").strip()
+                r_enabled_val = bool(method.get("enabled"))
+                r_base_price_val = _parse_float_or_none(method.get("base_price_per_kg"))
+                r_delivery_term_val = _parse_float_or_none(
+                    method.get("delivery_term_days")
+                )
+                r_price_currency_val = (method.get("price_currency") or "USD").upper()
+                if (
+                    r_is_custom
+                    and not r_name_val
+                    and not r_enabled_val
+                    and r_base_price_val is None
+                    and r_delivery_term_val is None
+                ):
+                    continue
+                _rows.append(
+                    make_company_delivery_row(
+                        mid=method.get("id"),
+                        name=r_name_val,
+                        is_custom=r_is_custom,
+                        enabled=r_enabled_val,
+                        base_price=r_base_price_val,
+                        price_currency=r_price_currency_val,
+                        delivery_term_days=r_delivery_term_val,
+                        region_id=_rid,
+                    )
+                )
+            refresh_company_delivery_rows_for(_rid)
+
+        delivery_region_blocks = [
+            build_collapsible_block(
+                str(reg.get("name") or reg.get("id")),
+                [
+                    company_delivery_containers_by_region[reg.get("id")],
+                    ft.OutlinedButton(
+                        "Додати спосіб доставки",
+                        icon=ft.Icons.ADD,
+                        on_click=add_custom_delivery_method_for(reg.get("id")),
+                        visible=self.can_manage_company_settings
+                        and not self.read_only_subordinate,
+                    ),
+                ],
+                initially_open=(len(company_regions_for_settings) <= 1),
+                key_prefix="delivery_region",
+            )
+            for reg in company_regions_for_settings
+        ] or [ft.Text("У компанії немає регіонів", size=12, color=_th_muted)]
+
+        payment_templates_region_blocks = [
+            _build_payment_field_rows_block(
+                reg.get("id"), str(reg.get("name") or reg.get("id"))
+            )
+            for reg in company_regions_for_settings
+        ] or [ft.Text("У компанії немає регіонів", size=12, color=_th_muted)]
 
         # Build per-manager payment overrides UI (based on company templates).
         payment_fields_container = ft.Column(spacing=8)
@@ -975,175 +1240,6 @@ class SettingsView:
                     ),
                 )
             )
-
-        def _open_edit_company_payment_templates_dialog():
-            if not self.can_manage_company_settings or self.read_only_subordinate:
-                self._show_snack("Редагування недоступне", "orange")
-                return
-            cid = self.company_id
-            if not cid:
-                self._show_snack("Не визначено компанію", "orange")
-                return
-            templates = (
-                self.db.get_company_payment_field_templates(
-                    cid, region_id=region_id_for_delivery
-                )
-                or []
-            )
-            dlg_w = self._dialog_width(680)
-            rows_col = ft.Column(spacing=8)
-
-            def _add_row(name_val="", has_text=True, has_image=False):
-                name_w = max(260, int(dlg_w) - 120 - 36 - 32)
-                name_f = ft.TextField(
-                    label="Назва", border_radius=10, value=name_val, width=name_w
-                )
-                text_cb = ft.Checkbox(label="Текст", value=bool(has_text))
-                img_cb = ft.Checkbox(label="Картинка", value=bool(has_image))
-                del_btn = ft.IconButton(
-                    ft.Icons.DELETE_OUTLINE,
-                    icon_color=ft.Colors.RED_600,
-                    tooltip=self.t("common.delete", "Видалити"),
-                )
-                row = ft.Row(
-                    [
-                        name_f,
-                        ft.Container(
-                            width=120,
-                            content=ft.Row([text_cb, img_cb], spacing=6, wrap=True),
-                        ),
-                        ft.Container(
-                            width=36, alignment=ft.Alignment.CENTER, content=del_btn
-                        ),
-                    ],
-                    spacing=8,
-                    width=dlg_w,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                )
-                row.data = {"name": name_f, "text": text_cb, "img": img_cb}
-
-                def _del(_):
-                    if row in rows_col.controls:
-                        rows_col.controls.remove(row)
-                        with contextlib.suppress(Exception):
-                            rows_col.update()
-
-                del_btn.on_click = _del
-                rows_col.controls.append(row)
-
-            for t in templates:
-                if isinstance(t, dict):
-                    _add_row(
-                        t.get("name", ""),
-                        bool(t.get("has_text", True)),
-                        bool(t.get("has_image", False)),
-                    )
-
-            if not rows_col.controls:
-                _add_row("SWIFT", True, False)
-                _add_row("AliPay ID", True, True)
-                _add_row("WeChat ID", True, True)
-
-            def _save(_):
-                try:
-                    payload = []
-                    seen = set()
-                    for idx, r in enumerate(rows_col.controls):
-                        if not isinstance(r, ft.Row) or not getattr(r, "data", None):
-                            continue
-                        name_f = r.data.get("name")
-                        n = (name_f.value or "").strip()
-                        name_f.error_text = None
-                        if not n:
-                            continue
-                        key = n.lower()
-                        if key in seen:
-                            name_f.error_text = "Повтор назви"
-                            self._show_snack(
-                                "Назви платіжних полів не повинні повторюватися", "orange"
-                            )
-                            with contextlib.suppress(Exception):
-                                name_f.update()
-                            return
-                        seen.add(key)
-                        payload.append(
-                            {
-                                "name": n,
-                                "has_text": bool(r.data.get("text").value),
-                                "has_image": bool(r.data.get("img").value),
-                                "order_index": idx,
-                            }
-                        )
-                    ok = self.db.save_company_payment_field_templates(
-                        cid, payload, region_id=region_id_for_delivery
-                    )
-                    if ok:
-                        # refresh local state for current settings session
-                        nonlocal company_payment_templates
-                        company_payment_templates = (
-                            self.db.get_company_payment_field_templates(
-                                cid, region_id=region_id_for_delivery
-                            )
-                            or []
-                        )
-                        self._close_dialog(dlg)
-                        self.content_area.page.show_dialog(success_dlg)
-                        self._build_deferred()
-                    else:
-                        self._show_snack(self.t("settings.err.save_payment_fields", "Не вдалося зберегти платіжні поля"), "red")
-                except Exception:
-                    logger.exception("[settings] payment field templates save failed")
-                    self._show_snack(self.t("settings.err.save_failed", "Не вдалося зберегти"), "red")
-
-            def _pf_help(_):
-                from views.help_utils import show_modal_help
-                show_modal_help(self.content_area.page, "Платіжні поля постачальників", [
-                    self.t("settings.pf_help.step1", "1. Введіть назву поля (наприклад, SWIFT, Alipay)."),
-                    self.t("settings.pf_help.step2", "2. Додайте поля кнопкою «Додати поле»."),
-                    self.t("settings.pf_help.step3", "3. Видаліть непотрібне поле іконкою кошика."),
-                    self.t("settings.pf_help.step4", "4. Натисніть «Зберегти»."),
-                ])
-
-            dlg = ft.AlertDialog(
-                title=ft.Row(
-                    [
-                        ft.Text("Платіжні поля постачальників (компанія)", expand=True),
-                        ft.IconButton(icon=ft.Icons.HELP_OUTLINE, icon_size=16, tooltip=self.t("common.help.tooltip", "Довідка"), on_click=_pf_help),
-                    ],
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER, tight=True,
-                ),
-                content=ft.Container(
-                    width=dlg_w,
-                    content=ft.Column(
-                        [
-                            ft.Text(
-                                self.t("settings.payment_fields_hint", "Налаштуйте поля, які можуть заповнюватися у постачальниках."),
-                                size=12,
-                                color=_th_muted,
-                            ),
-                            rows_col,
-                            ft.TextButton(
-                                self.t("settings.add_field_btn", "Додати поле"),
-                                icon=ft.Icons.ADD,
-                                on_click=lambda _: (
-                                    _add_row(),
-                                    rows_col.update(),
-                                ),
-                            ),
-                        ],
-                        spacing=8,
-                        tight=True,
-                        scroll=ft.ScrollMode.ADAPTIVE,
-                    ),
-                ),
-                actions=[
-                    ft.TextButton(
-                        self.t("common.cancel", "Скасувати"), on_click=lambda _: self._close_dialog(dlg)
-                    ),
-                    ft.FilledButton(self.t("common.save", "Зберегти"), on_click=_save),
-                ],
-            )
-            self.content_area.page.show_dialog(dlg)
 
         def create_region_card(name="", prices=None, is_first=False):
             """Створює картку регіону з вибором валюти окремо для кожної ціни"""
@@ -1847,21 +1943,19 @@ class SettingsView:
             value="Категорійний менеджер",
         )
         user_parent_f = ft.Dropdown(label="Керівник", border_radius=10, options=[])
-        # A bare Column carrying both a fixed height AND its own scroll,
-        # nested inside this page's outer scrolling Column, renders as an
-        # empty grey block in this Flet version (same bug class as the
-        # expand=True issue noted elsewhere in this file). Wrapping it in a
-        # Container that owns the fixed height, with the Column only owning
-        # the scroll, keeps the bounded-height list working without it.
-        user_regions_checks_block = ft.Column(spacing=4, scroll=ft.ScrollMode.ADAPTIVE)
-        user_regions_checks_host = ft.Container(
-            height=120, content=user_regions_checks_block
-        )
+        # A Column with its own height=/scroll=ADAPTIVE, nested inside this
+        # page's already-scrolling outer Column (content_area), renders as a
+        # blank/grey block — Flutter doesn't support two nested scrollables
+        # in the same axis and Flet surfaces the failure as a grey box
+        # instead of a Python exception (see gray-dialog-nested-scroll memory;
+        # same fix already applied to admin_dashboard.py/superadmin_dashboard.py
+        # checkbox lists). Only content_area itself should own scroll here —
+        # these stay plain, unbounded Columns.
+        user_regions_checks_block = ft.Column(spacing=4)
+        user_regions_checks_host = user_regions_checks_block
         user_regions_checks = {}
-        user_catalog_checks_block = ft.Column(spacing=4, scroll=ft.ScrollMode.ADAPTIVE)
-        user_catalog_checks_host = ft.Container(
-            height=180, content=user_catalog_checks_block
-        )
+        user_catalog_checks_block = ft.Column(spacing=4)
+        user_catalog_checks_host = user_catalog_checks_block
         user_catalog_checks = {}
 
         def _wide_checkbox_row(label, value=False, on_change=None):
@@ -2055,22 +2149,9 @@ class SettingsView:
                 for r in region_rows
                 if isinstance(r, dict) and r.get("id")
             }
-            for reg in region_rows:
-                if not isinstance(reg, dict) or not reg.get("id"):
-                    continue
-                rid = reg.get("id")
-                cb, cb_row = _wide_checkbox_row(reg.get("name", "Регіон"), False)
-                user_regions_checks[rid] = cb
-                user_regions_checks_block.controls.append(cb_row)
-            if not user_regions_checks_block.controls:
-                user_regions_checks_block.controls.append(
-                    ft.Text(self.t("settings.no_regions", "У компанії поки немає регіонів"), size=11, color=_th_muted)
-                )
 
-            user_catalog_checks.clear()
-            user_catalog_checks_block.controls.clear()
             self.db.sync_company_catalog_nodes(self.company_id)
-            nodes = self.db.get_company_catalog_nodes(self.company_id)
+            nodes_all = self.db.get_company_catalog_nodes(self.company_id)
             allowed_types = {
                 "category",
                 "level_1",
@@ -2080,24 +2161,68 @@ class SettingsView:
                 "level_5",
                 "level_6",
             }
-            nodes = [
+            nodes_all = [
                 n
-                for n in nodes
+                for n in nodes_all
                 if isinstance(n, dict)
                 and n.get("id")
                 and n.get("node_type") in allowed_types
             ]
-            tree_controls, tree_checks = _build_catalog_tree(
-                nodes, regions_by_id, selected_ids=[]
-            )
-            user_catalog_checks.update(tree_checks)
-            user_catalog_checks_block.controls = tree_controls
-            if not tree_controls:
-                user_catalog_checks_block.controls.append(
-                    ft.Text(
-                        "У компанії немає елементів каталогу", size=11, color=_th_muted
+
+            def _rebuild_creation_catalog_tree(_=None):
+                # Only offer categories from region(s) checked above — a new
+                # user restricted to one region must not be assignable
+                # categories from a region they don't have access to.
+                checked_region_ids = {
+                    rid for rid, cb in user_regions_checks.items() if cb.value
+                }
+                user_catalog_checks.clear()
+                if not checked_region_ids:
+                    user_catalog_checks_block.controls = [
+                        ft.Text(
+                            "Спочатку оберіть регіон(и) вище",
+                            size=11,
+                            color=_th_muted,
+                        )
+                    ]
+                else:
+                    nodes = [
+                        n
+                        for n in nodes_all
+                        if n.get("node_type") != "category"
+                        or n.get("region_id") in checked_region_ids
+                    ]
+                    tree_controls, tree_checks = _build_catalog_tree(
+                        nodes, regions_by_id, selected_ids=[]
                     )
+                    user_catalog_checks.update(tree_checks)
+                    user_catalog_checks_block.controls = tree_controls or [
+                        ft.Text(
+                            "У компанії немає елементів каталогу",
+                            size=11,
+                            color=_th_muted,
+                        )
+                    ]
+                with contextlib.suppress(Exception):
+                    user_catalog_checks_block.update()
+
+            for reg in region_rows:
+                if not isinstance(reg, dict) or not reg.get("id"):
+                    continue
+                rid = reg.get("id")
+                cb, cb_row = _wide_checkbox_row(
+                    reg.get("name", "Регіон"),
+                    False,
+                    on_change=_rebuild_creation_catalog_tree,
                 )
+                user_regions_checks[rid] = cb
+                user_regions_checks_block.controls.append(cb_row)
+            if not user_regions_checks_block.controls:
+                user_regions_checks_block.controls.append(
+                    ft.Text(self.t("settings.no_regions", "У компанії поки немає регіонів"), size=11, color=_th_muted)
+                )
+
+            _rebuild_creation_catalog_tree()
 
         def _open_edit_user_regions_dialog(manager):
             manager = manager if isinstance(manager, dict) else {}
@@ -2553,49 +2678,56 @@ class SettingsView:
                 success_manager_delivery = True
                 success_manager_payment_fields = True
                 if self.can_manage_company_settings:
-                    delivery_methods_payload = []
-                    for row in company_delivery_rows:
-                        name_val = (row["name_f"].value or "").strip()
-                        enabled_val = bool(row["enabled_cb"].value)
-                        base_price_val = _parse_float_or_none(row["base_price_f"].value)
-                        delivery_term_val = _parse_float_or_none(
-                            row["delivery_term_f"].value
-                        )
-                        price_currency_val = (row["currency_f"].value or "USD").upper()
-                        if row["is_custom"]:
-                            has_data = (
-                                bool(name_val)
-                                or enabled_val
-                                or base_price_val is not None
-                                or delivery_term_val is not None
+                    for _rid, _region_rows in company_delivery_rows_by_region.items():
+                        delivery_methods_payload = []
+                        for row in _region_rows:
+                            name_val = (row["name_f"].value or "").strip()
+                            enabled_val = bool(row["enabled_cb"].value)
+                            base_price_val = _parse_float_or_none(
+                                row["base_price_f"].value
                             )
-                            if not has_data:
-                                continue
-                            if not name_val:
-                                self._show_snack(
-                                    "Для нового способу доставки вкажіть назву", "orange"
+                            delivery_term_val = _parse_float_or_none(
+                                row["delivery_term_f"].value
+                            )
+                            price_currency_val = (
+                                row["currency_f"].value or "USD"
+                            ).upper()
+                            if row["is_custom"]:
+                                has_data = (
+                                    bool(name_val)
+                                    or enabled_val
+                                    or base_price_val is not None
+                                    or delivery_term_val is not None
                                 )
-                                return
-                        delivery_methods_payload.append(
-                            {
-                                "id": row["id"],
-                                "name": name_val,
-                                "enabled": enabled_val,
-                                "base_price_per_kg": base_price_val,
-                                "delivery_term_days": (
-                                    int(delivery_term_val)
-                                    if delivery_term_val is not None
-                                    else None
-                                ),
-                                "price_currency": price_currency_val,
-                                "is_custom": bool(row["is_custom"]),
-                            }
-                        )
-                    success_company_delivery = self.db.save_company_delivery_methods(
-                        self.company_id,
-                        delivery_methods_payload,
-                        region_id=region_id_for_delivery,
-                    )
+                                if not has_data:
+                                    continue
+                                if not name_val:
+                                    self._show_snack(
+                                        "Для нового способу доставки вкажіть назву",
+                                        "orange",
+                                    )
+                                    return
+                            delivery_methods_payload.append(
+                                {
+                                    "id": row["id"],
+                                    "name": name_val,
+                                    "enabled": enabled_val,
+                                    "base_price_per_kg": base_price_val,
+                                    "delivery_term_days": (
+                                        int(delivery_term_val)
+                                        if delivery_term_val is not None
+                                        else None
+                                    ),
+                                    "price_currency": price_currency_val,
+                                    "is_custom": bool(row["is_custom"]),
+                                }
+                            )
+                        if not self.db.save_company_delivery_methods(
+                            self.company_id,
+                            delivery_methods_payload,
+                            region_id=_rid,
+                        ):
+                            success_company_delivery = False
 
                 manager_delivery_payload = {}
                 for row in manager_delivery_rows:
@@ -2826,45 +2958,6 @@ class SettingsView:
                     spacing=8,
                 ),
                 padding=ft.padding.only(top=4),
-            )
-
-        def build_collapsible_block(
-            title, controls, initially_open=False, visible=True
-        ):
-            body = ft.Column(controls, spacing=8, visible=initially_open)
-            toggle_btn = ft.TextButton(
-                title,
-                icon=(
-                    ft.Icons.KEYBOARD_ARROW_DOWN
-                    if initially_open
-                    else ft.Icons.KEYBOARD_ARROW_RIGHT
-                ),
-                style=ft.ButtonStyle(
-                    color=_th_icon,
-                    padding=ft.padding.symmetric(horizontal=0, vertical=0),
-                ),
-            )
-
-            def toggle(_):
-                body.visible = not body.visible
-                toggle_btn.icon = (
-                    ft.Icons.KEYBOARD_ARROW_DOWN
-                    if body.visible
-                    else ft.Icons.KEYBOARD_ARROW_RIGHT
-                )
-                self.content_area.update()
-
-            toggle_btn.on_click = toggle
-            return ft.Container(
-                visible=visible,
-                padding=14,
-                bgcolor=_th_panel,
-                border=ft.border.all(1, _th_border),
-                border_radius=8,
-                content=ft.Column(
-                    [toggle_btn, body],
-                    spacing=6,
-                ),
             )
 
         # ── GSM Parser per-user settings block ─────────────────────────────
@@ -3428,18 +3521,13 @@ class SettingsView:
                     "Способи доставки компанії",
                     [
                         ft.Text(
-                            "Доступні для всіх користувачів компанії. Користувач може перевизначити свою ціну за кг.",
+                            "Налаштовуються окремо для кожного регіону. Доступні для "
+                            "всіх користувачів цього регіону; користувач може "
+                            "перевизначити свою ціну за кг.",
                             size=12,
                             color=_th_muted,
                         ),
-                        company_delivery_rows_container,
-                        ft.OutlinedButton(
-                            "Додати спосіб доставки",
-                            icon=ft.Icons.ADD,
-                            on_click=add_custom_delivery_method,
-                            visible=self.can_manage_company_settings
-                            and not self.read_only_subordinate,
-                        ),
+                        *delivery_region_blocks,
                     ],
                     initially_open=False,
                     visible=True,
@@ -3448,16 +3536,12 @@ class SettingsView:
                     "Платіжні поля постачальників (компанія)",
                     [
                         ft.Text(
-                            "Адмін/Суперадмін задає набір полів, які можуть використовуватися у постачальниках.",
+                            "Налаштовуються окремо для кожного регіону — визначте, "
+                            "які платіжні поля можна використовувати у постачальниках.",
                             size=12,
                             color=_th_muted,
                         ),
-                        ft.OutlinedButton(
-                            "Редагувати шаблони полів",
-                            icon=ft.Icons.EDIT,
-                            on_click=lambda _: _open_edit_company_payment_templates_dialog(),
-                            disabled=self.read_only_subordinate,
-                        ),
+                        *payment_templates_region_blocks,
                     ],
                     initially_open=False,
                     visible=self.can_manage_company_settings

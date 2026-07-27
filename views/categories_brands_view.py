@@ -42,6 +42,12 @@ class CategoriesBrandsView:
     META_TEXT_SIZE = 12
     EMPTY_TEXT_SIZE = 14
     _expanded_state_by_context = {}
+    # Archive-section collapse toggles are separate from the main category/
+    # level tree above — persisted the same way (keyed by the same per-user
+    # context) so re-instantiating this view (every tab load / sync pulse)
+    # doesn't silently re-collapse them.
+    _archive_collapsed_by_context: dict = {}
+    _level_archive_expanded_by_context: dict = {}
 
     def __init__(
         self,
@@ -843,11 +849,14 @@ class CategoriesBrandsView:
             )
             or []
         )
-        collapsed = getattr(self, "_categories_archive_collapsed", True)
+        archive_key = self._expanded_state_key()
+        collapsed = CategoriesBrandsView._archive_collapsed_by_context.get(
+            archive_key, True
+        )
 
         def _toggle(_):
-            self._categories_archive_collapsed = not getattr(
-                self, "_categories_archive_collapsed", True
+            CategoriesBrandsView._archive_collapsed_by_context[archive_key] = (
+                not collapsed
             )
             self.load_categories()
 
@@ -1329,10 +1338,9 @@ class CategoriesBrandsView:
         self, category_id, levels, level_row, archived_nodes, parent_key
     ):
         """Згорнута секція архівованих дочірніх рівнів під конкретним вузлом ієрархії."""
-        expanded_ids = getattr(self, "_expanded_level_archive_ids", None)
-        if expanded_ids is None:
-            expanded_ids = set()
-            self._expanded_level_archive_ids = expanded_ids
+        expanded_ids = CategoriesBrandsView._level_archive_expanded_by_context.setdefault(
+            self._expanded_state_key(), set()
+        )
         collapsed = parent_key not in expanded_ids
 
         def _toggle(_):

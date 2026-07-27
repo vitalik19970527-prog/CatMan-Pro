@@ -30,6 +30,14 @@ def _gw_get_theme(user_data: dict) -> dict:
     return _gw_themes.get_active_theme(mid)
 
 
+# Persist which per-manager / per-region sections are expanded across rebuilds —
+# build_general_sections()/build_region_sections() run fresh every time the
+# hosting view is rebuilt (tab reload, sync pulse, field save), so without this
+# every section would silently re-collapse. Keyed by (view_class, scope_id, id).
+_general_section_open_state: dict = {}
+_region_section_open_state: dict = {}
+
+
 def build_general_sections(
     content_area: ft.Column,
     user_data: dict,
@@ -76,9 +84,16 @@ def build_general_sections(
             )
         )
 
+    company_id = str(user_data.get("company_id") or "").strip()
     for mid in general_manager_ids:
         mgr_name = mgr_names.get(mid, mid)
-        arrow = ft.Icon(ft.Icons.EXPAND_MORE, size=18, color=_gw_icon)
+        state_key = (str(view_class), company_id, mid)
+        is_open = _general_section_open_state.get(state_key, False)
+        arrow = ft.Icon(
+            ft.Icons.EXPAND_LESS if is_open else ft.Icons.EXPAND_MORE,
+            size=18,
+            color=_gw_icon,
+        )
 
         sub_area = ft.Column(
             expand=True,
@@ -86,36 +101,47 @@ def build_general_sections(
             scroll=ft.ScrollMode.HIDDEN,
             horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
         )
-        body = ft.Column([sub_area], spacing=0, visible=False)
+        body = ft.Column([sub_area], spacing=0, visible=is_open)
         _loaded = [False]
 
-        def _expand(e, _mid=mid, _body=body, _arrow=arrow, _sub=sub_area, _lf=_loaded):
+        def _load_sub(_mid=mid, _sub=sub_area, _lf=_loaded):
+            if _lf[0]:
+                return
+            _lf[0] = True
+            mgr_ctx = dict(user_data)
+            mgr_ctx["active_manager_id"] = _mid
+            mgr_ctx["active_manager_name"] = mgr_names.get(_mid, _mid)
+            mgr_ctx["subordinate_view_readonly"] = True
+            mgr_ctx["general_mode"] = False
+            mgr_ctx["general_manager_ids"] = []
+            mgr_ctx["_is_sub_section_view"] = True
+            try:
+                inst = view_class(_sub, mgr_ctx, db, **extra_kw)
+                inst.build()
+            except Exception as _ex:
+                _sub.controls.append(
+                    ft.Text(
+                        _t(
+                            "async.error_title", "Помилка завантаження: {ex}"
+                        ).format(ex=_ex),
+                        size=11,
+                        color="red",
+                    )
+                )
+
+        if is_open:
+            _load_sub()
+
+        def _expand(
+            e, _key=state_key, _body=body, _arrow=arrow, _load=_load_sub
+        ):
             _body.visible = not _body.visible
+            _general_section_open_state[_key] = _body.visible
             _arrow.name = (
                 ft.Icons.EXPAND_LESS if _body.visible else ft.Icons.EXPAND_MORE
             )
-            if _body.visible and not _lf[0]:
-                _lf[0] = True
-                mgr_ctx = dict(user_data)
-                mgr_ctx["active_manager_id"] = _mid
-                mgr_ctx["active_manager_name"] = mgr_names.get(_mid, _mid)
-                mgr_ctx["subordinate_view_readonly"] = True
-                mgr_ctx["general_mode"] = False
-                mgr_ctx["general_manager_ids"] = []
-                mgr_ctx["_is_sub_section_view"] = True
-                try:
-                    inst = view_class(_sub, mgr_ctx, db, **extra_kw)
-                    inst.build()
-                except Exception as _ex:
-                    _sub.controls.append(
-                        ft.Text(
-                            _t(
-                                "async.error_title", "Помилка завантаження: {ex}"
-                            ).format(ex=_ex),
-                            size=11,
-                            color="red",
-                        )
-                    )
+            if _body.visible:
+                _load()
             with contextlib.suppress(Exception):
                 e.control.parent.update()
 
@@ -309,7 +335,13 @@ def build_region_sections(
     for region in regions:
         rid = str(region.get("id") or "").strip()
         rname = str(region.get("name") or rid).strip()
-        arrow = ft.Icon(ft.Icons.EXPAND_MORE, size=18, color=_gw_icon)
+        state_key = (str(view_class), company_id, rid)
+        is_open = _region_section_open_state.get(state_key, False)
+        arrow = ft.Icon(
+            ft.Icons.EXPAND_LESS if is_open else ft.Icons.EXPAND_MORE,
+            size=18,
+            color=_gw_icon,
+        )
 
         sub_area = ft.Column(
             expand=True,
@@ -317,35 +349,44 @@ def build_region_sections(
             scroll=ft.ScrollMode.HIDDEN,
             horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
         )
-        body = ft.Column([sub_area], spacing=0, visible=False)
+        body = ft.Column([sub_area], spacing=0, visible=is_open)
         _loaded = [False]
 
+        def _load_sub(_rname=rname, _sub=sub_area, _lf=_loaded):
+            if _lf[0]:
+                return
+            _lf[0] = True
+            region_kw = dict(extra_kw)
+            region_kw[region_kwarg_name] = _rname
+            sub_ud = dict(user_data)
+            sub_ud["_is_sub_section_view"] = True
+            try:
+                inst = view_class(_sub, sub_ud, db, **region_kw)
+                inst.build()
+            except Exception as _ex:
+                _sub.controls.append(
+                    ft.Text(
+                        _t(
+                            "async.error_title", "Помилка завантаження: {ex}"
+                        ).format(ex=_ex),
+                        size=11,
+                        color="red",
+                    )
+                )
+
+        if is_open:
+            _load_sub()
+
         def _expand(
-            e, _rname=rname, _body=body, _arrow=arrow, _sub=sub_area, _lf=_loaded
+            e, _key=state_key, _body=body, _arrow=arrow, _load=_load_sub
         ):
             _body.visible = not _body.visible
+            _region_section_open_state[_key] = _body.visible
             _arrow.name = (
                 ft.Icons.EXPAND_LESS if _body.visible else ft.Icons.EXPAND_MORE
             )
-            if _body.visible and not _lf[0]:
-                _lf[0] = True
-                region_kw = dict(extra_kw)
-                region_kw[region_kwarg_name] = _rname
-                sub_ud = dict(user_data)
-                sub_ud["_is_sub_section_view"] = True
-                try:
-                    inst = view_class(_sub, sub_ud, db, **region_kw)
-                    inst.build()
-                except Exception as _ex:
-                    _sub.controls.append(
-                        ft.Text(
-                            _t(
-                                "async.error_title", "Помилка завантаження: {ex}"
-                            ).format(ex=_ex),
-                            size=11,
-                            color="red",
-                        )
-                    )
+            if _body.visible:
+                _load()
             with contextlib.suppress(Exception):
                 e.control.parent.update()
 
