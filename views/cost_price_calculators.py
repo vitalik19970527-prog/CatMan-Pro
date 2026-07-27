@@ -1,6 +1,6 @@
-from typing import Optional
 
 import flet as ft
+
 import i18n
 from views.number_format import safe_float
 
@@ -44,7 +44,7 @@ def _set_cache(view, calc_name: str, payload: dict) -> None:
     _CALCULATORS_SESSION_CACHE[key] = dict(payload or {})
 
 
-def _pick_ccy(value: Optional[str], currencies: list[str], fallback: str) -> str:
+def _pick_ccy(value: str | None, currencies: list[str], fallback: str) -> str:
     ccy = str(value or "").upper().strip()
     if ccy and ccy in set(currencies or []):
         return ccy
@@ -60,11 +60,11 @@ def _set_field_value(control, value) -> None:
         pass
 
 
-def _safe_float(v, default: Optional[float] = None) -> Optional[float]:
+def _safe_float(v, default: float | None = None) -> float | None:
     return safe_float(v, default)
 
 
-def _convert_currency(view, amount: Optional[float], from_ccy: str, to_ccy: str):
+def _convert_currency(view, amount: float | None, from_ccy: str, to_ccy: str):
     if amount is None:
         return None
     src = str(from_ccy or "USD").upper().strip() or "USD"
@@ -150,7 +150,7 @@ def _delivery_tariffs_for_region(view) -> list[dict]:
     return rows
 
 
-def _format_money(view, value: Optional[float], ccy: str = "") -> str:
+def _format_money(view, value: float | None, ccy: str = "") -> str:
     if value is None:
         return "-"
     try:
@@ -259,7 +259,7 @@ def _delivery_chip(view, row: dict) -> ft.Container:
         bgcolor=_HDR_BG,
         border=ft.border.all(1, "#BFDBFE"),
         content=ft.Text(
-            f"{str(row.get('name') or '-')}: {_format_money(view, row.get('tariff'), row.get('currency') or 'USD')}",
+            f"{row.get('name') or '-'!s}: {_format_money(view, row.get('tariff'), row.get('currency') or 'USD')}",
             size=11,
             color=_CHIP_T,
         ),

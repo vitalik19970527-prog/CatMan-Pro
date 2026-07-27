@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 
 import flet as ft
+
 import i18n
 
 # ---------------------------------------------------------------------------

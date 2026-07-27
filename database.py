@@ -5573,6 +5573,12 @@ class DataManager:
             for k, v in (data or {}).items():
                 if k not in merged or merged.get(k) in (None, ""):
                     merged[k] = v
+            # Drop the now-fully-unpacked raw "data" key -- a caller that
+            # edits a couple of fields on this flattened dict and passes it
+            # straight back to a save function must not be able to round-trip
+            # this residual key as the new blob and nest a stale snapshot
+            # inside itself (see the same fix on get_orders/get_order_by_id).
+            merged.pop("data", None)
             # Normalize sales prices storage:
             # - legacy/UI often uses "sales_prices_json" as a JSON string
             # - some rows may store it as jsonb array or under "sales_prices"
@@ -5719,6 +5725,7 @@ class DataManager:
         for k, v in (data or {}).items():
             if k not in merged or merged.get(k) in (None, ""):
                 merged[k] = v
+        merged.pop("data", None)
         # Normalize sales prices storage (keep same behavior as get_products).
         sp = merged.get("sales_prices_json")
         if isinstance(sp, list):
@@ -5875,6 +5882,7 @@ class DataManager:
             for k, v in (data or {}).items():
                 if k not in merged or merged.get(k) in (None, ""):
                     merged[k] = v
+            merged.pop("data", None)
             out.append(merged)
         return out
 
@@ -6104,7 +6112,12 @@ class DataManager:
             ).strip()
             merged = dict(current_data or {})
             for k, v in payload.items():
-                if k in {"id", "company_id", "created_at"}:
+                if k in {"id", "company_id", "created_at", "data"}:
+                    # "data" is a residual key on a payload that started life
+                    # as a flattened get_product_by_id()/get_products() dict
+                    # (edited in place and passed straight back here) --
+                    # never let it overwrite `merged` and nest a stale
+                    # snapshot inside the product's own new data blob.
                     continue
                 if k in {"region_id", "manager_id", "name"}:
                     continue
@@ -6328,6 +6341,7 @@ class DataManager:
             for k, v in (data or {}).items():
                 if k not in merged or merged.get(k) in (None, ""):
                     merged[k] = v
+            merged.pop("data", None)
             # UI expects nested suppliers dict: {"name": ..., "currency": ...}
             if not isinstance(merged.get("suppliers"), dict):
                 sdata = (
@@ -6429,6 +6443,7 @@ class DataManager:
             for k, v in (data or {}).items():
                 if k not in merged or merged.get(k) in (None, ""):
                     merged[k] = v
+            merged.pop("data", None)
             if not isinstance(merged.get("suppliers"), dict):
                 sdata = (
                     merged.get("supplier_join_data")
@@ -6627,7 +6642,13 @@ class DataManager:
             company_id = str(row.get("company_id") or "").strip()
             current_data = row.get("data") if isinstance(row.get("data"), dict) else {}
             merged = dict(current_data or {})
-            merged.update(payload)
+            # A payload that started life as a flattened get_suppliers()/
+            # get_supplier_by_id()-style dict (edited in place and passed
+            # straight back here) can carry a residual "data" key -- never
+            # let it overwrite `merged` and nest a stale snapshot inside the
+            # supplier's own new data blob.
+            _payload_clean = {k: v for k, v in payload.items() if k != "data"}
+            merged.update(_payload_clean)
             sets = ["data=%s::jsonb", "updated_at=%s"]
             params: list[Any] = [psycopg.types.json.Jsonb(merged), now]
             if name:
@@ -7914,6 +7935,7 @@ class DataManager:
             for k, v in (data or {}).items():
                 if k not in merged or merged.get(k) in (None, ""):
                     merged[k] = v
+            merged.pop("data", None)
             out.append(merged)
         if manager_id:
             visible_ctx = self._get_manager_visible_scope_context(
@@ -8003,6 +8025,7 @@ class DataManager:
             for k, v in (data or {}).items():
                 if k not in merged or merged.get(k) in (None, ""):
                     merged[k] = v
+            merged.pop("data", None)
             out.append(merged)
         return out
 
@@ -8156,7 +8179,13 @@ class DataManager:
                 return False
             current_data = row.get("data") if isinstance(row.get("data"), dict) else {}
             merged = dict(current_data or {})
-            merged.update(payload)
+            # A payload that started life as a flattened get_suppliers()/
+            # get_supplier_by_id()-style dict (edited in place and passed
+            # straight back here) can carry a residual "data" key -- never
+            # let it overwrite `merged` and nest a stale snapshot inside the
+            # supplier's own new data blob.
+            _payload_clean = {k: v for k, v in payload.items() if k != "data"}
+            merged.update(_payload_clean)
             sets = ["data=%s::jsonb", "updated_at=%s"]
             params: list[Any] = [psycopg.types.json.Jsonb(merged), now]
             if name:
@@ -8347,6 +8376,14 @@ class DataManager:
             for _col in _SQL_COLS:
                 if _col in r and r[_col] is not None:
                     merged[_col] = r[_col]
+            # `r` carries a literal "data" key (the raw jsonb column) that's
+            # now fully unpacked into the flat fields above -- drop it so a
+            # caller that fetches an order, edits a couple of fields, and
+            # passes the same dict straight back to upsert_order() can't
+            # round-trip this residual key as the new data blob and nest a
+            # stale snapshot inside itself (upsert_order's `data.data ||
+            # EXCLUDED.data` merge doesn't know this key is stale baggage).
+            merged.pop("data", None)
             out.append(merged)
         if manager_id and visible_ctx is not None:
             if visible_ctx.get("restricted"):
@@ -8395,7 +8432,12 @@ class DataManager:
         if not isinstance(r, dict):
             return None
         data = r.get("data") if isinstance(r.get("data"), dict) else {}
-        return {**r, **data}
+        merged = {**r, **data}
+        # See get_orders() for why this residual key must not survive the
+        # flatten -- callers regularly mutate a couple of fields on the
+        # returned dict and hand it straight back to upsert_order().
+        merged.pop("data", None)
+        return merged
 
     def reconcile_packaging_supply_goods_links(
         self, company_id: str, region_id: str, manager_id: str | None = None
@@ -8733,6 +8775,20 @@ class DataManager:
             "updated_at",
         ):
             data.pop(k, None)
+        # Defense in depth: get_orders()/get_order_by_id() return a flattened
+        # dict with the raw jsonb column's fields unpacked to the top level --
+        # a caller that fetches one, tweaks a couple of fields, and passes it
+        # straight back here should never have a stray "data" key left over.
+        # If one slips through anyway, dropping it here stops it from being
+        # nested as a sub-object inside the new blob via `orders.data ||
+        # EXCLUDED.data` and silently burying the real (fresh) top-level
+        # fields under a stale inner snapshot.
+        if isinstance(data.get("data"), dict):
+            logger.warning(
+                "upsert_order: payload had a residual 'data' key (order id=%s) -- dropped to avoid nesting",
+                oid,
+            )
+        data.pop("data", None)
         try:
             with self._pg().cursor() as cur:
                 cur.execute(
@@ -9094,16 +9150,14 @@ class DataManager:
                     merged["comment"] = dc
             out.append(merged)
         if mid and visible_ctx is not None and visible_ctx.get("restricted"):
-            candidate_supplier_ids = {
-                str(row.get("supplier_id") or "").strip()
-                for row in out
-                if isinstance(row, dict) and row.get("supplier_id")
-            }
-            owner_sets = (
-                self._get_supplier_owner_sets(cid, candidate_supplier_ids)
-                if has_manager_id
-                else {}
-            )
+            # Each settlement row belongs to exactly one manager_id (see
+            # PaymentsView._build_settlement_who_picker: sharing a category
+            # means each person gets their OWN independent row, never a row
+            # shared by several people) -- so visibility is simply "your own
+            # rows, always" plus "anyone's un-attributed legacy rows, as long
+            # as the supplier is still in your current scope". A row someone
+            # else created for a supplier you can now also see (e.g. after a
+            # category transfer) stays theirs, not yours.
             filtered = []
             for row in out:
                 if not isinstance(row, dict):
@@ -9126,57 +9180,11 @@ class DataManager:
                     # "follows current scope" behavior so existing data isn't
                     # hidden outright.
                     filtered.append(row)
-                    continue
-                owners = owner_sets.get(sid) or set()
-                if len(owners) > 1 and mid in owners and row_mid in owners:
-                    # Supplier is currently under joint/shared access and both
-                    # the viewer and the row's creator are among the current
-                    # co-owners -- shared pool, everyone sees everyone's rows.
-                    filtered.append(row)
-                # Otherwise: sid is in scope but the row belongs to a manager
-                # who isn't a current co-owner (e.g. the previous exclusive
-                # owner after a "move" transfer) -- their history stays
-                # theirs, not visible to the new owner.
+                # Otherwise: sid is in scope but the row belongs to a
+                # different manager (their own personal opening balance /
+                # compensation, or the previous owner's history after a
+                # transfer) -- stays theirs, not shown to you.
             out = filtered
-        return out
-
-    def _get_supplier_owner_sets(
-        self, company_id: str, supplier_ids: set[str] | list[str]
-    ) -> dict[str, set[str]]:
-        """Current entity_owners manager-id set for each given supplier id.
-
-        Used only to decide settlement-row visibility for shared/joint
-        access (see get_supplier_settlements): a supplier with 2+ current
-        owners is a "joint" supplier whose settlement history is a shared
-        pool between exactly those owners.
-        """
-        ids = sorted({str(x).strip() for x in (supplier_ids or []) if str(x).strip()})
-        if not ids or not self._use_postgres():
-            return {}
-        cid = str(company_id or "").strip()
-        if not cid:
-            return {}
-        out: dict[str, set[str]] = {}
-        try:
-            with self._pg().cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT entity_id, manager_id
-                    FROM entity_owners
-                    WHERE company_id=%s AND entity_type='supplier' AND entity_id = ANY(%s)
-                    """,
-                    (cid, ids),
-                )
-                for row in cur.fetchall() or []:
-                    if not isinstance(row, dict):
-                        continue
-                    eid = str(row.get("entity_id") or "").strip()
-                    mgr = str(row.get("manager_id") or "").strip()
-                    if eid and mgr:
-                        out.setdefault(eid, set()).add(mgr)
-        except Exception:
-            logger.exception("_get_supplier_owner_sets failed")
-            return {}
         return out
 
     def get_managers_with_supplier_access(
@@ -12329,7 +12337,7 @@ class DataManager:
                 # ever opened would round-trip an empty {} and permanently
                 # silence every category's Telegram messages (an empty dict
                 # is NOT the same as "not configured yet" to the runner).
-                **({"categories": categories_out} if "categories" in telegram else {}),
+                **({"categories": categories_out} if "categories" in (telegram or {}) else {}),
             },
             "settings": {
                 "change_retention_days": change_retention_days,

@@ -1,4 +1,5 @@
 """User file storage — per-user per-region, nested folder tree, fast region switch."""
+
 from __future__ import annotations
 
 import asyncio
@@ -8,8 +9,8 @@ import tempfile
 from datetime import datetime
 
 import flet as ft
-import i18n
 
+import i18n
 from views.mobile_layout_helpers import is_mobile
 
 _MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
@@ -36,15 +37,15 @@ def _file_icon(filename: str) -> tuple[str, str]:
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     return {
         "xlsx": (ft.Icons.TABLE_CHART, "#217346"),
-        "xls":  (ft.Icons.TABLE_CHART, "#217346"),
+        "xls": (ft.Icons.TABLE_CHART, "#217346"),
         "xlsm": (ft.Icons.TABLE_CHART, "#217346"),
         "docx": (ft.Icons.DESCRIPTION, "#2B579A"),
-        "doc":  (ft.Icons.DESCRIPTION, "#2B579A"),
-        "pdf":  (ft.Icons.PICTURE_AS_PDF, "#E53935"),
-        "csv":  (ft.Icons.TABLE_VIEW, _MUTED),
-        "zip":  (ft.Icons.FOLDER_ZIP_OUTLINED, _MUTED),
-        "png":  (ft.Icons.IMAGE_OUTLINED, _MUTED),
-        "jpg":  (ft.Icons.IMAGE_OUTLINED, _MUTED),
+        "doc": (ft.Icons.DESCRIPTION, "#2B579A"),
+        "pdf": (ft.Icons.PICTURE_AS_PDF, "#E53935"),
+        "csv": (ft.Icons.TABLE_VIEW, _MUTED),
+        "zip": (ft.Icons.FOLDER_ZIP_OUTLINED, _MUTED),
+        "png": (ft.Icons.IMAGE_OUTLINED, _MUTED),
+        "jpg": (ft.Icons.IMAGE_OUTLINED, _MUTED),
         "jpeg": (ft.Icons.IMAGE_OUTLINED, _MUTED),
     }.get(ext, (ft.Icons.ATTACH_FILE, _MUTED))
 
@@ -68,8 +69,8 @@ class FilesView:
         )
 
         # Read-only: viewing other user's files OR all-regions mode
-        self._is_other_user = (own_id != active_id and active_id != "")
-        self._is_all_regions = (self.region_id == "")
+        self._is_other_user = own_id != active_id and active_id != ""
+        self._is_all_regions = self.region_id == ""
         self._readonly = self._is_other_user or self._is_all_regions
 
         # Tree state
@@ -120,7 +121,7 @@ class FilesView:
         UI never blocks while switching regions."""
         self.region_id = region_id
         self.region_label = region_label
-        self._is_all_regions = (region_id == "")
+        self._is_all_regions = region_id == ""
         self._readonly = self._is_other_user or self._is_all_regions
         self._sel_folder_id = None
         self._files = []
@@ -130,8 +131,8 @@ class FilesView:
 
         # Update region badge
         if self._region_badge_text is not None:
-            self._region_badge_text.value = (
-                region_label or self.t("files.all_regions", "Всі регіони")
+            self._region_badge_text.value = region_label or self.t(
+                "files.all_regions", "Всі регіони"
             )
             with contextlib.suppress(Exception):
                 self._region_badge_text.update()
@@ -185,15 +186,17 @@ class FilesView:
 
         # ---- Tree column (left) ----
         tree_col = ft.Column(
-            [], spacing=0, tight=True,
-            scroll=ft.ScrollMode.AUTO, expand=True
+            [], spacing=0, tight=True, scroll=ft.ScrollMode.AUTO, expand=True
         )
         self._tree_col = tree_col
 
         # Create root folder row
         create_tf = ft.TextField(
             hint_text=self.t("files.new_folder_hint", "Нова папка…"),
-            dense=True, text_size=12, expand=True, border_radius=6,
+            dense=True,
+            text_size=12,
+            expand=True,
+            border_radius=6,
             content_padding=ft.padding.symmetric(horizontal=8, vertical=4),
         )
 
@@ -210,7 +213,10 @@ class FilesView:
                     create_tf.update()
                 self._reload_tree()
             else:
-                self._snack(self.t("files.err.create_folder", "Помилка створення папки"), ft.Colors.RED)
+                self._snack(
+                    self.t("files.err.create_folder", "Помилка створення папки"),
+                    ft.Colors.RED,
+                )
 
         create_tf.on_submit = _create_root
 
@@ -219,13 +225,16 @@ class FilesView:
                 ft.Icon(ft.Icons.CREATE_NEW_FOLDER_OUTLINED, size=14, color=_OK_DK),
                 create_tf,
                 ft.IconButton(
-                    ft.Icons.ADD_CIRCLE_OUTLINE, icon_color=_OK_DK, icon_size=16,
+                    ft.Icons.ADD_CIRCLE_OUTLINE,
+                    icon_color=_OK_DK,
+                    icon_size=16,
                     tooltip=self.t("files.tooltip.create_folder", "Створити папку"),
                     on_click=_create_root,
                     style=ft.ButtonStyle(padding=ft.padding.all(2)),
                 ),
             ],
-            spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=4,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
             visible=not self._readonly,
         )
         self._create_folder_row = create_folder_row
@@ -233,12 +242,15 @@ class FilesView:
         # Region badge
         region_badge_text = ft.Text(
             self.region_label or self.t("files.all_regions", "Всі регіони"),
-            size=10, color=_ACCENT,
+            size=10,
+            color=_ACCENT,
         )
         self._region_badge_text = region_badge_text
 
         region_badge = ft.Container(
-            bgcolor=_SOFT, border=ft.border.all(1, _BORDER), border_radius=6,
+            bgcolor=_SOFT,
+            border=ft.border.all(1, _BORDER),
+            border_radius=6,
             padding=ft.padding.symmetric(horizontal=8, vertical=3),
             content=region_badge_text,
         )
@@ -250,25 +262,32 @@ class FilesView:
                         ft.Icon(ft.Icons.FOLDER_OUTLINED, size=15, color=_ACCENT),
                         ft.Text(
                             self.t("files.folders_label", "Папки"),
-                            size=12, weight=ft.FontWeight.W_700, color=_ACCENT,
+                            size=12,
+                            weight=ft.FontWeight.W_700,
+                            color=_ACCENT,
                         ),
                         ft.Container(expand=True),
                         region_badge,
                     ],
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=4,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    spacing=4,
                 ),
                 ft.Divider(height=1, thickness=1, color=_BORDER),
                 ft.Container(expand=True, content=tree_col),
                 ft.Divider(height=1, thickness=1, color=_BORDER),
                 create_folder_row,
             ],
-            spacing=6, expand=True,
+            spacing=6,
+            expand=True,
         )
 
         # ---- Files column (right) ----
         header_text = ft.Text(
             self.t("files.select_folder", "Оберіть папку"),
-            size=13, color=_MUTED, italic=True, expand=True,
+            size=13,
+            color=_MUTED,
+            italic=True,
+            expand=True,
         )
         self._header_text = header_text
 
@@ -276,7 +295,8 @@ class FilesView:
             self.t("files.upload_btn", "Завантажити файл"),
             icon=ft.Icons.UPLOAD_FILE,
             visible=False,
-            on_click=lambda _: self._page() and self._page().run_task(self._pick_and_upload),
+            on_click=lambda _: self._page()
+            and self._page().run_task(self._pick_and_upload),
             style=ft.ButtonStyle(
                 bgcolor=_ACCENT,
                 padding=ft.padding.symmetric(horizontal=14, vertical=7),
@@ -286,8 +306,11 @@ class FilesView:
         self._upload_btn = upload_btn
 
         files_col = ft.Column(
-            [], spacing=0, tight=True,
-            scroll=ft.ScrollMode.AUTO, expand=True,
+            [],
+            spacing=0,
+            tight=True,
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
         )
         self._files_col = files_col
 
@@ -300,7 +323,8 @@ class FilesView:
                 ft.Divider(height=1, thickness=1, color=_BORDER),
                 ft.Container(expand=True, content=files_col),
             ],
-            spacing=8, expand=True,
+            spacing=8,
+            expand=True,
         )
 
         # ---- Title row ----
@@ -309,15 +333,20 @@ class FilesView:
                 ft.Icon(ft.Icons.FOLDER_COPY_OUTLINED, size=20, color=_ACCENT),
                 ft.Text(
                     self.t("files.title", "Мої файли"),
-                    size=17, weight=ft.FontWeight.W_700, color=_TEXT,
+                    size=17,
+                    weight=ft.FontWeight.W_700,
+                    color=_TEXT,
                 ),
                 ft.IconButton(
-                    icon=ft.Icons.HELP_OUTLINE, icon_size=18, icon_color=_ACCENT,
+                    icon=ft.Icons.HELP_OUTLINE,
+                    icon_size=18,
+                    icon_color=_ACCENT,
                     tooltip=self.t("common.help.tooltip", "Довідка"),
                     on_click=lambda _: self._show_help(),
                 ),
             ],
-            spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=6,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
 
         # ---- Main layout ----
@@ -336,11 +365,13 @@ class FilesView:
                         padding=ft.padding.only(bottom=8),
                     ),
                     ft.Container(
-                        expand=True, content=right_panel,
+                        expand=True,
+                        content=right_panel,
                         padding=ft.padding.only(top=8),
                     ),
                 ],
-                spacing=0, expand=True,
+                spacing=0,
+                expand=True,
             )
         else:
             layout = ft.Row(
@@ -352,11 +383,13 @@ class FilesView:
                         padding=ft.padding.only(right=12, top=4, bottom=4),
                     ),
                     ft.Container(
-                        expand=True, content=right_panel,
+                        expand=True,
+                        content=right_panel,
                         padding=ft.padding.only(left=16, top=4, bottom=4, right=4),
                     ),
                 ],
-                spacing=0, expand=True,
+                spacing=0,
+                expand=True,
                 vertical_alignment=ft.CrossAxisAlignment.START,
             )
 
@@ -369,11 +402,13 @@ class FilesView:
                         padding=ft.padding.symmetric(horizontal=16, vertical=8),
                     ),
                     ft.Container(
-                        expand=True, content=layout,
+                        expand=True,
+                        content=layout,
                         padding=ft.padding.symmetric(horizontal=16),
                     ),
                 ],
-                spacing=0, expand=True,
+                spacing=0,
+                expand=True,
             )
         )
         with contextlib.suppress(Exception):
@@ -402,10 +437,14 @@ class FilesView:
                 padding=ft.padding.symmetric(vertical=20, horizontal=4),
                 content=ft.Row(
                     [
-                        ft.ProgressRing(width=14, height=14, stroke_width=2, color=_ACCENT),
+                        ft.ProgressRing(
+                            width=14, height=14, stroke_width=2, color=_ACCENT
+                        ),
                         ft.Text(
                             self.t("files.loading", "Завантаження…"),
-                            size=11, color=_MUTED, italic=True,
+                            size=11,
+                            color=_MUTED,
+                            italic=True,
                         ),
                     ],
                     spacing=8,
@@ -421,9 +460,15 @@ class FilesView:
         # another region again before this DB call returns, the stale result
         # must not overwrite the newer one.
         _region_at_start = self.region_id
-        folders = await asyncio.to_thread(
-            self.db.get_user_file_groups, self.company_id, self.manager_id, self.region_id
-        ) or []
+        folders = (
+            await asyncio.to_thread(
+                self.db.get_user_file_groups,
+                self.company_id,
+                self.manager_id,
+                self.region_id,
+            )
+            or []
+        )
         if _region_at_start != self.region_id:
             return
         self._folders = folders
@@ -446,9 +491,12 @@ class FilesView:
                     content=ft.Text(
                         self.t(
                             "files.no_folders",
-                            "Немає папок." + ("" if self._readonly else " Створіть першу."),
+                            "Немає папок."
+                            + ("" if self._readonly else " Створіть першу."),
                         ),
-                        size=11, color=_MUTED, italic=True,
+                        size=11,
+                        color=_MUTED,
+                        italic=True,
                     ),
                 )
             )
@@ -465,7 +513,9 @@ class FilesView:
             children = self._get_children(fid)
             is_exp = fid in self._expanded_ids
             is_sel = fid == self._sel_folder_id
-            items.append(self._build_folder_item(f, depth, bool(children), is_exp, is_sel))
+            items.append(
+                self._build_folder_item(f, depth, bool(children), is_exp, is_sel)
+            )
             if is_exp:
                 items.extend(self._build_tree_items(children, depth + 1))
         return items
@@ -508,21 +558,30 @@ class FilesView:
         if has_children:
             expand_ctl = ft.IconButton(
                 icon=ft.Icons.EXPAND_LESS if is_expanded else ft.Icons.EXPAND_MORE,
-                icon_size=13, icon_color=_MUTED, on_click=_toggle,
+                icon_size=13,
+                icon_color=_MUTED,
+                on_click=_toggle,
                 style=ft.ButtonStyle(padding=ft.padding.all(0)),
-                width=18, height=20,
+                width=18,
+                height=20,
             )
         else:
             expand_ctl = ft.Container(width=18)
 
         folder_icon = ft.Icon(
-            ft.Icons.FOLDER_OPEN if (is_expanded or is_sel) else ft.Icons.FOLDER_OUTLINED,
-            size=14, color=_ACCENT if is_sel else _MUTED,
+            (
+                ft.Icons.FOLDER_OPEN
+                if (is_expanded or is_sel)
+                else ft.Icons.FOLDER_OUTLINED
+            ),
+            size=14,
+            color=_ACCENT if is_sel else _MUTED,
         )
 
         # Action buttons (hidden when not selected OR readonly)
         action_btns = []
         if is_sel and not self._readonly:
+
             def _add_sub(_, _fid=fid):
                 self._show_subfolder_dialog(_fid)
 
@@ -534,25 +593,34 @@ class FilesView:
 
             action_btns = [
                 ft.IconButton(
-                    ft.Icons.CREATE_NEW_FOLDER_OUTLINED, icon_size=12, icon_color=_MUTED,
+                    ft.Icons.CREATE_NEW_FOLDER_OUTLINED,
+                    icon_size=12,
+                    icon_color=_MUTED,
                     tooltip=self.t("files.tooltip.add_subfolder", "Підпапка"),
                     on_click=_add_sub,
                     style=ft.ButtonStyle(padding=ft.padding.all(1)),
-                    width=22, height=22,
+                    width=22,
+                    height=22,
                 ),
                 ft.IconButton(
-                    ft.Icons.EDIT_OUTLINED, icon_size=12, icon_color=_MUTED,
+                    ft.Icons.EDIT_OUTLINED,
+                    icon_size=12,
+                    icon_color=_MUTED,
                     tooltip=self.t("files.tooltip.rename", "Перейменувати"),
                     on_click=_rename,
                     style=ft.ButtonStyle(padding=ft.padding.all(1)),
-                    width=22, height=22,
+                    width=22,
+                    height=22,
                 ),
                 ft.IconButton(
-                    ft.Icons.DELETE_OUTLINE, icon_size=12, icon_color=ft.Colors.RED_400,
+                    ft.Icons.DELETE_OUTLINE,
+                    icon_size=12,
+                    icon_color=ft.Colors.RED_400,
                     tooltip=self.t("files.tooltip.delete_folder", "Видалити"),
                     on_click=_del,
                     style=ft.ButtonStyle(padding=ft.padding.all(1)),
-                    width=22, height=22,
+                    width=22,
+                    height=22,
                 ),
             ]
 
@@ -561,11 +629,14 @@ class FilesView:
         if self._is_all_regions and region_id and not folder.get("parent_id"):
             region_badge = [
                 ft.Container(
-                    bgcolor=_SOFT, border=ft.border.all(1, _BORDER), border_radius=4,
+                    bgcolor=_SOFT,
+                    border=ft.border.all(1, _BORDER),
+                    border_radius=4,
                     padding=ft.padding.symmetric(horizontal=4, vertical=1),
                     content=ft.Text(
                         (region_id[:6] + "…") if len(region_id) > 6 else region_id,
-                        size=9, color=_ACCENT,
+                        size=9,
+                        color=_ACCENT,
                     ),
                 )
             ]
@@ -578,10 +649,12 @@ class FilesView:
                 ft.Container(
                     expand=True,
                     content=ft.Text(
-                        name, size=12,
+                        name,
+                        size=12,
                         weight=ft.FontWeight.W_600 if is_sel else ft.FontWeight.W_400,
                         color=_ACCENT if is_sel else _TEXT,
-                        no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS,
+                        no_wrap=True,
+                        overflow=ft.TextOverflow.ELLIPSIS,
                     ),
                     on_click=_select,
                     padding=ft.padding.only(left=3),
@@ -612,7 +685,10 @@ class FilesView:
             return
         tf = ft.TextField(
             hint_text=self.t("files.new_folder_hint", "Нова папка…"),
-            autofocus=True, dense=True, text_size=13, border_radius=6,
+            autofocus=True,
+            dense=True,
+            text_size=13,
+            border_radius=6,
             content_padding=ft.padding.symmetric(horizontal=10, vertical=6),
         )
         dlg: list = [None]
@@ -624,21 +700,35 @@ class FilesView:
             with contextlib.suppress(Exception):
                 pg.pop_dialog()
             gid = self.db.create_user_file_group(
-                self.company_id, self.manager_id, self.region_id, name, parent_id=parent_id
+                self.company_id,
+                self.manager_id,
+                self.region_id,
+                name,
+                parent_id=parent_id,
             )
             if gid:
                 self._expanded_ids.add(parent_id)
                 self._reload_tree()
             else:
-                self._snack(self.t("files.err.create_folder", "Помилка створення папки"), ft.Colors.RED)
+                self._snack(
+                    self.t("files.err.create_folder", "Помилка створення папки"),
+                    ft.Colors.RED,
+                )
 
         tf.on_submit = _save
         dlg[0] = ft.AlertDialog(
             modal=True,
-            title=ft.Text(self.t("files.dlg.new_subfolder", "Нова підпапка"), size=14, weight="bold"),
+            title=ft.Text(
+                self.t("files.dlg.new_subfolder", "Нова підпапка"),
+                size=14,
+                weight="bold",
+            ),
             content=ft.Container(width=320, content=tf),
             actions=[
-                ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=lambda _: pg.pop_dialog()),
+                ft.TextButton(
+                    self.t("common.cancel", "Скасувати"),
+                    on_click=lambda _: pg.pop_dialog(),
+                ),
                 ft.FilledButton(self.t("common.create", "Створити"), on_click=_save),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
@@ -650,7 +740,10 @@ class FilesView:
         if not pg:
             return
         tf = ft.TextField(
-            value=current_name, autofocus=True, dense=True, text_size=13,
+            value=current_name,
+            autofocus=True,
+            dense=True,
+            text_size=13,
             border_radius=6,
             content_padding=ft.padding.symmetric(horizontal=10, vertical=6),
         )
@@ -676,15 +769,24 @@ class FilesView:
                         self._header_text.update()
                 self._rebuild_tree_col()
             else:
-                self._snack(self.t("files.err.rename", "Помилка перейменування"), ft.Colors.RED)
+                self._snack(
+                    self.t("files.err.rename", "Помилка перейменування"), ft.Colors.RED
+                )
 
         tf.on_submit = _save
         dlg[0] = ft.AlertDialog(
             modal=True,
-            title=ft.Text(self.t("files.dlg.rename_folder", "Перейменувати папку"), size=14, weight="bold"),
+            title=ft.Text(
+                self.t("files.dlg.rename_folder", "Перейменувати папку"),
+                size=14,
+                weight="bold",
+            ),
             content=ft.Container(width=320, content=tf),
             actions=[
-                ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=lambda _: pg.pop_dialog()),
+                ft.TextButton(
+                    self.t("common.cancel", "Скасувати"),
+                    on_click=lambda _: pg.pop_dialog(),
+                ),
                 ft.FilledButton(self.t("common.save", "Зберегти"), on_click=_save),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
@@ -707,7 +809,9 @@ class FilesView:
                     self._files = []
                     self._rebuild_files_col()
                     if self._header_text:
-                        self._header_text.value = self.t("files.select_folder", "Оберіть папку")
+                        self._header_text.value = self.t(
+                            "files.select_folder", "Оберіть папку"
+                        )
                         self._header_text.italic = True
                         self._header_text.color = _MUTED
                         with contextlib.suppress(Exception):
@@ -718,28 +822,39 @@ class FilesView:
                             self._upload_btn.update()
                 self._expanded_ids.discard(folder_id)
                 self._snack(
-                    self.t("files.folder_deleted", 'Папку "{name}" видалено').format(name=name),
+                    self.t("files.folder_deleted", 'Папку "{name}" видалено').format(
+                        name=name
+                    ),
                     ft.Colors.ORANGE,
                 )
                 self._reload_tree()
             else:
-                self._snack(self.t("files.err.delete", "Помилка видалення"), ft.Colors.RED)
+                self._snack(
+                    self.t("files.err.delete", "Помилка видалення"), ft.Colors.RED
+                )
 
         dlg[0] = ft.AlertDialog(
             modal=True,
             title=ft.Text(
-                self.t("files.delete_folder_confirm", 'Видалити "{name}"?').format(name=name),
-                size=14, weight="bold",
+                self.t("files.delete_folder_confirm", 'Видалити "{name}"?').format(
+                    name=name
+                ),
+                size=14,
+                weight="bold",
             ),
             content=ft.Text(
                 self.t(
                     "files.delete_folder_body",
                     "Всі файли та підпапки будуть видалені безповоротно.",
                 ),
-                size=12, color=_MUTED,
+                size=12,
+                color=_MUTED,
             ),
             actions=[
-                ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=lambda _: pg.pop_dialog()),
+                ft.TextButton(
+                    self.t("common.cancel", "Скасувати"),
+                    on_click=lambda _: pg.pop_dialog(),
+                ),
                 ft.FilledButton(
                     self.t("common.delete", "Видалити"),
                     icon=ft.Icons.DELETE_OUTLINE,
@@ -777,10 +892,14 @@ class FilesView:
         if not col:
             return self._files
         reverse = self._file_sort_dir < 0
-        if col == "name":
-            key = lambda f: str(f.get("original_filename") or "").lower()
-        else:  # "date"
-            key = lambda f: self._parse_file_date(f) or datetime.min
+
+        def _name_key(f):
+            return str(f.get("original_filename") or "").lower()
+
+        def _date_key(f):
+            return self._parse_file_date(f) or datetime.min
+
+        key = _name_key if col == "name" else _date_key
         return sorted(self._files, key=key, reverse=reverse)
 
     def _toggle_file_sort(self, col_key: str, _=None):
@@ -795,7 +914,9 @@ class FilesView:
             self._file_sort_dir = 1
         self._rebuild_files_col()
 
-    def _sort_header_cell(self, label: str, col_key: str, *, expand=None, width=None) -> ft.Control:
+    def _sort_header_cell(
+        self, label: str, col_key: str, *, expand=None, width=None
+    ) -> ft.Control:
         active = self._file_sort_col == col_key
         if active and self._file_sort_dir == 1:
             arrow = ft.Icons.ARROW_UPWARD
@@ -806,13 +927,20 @@ class FilesView:
         content = ft.Row(
             [
                 ft.Text(
-                    label, size=10,
+                    label,
+                    size=10,
                     color=_ACCENT if active else _MUTED,
                     weight="bold",
                 ),
-                ft.Icon(arrow, size=11, color=_ACCENT) if arrow else ft.Container(width=11),
+                (
+                    ft.Icon(arrow, size=11, color=_ACCENT)
+                    if arrow
+                    else ft.Container(width=11)
+                ),
             ],
-            spacing=2, tight=True, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=2,
+            tight=True,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
         return ft.Container(
             content=content,
@@ -840,23 +968,32 @@ class FilesView:
                     alignment=ft.Alignment(0, 0),
                     content=ft.Column(
                         [
-                            ft.Icon(ft.Icons.FOLDER_OPEN_OUTLINED, size=44, color="#CBD5E1"),
+                            ft.Icon(
+                                ft.Icons.FOLDER_OPEN_OUTLINED, size=44, color="#CBD5E1"
+                            ),
                             ft.Text(
                                 self.t("files.empty_folder", "Папка порожня."),
-                                size=12, color=_MUTED, italic=True,
+                                size=12,
+                                color=_MUTED,
+                                italic=True,
                             ),
                             *(
                                 [
                                     ft.Text(
-                                        self.t("files.upload_hint", "Натисніть «Завантажити файл» щоб додати."),
-                                        size=11, color="#94A3B8",
+                                        self.t(
+                                            "files.upload_hint",
+                                            "Натисніть «Завантажити файл» щоб додати.",
+                                        ),
+                                        size=11,
+                                        color="#94A3B8",
                                     )
                                 ]
                                 if not self._readonly
                                 else []
                             ),
                         ],
-                        horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=6,
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        spacing=6,
                     ),
                 )
             )
@@ -869,12 +1006,23 @@ class FilesView:
                     content=ft.Row(
                         [
                             ft.Container(width=22),
-                            self._sort_header_cell(self.t("files.col.file", "Файл"), "name", expand=True),
-                            ft.Text(self.t("files.col.size", "Розмір"), size=10, color=_MUTED, weight="bold", width=72),
-                            self._sort_header_cell(self.t("files.col.date", "Дата"), "date", width=86),
+                            self._sort_header_cell(
+                                self.t("files.col.file", "Файл"), "name", expand=True
+                            ),
+                            ft.Text(
+                                self.t("files.col.size", "Розмір"),
+                                size=10,
+                                color=_MUTED,
+                                weight="bold",
+                                width=72,
+                            ),
+                            self._sort_header_cell(
+                                self.t("files.col.date", "Дата"), "date", width=86
+                            ),
                             ft.Container(width=self._actions_width()),
                         ],
-                        spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                 )
             )
@@ -887,8 +1035,8 @@ class FilesView:
     def _actions_width(self) -> int:
         # Open + Save = 2 buttons; + Rename + Move + Delete for own user
         if self._readonly:
-            return 76    # open + save
-        return 154        # open + save + rename + move + delete
+            return 76  # open + save
+        return 154  # open + save + rename + move + delete
 
     def _build_file_row(self, f: dict) -> ft.Control:
         fid = str(f.get("id") or "")
@@ -901,7 +1049,11 @@ class FilesView:
                 if isinstance(created_at, str)
                 else created_at
             )
-            date_str = dt.strftime("%d.%m.%Y") if hasattr(dt, "strftime") else str(created_at)[:10]
+            date_str = (
+                dt.strftime("%d.%m.%Y")
+                if hasattr(dt, "strftime")
+                else str(created_at)[:10]
+            )
         except Exception:
             date_str = str(created_at or "")[:10]
 
@@ -910,7 +1062,10 @@ class FilesView:
         async def _open(_fid=fid, _fname=fname):
             data = await asyncio.to_thread(self.db.get_user_file_data, _fid)
             if not data:
-                self._snack(self.t("files.err.no_data", "Не вдалося отримати файл"), ft.Colors.RED)
+                self._snack(
+                    self.t("files.err.no_data", "Не вдалося отримати файл"),
+                    ft.Colors.RED,
+                )
                 return
             try:
                 tmp_path = os.path.join(tempfile.gettempdir(), _fname)
@@ -929,9 +1084,13 @@ class FilesView:
             pg.update()
             await asyncio.sleep(0.2)
             save_path = await fp.save_file(
-                dialog_title=self.t("files.save_dialog", 'Зберегти "{fname}"').format(fname=_fname),
+                dialog_title=self.t("files.save_dialog", 'Зберегти "{fname}"').format(
+                    fname=_fname
+                ),
                 file_name=_fname,
-                allowed_extensions=[_fname.rsplit(".", 1)[-1]] if "." in _fname else None,
+                allowed_extensions=(
+                    [_fname.rsplit(".", 1)[-1]] if "." in _fname else None
+                ),
             )
             with contextlib.suppress(Exception):
                 pg.services.remove(fp)
@@ -940,13 +1099,18 @@ class FilesView:
                 return
             data = await asyncio.to_thread(self.db.get_user_file_data, _fid)
             if not data:
-                self._snack(self.t("files.err.no_data", "Не вдалося отримати файл"), ft.Colors.RED)
+                self._snack(
+                    self.t("files.err.no_data", "Не вдалося отримати файл"),
+                    ft.Colors.RED,
+                )
                 return
             try:
                 with open(save_path, "wb") as fh:
                     fh.write(data)
                 self._snack(
-                    self.t("files.saved", "Збережено: {name}").format(name=os.path.basename(save_path)),
+                    self.t("files.saved", "Збережено: {name}").format(
+                        name=os.path.basename(save_path)
+                    ),
                     ft.Colors.GREEN,
                 )
             except Exception as ex:
@@ -969,20 +1133,31 @@ class FilesView:
                     pg.pop_dialog()
                 ok = self.db.delete_user_file(_fid)
                 if ok:
-                    self._files = [x for x in self._files if str(x.get("id") or "") != _fid]
+                    self._files = [
+                        x for x in self._files if str(x.get("id") or "") != _fid
+                    ]
                     self._rebuild_files_col()
                     self._snack(f'"{_fname}" видалено', ft.Colors.ORANGE)
                 else:
-                    self._snack(self.t("files.err.delete_file", "Помилка видалення файлу"), ft.Colors.RED)
+                    self._snack(
+                        self.t("files.err.delete_file", "Помилка видалення файлу"),
+                        ft.Colors.RED,
+                    )
 
             dlg[0] = ft.AlertDialog(
                 modal=True,
                 title=ft.Text(
-                    self.t("files.delete_file_confirm", 'Видалити "{fname}"?').format(fname=_fname),
-                    size=14, weight="bold",
+                    self.t("files.delete_file_confirm", 'Видалити "{fname}"?').format(
+                        fname=_fname
+                    ),
+                    size=14,
+                    weight="bold",
                 ),
                 actions=[
-                    ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=lambda _: pg.pop_dialog()),
+                    ft.TextButton(
+                        self.t("common.cancel", "Скасувати"),
+                        on_click=lambda _: pg.pop_dialog(),
+                    ),
                     ft.FilledButton(
                         self.t("common.delete", "Видалити"),
                         icon=ft.Icons.DELETE_OUTLINE,
@@ -1010,42 +1185,57 @@ class FilesView:
         # Delete outside the row's visible/clickable area.
         action_btns = [
             ft.IconButton(
-                ft.Icons.OPEN_IN_NEW, icon_size=16, icon_color=_ACCENT,
+                ft.Icons.OPEN_IN_NEW,
+                icon_size=16,
+                icon_color=_ACCENT,
                 tooltip=self.t("files.tooltip.open", "Відкрити"),
                 on_click=_run_open,
                 style=ft.ButtonStyle(padding=ft.padding.all(4)),
-                width=24, height=24,
+                width=24,
+                height=24,
             ),
             ft.IconButton(
-                ft.Icons.SAVE_ALT, icon_size=16, icon_color=_OK_DK,
+                ft.Icons.SAVE_ALT,
+                icon_size=16,
+                icon_color=_OK_DK,
                 tooltip=self.t("files.tooltip.save_pc", "Зберегти на ПК"),
                 on_click=_run_save,
                 style=ft.ButtonStyle(padding=ft.padding.all(4)),
-                width=24, height=24,
+                width=24,
+                height=24,
             ),
         ]
         if not self._readonly:
             action_btns += [
                 ft.IconButton(
-                    ft.Icons.EDIT_OUTLINED, icon_size=16, icon_color=_MUTED,
+                    ft.Icons.EDIT_OUTLINED,
+                    icon_size=16,
+                    icon_color=_MUTED,
                     tooltip=self.t("files.tooltip.rename", "Перейменувати"),
                     on_click=lambda _, _rn=_rename: _rn(),
                     style=ft.ButtonStyle(padding=ft.padding.all(4)),
-                    width=24, height=24,
+                    width=24,
+                    height=24,
                 ),
                 ft.IconButton(
-                    ft.Icons.DRIVE_FILE_MOVE_OUTLINED, icon_size=16, icon_color=_MUTED,
+                    ft.Icons.DRIVE_FILE_MOVE_OUTLINED,
+                    icon_size=16,
+                    icon_color=_MUTED,
                     tooltip=self.t("files.tooltip.move", "Перемістити"),
                     on_click=lambda _, _mv=_move: _mv(),
                     style=ft.ButtonStyle(padding=ft.padding.all(4)),
-                    width=24, height=24,
+                    width=24,
+                    height=24,
                 ),
                 ft.IconButton(
-                    ft.Icons.DELETE_OUTLINE, icon_size=16, icon_color=ft.Colors.RED_400,
+                    ft.Icons.DELETE_OUTLINE,
+                    icon_size=16,
+                    icon_color=ft.Colors.RED_400,
                     tooltip=self.t("common.delete", "Видалити"),
                     on_click=lambda _, _cd=_confirm_delete: _cd(),
                     style=ft.ButtonStyle(padding=ft.padding.all(4)),
-                    width=24, height=24,
+                    width=24,
+                    height=24,
                 ),
             ]
 
@@ -1056,14 +1246,19 @@ class FilesView:
                 [
                     ft.Icon(icon_name, size=18, color=icon_color),
                     ft.Text(
-                        fname, size=12, expand=True,
-                        no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS, color=_TEXT,
+                        fname,
+                        size=12,
+                        expand=True,
+                        no_wrap=True,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                        color=_TEXT,
                     ),
                     ft.Text(_fmt_size(fsize), size=11, color=_MUTED, width=72),
                     ft.Text(date_str, size=11, color=_MUTED, width=86),
                     ft.Row(action_btns, spacing=0, width=self._actions_width()),
                 ],
-                spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
             ),
         )
 
@@ -1081,8 +1276,12 @@ class FilesView:
         else:
             base, ext = current_name, ""
         tf = ft.TextField(
-            value=base, autofocus=True, dense=True, text_size=13,
-            border_radius=6, suffix=ft.Text(ext) if ext else None,
+            value=base,
+            autofocus=True,
+            dense=True,
+            text_size=13,
+            border_radius=6,
+            suffix=ft.Text(ext) if ext else None,
             content_padding=ft.padding.symmetric(horizontal=10, vertical=6),
         )
         dlg: list = [None]
@@ -1105,15 +1304,24 @@ class FilesView:
                 self._rebuild_files_col()
                 self._snack(self.t("files.renamed", "Перейменовано"), ft.Colors.GREEN)
             else:
-                self._snack(self.t("files.err.rename", "Помилка перейменування"), ft.Colors.RED)
+                self._snack(
+                    self.t("files.err.rename", "Помилка перейменування"), ft.Colors.RED
+                )
 
         tf.on_submit = _save
         dlg[0] = ft.AlertDialog(
             modal=True,
-            title=ft.Text(self.t("files.dlg.rename_file", "Перейменувати файл"), size=14, weight="bold"),
+            title=ft.Text(
+                self.t("files.dlg.rename_file", "Перейменувати файл"),
+                size=14,
+                weight="bold",
+            ),
             content=ft.Container(width=320, content=tf),
             actions=[
-                ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=lambda _: pg.pop_dialog()),
+                ft.TextButton(
+                    self.t("common.cancel", "Скасувати"),
+                    on_click=lambda _: pg.pop_dialog(),
+                ),
                 ft.FilledButton(self.t("common.save", "Зберегти"), on_click=_save),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
@@ -1145,7 +1353,12 @@ class FilesView:
         flat = [f for f in flat if f["id"] != self._sel_folder_id]
 
         if not flat:
-            self._snack(self.t("files.err.no_other_folder", "Немає інших папок для переміщення"), _MUTED)
+            self._snack(
+                self.t(
+                    "files.err.no_other_folder", "Немає інших папок для переміщення"
+                ),
+                _MUTED,
+            )
             return
 
         options = [
@@ -1158,7 +1371,8 @@ class FilesView:
         dd = ft.Dropdown(
             options=options,
             hint_text=self.t("files.move_select_hint", "Оберіть папку…"),
-            dense=True, text_size=13,
+            dense=True,
+            text_size=13,
         )
         dlg: list = [None]
 
@@ -1175,17 +1389,23 @@ class FilesView:
                 )
                 self._reload_files()
             else:
-                self._snack(self.t("files.err.move", "Помилка переміщення"), ft.Colors.RED)
+                self._snack(
+                    self.t("files.err.move", "Помилка переміщення"), ft.Colors.RED
+                )
 
         dlg[0] = ft.AlertDialog(
             modal=True,
             title=ft.Text(
                 self.t("files.dlg.move", 'Перемістити "{fname}"').format(fname=fname),
-                size=14, weight="bold",
+                size=14,
+                weight="bold",
             ),
             content=ft.Container(width=340, content=dd),
             actions=[
-                ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=lambda _: pg.pop_dialog()),
+                ft.TextButton(
+                    self.t("common.cancel", "Скасувати"),
+                    on_click=lambda _: pg.pop_dialog(),
+                ),
                 ft.FilledButton(self.t("files.move_btn", "Перемістити"), on_click=_do),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
@@ -1233,14 +1453,15 @@ class FilesView:
 
         if len(data) > _MAX_FILE_SIZE:
             self._snack(
-                self.t("files.err.too_large", "Файл занадто великий (макс. {sz})").format(
-                    sz=_fmt_size(_MAX_FILE_SIZE)
-                ),
+                self.t(
+                    "files.err.too_large", "Файл занадто великий (макс. {sz})"
+                ).format(sz=_fmt_size(_MAX_FILE_SIZE)),
                 ft.Colors.RED,
             )
             return
 
         import mimetypes
+
         mime = mimetypes.guess_type(fname)[0] or "application/octet-stream"
 
         btn = self._upload_btn
@@ -1256,7 +1477,9 @@ class FilesView:
             self.company_id,
             self.manager_id,
             self.region_id,
-            fname, data, mime,
+            fname,
+            data,
+            mime,
         )
 
         if btn:
@@ -1272,7 +1495,9 @@ class FilesView:
             )
             self._reload_files()
         else:
-            self._snack(self.t("files.err.upload", "Помилка завантаження файлу"), ft.Colors.RED)
+            self._snack(
+                self.t("files.err.upload", "Помилка завантаження файлу"), ft.Colors.RED
+            )
 
     # ------------------------------------------------------------------ #
     #  Help                                                                #
@@ -1283,11 +1508,31 @@ class FilesView:
         if not page:
             return
         from views.help_utils import show_modal_help
-        show_modal_help(page, self.t("files.help.title", "Довідка — Файли"), [
-            self.t("files.help.desc", "Зберігання файлів, організованих у папки по регіонах."),
-            (self.t("files.help.steps_title", "Як користуватись"), None),
-            self.t("files.help.step1", "1. Ліворуч — дерево папок. Натисніть «Нова папка» щоб створити кореневу папку."),
-            self.t("files.help.step2", "2. Щоб створити підпапку — виберіть папку і натисніть іконку 📁+ біля неї."),
-            self.t("files.help.step3", "3. Клік на папку → праворуч з'являться файли. «Завантажити файл» додає файл (макс. 50 МБ)."),
-            self.t("files.help.step4", "4. Для кожного файлу: відкрити, зберегти, перемістити, видалити. Чужі файли — тільки читання."),
-        ])
+
+        show_modal_help(
+            page,
+            self.t("files.help.title", "Довідка — Файли"),
+            [
+                self.t(
+                    "files.help.desc",
+                    "Зберігання файлів, організованих у папки по регіонах.",
+                ),
+                (self.t("files.help.steps_title", "Як користуватись"), None),
+                self.t(
+                    "files.help.step1",
+                    "1. Ліворуч — дерево папок. Натисніть «Нова папка» щоб створити кореневу папку.",
+                ),
+                self.t(
+                    "files.help.step2",
+                    "2. Щоб створити підпапку — виберіть папку і натисніть іконку 📁+ біля неї.",
+                ),
+                self.t(
+                    "files.help.step3",
+                    "3. Клік на папку → праворуч з'являться файли. «Завантажити файл» додає файл (макс. 50 МБ).",
+                ),
+                self.t(
+                    "files.help.step4",
+                    "4. Для кожного файлу: відкрити, зберегти, перемістити, видалити. Чужі файли — тільки читання.",
+                ),
+            ],
+        )

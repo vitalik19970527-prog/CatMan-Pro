@@ -13,22 +13,19 @@ import time
 import urllib.request
 from collections import defaultdict
 from datetime import date, datetime
-from typing import Any, Optional
+from typing import Any
 
 import flet as ft
 
 import i18n
 from logger import logger
-from views.async_view_build_helper import create_orders_header_loading_indicator
-from views.number_format import (
-    format_grouped,
-    format_maybe_numeric_text,
-    row_text_matches,
-    safe_float,
-)
-from views.orders_view import _wrap_text_for_width
 from views import product_naming
+from views.async_view_build_helper import \
+    create_orders_header_loading_indicator
 from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
+from views.number_format import (format_grouped, format_maybe_numeric_text,
+                                 row_text_matches, safe_float)
+from views.orders_view import _wrap_text_for_width
 
 # ---------------------------------------------------------------------------
 # Theme colour shims — module defaults, shadowed by live theme at render time
@@ -73,7 +70,7 @@ _PACKAGING_SUPPLY_NUMERIC_PAYLOAD_FIELDS = frozenset(
 )
 
 
-def _safe_float(raw: Any, default: Optional[float] = None) -> Optional[float]:
+def _safe_float(raw: Any, default: float | None = None) -> float | None:
     return safe_float(raw, default)
 
 
@@ -268,7 +265,7 @@ class PackagingStockView:
     TREE_REMAINDER_GAP_TRIM = 1
     TREE_REMAINDER_OUTER_PAD_MUL = 0.75
     # Кнопки «Замовити пакування» / «Початковий баланс» у картці контексту товару
-    CONTEXT_BTN_H = int(round(30 * 0.75))
+    CONTEXT_BTN_H = round(30 * 0.75)
     CONTEXT_BTN_TEXT = 12
     # Горизонтальний падінг ≈ на 30% менший за типовий Material (~20–24px)
     CONTEXT_BTN_PAD_H = 8
@@ -342,7 +339,7 @@ class PackagingStockView:
         self._auto_refresh_started = False
         self._auto_refresh_last_sig = ""
         self._orders_last_known_snapshot_sig = ""
-        self._counters_row: Optional[ft.Row] = None
+        self._counters_row: ft.Row | None = None
 
         self._cv_body_scroll = None
         self._reload_seq = 0
@@ -492,7 +489,7 @@ class PackagingStockView:
         except Exception:
             return 0
 
-    def _load_pack_orders_cache(self) -> Optional[int]:
+    def _load_pack_orders_cache(self) -> int | None:
         """Load cached supply orders + opening + writeoffs from file. Returns cached pulse_ts or None on miss."""
         path = self._pack_orders_cache_file_path()
         if not os.path.exists(path):
@@ -2234,7 +2231,7 @@ class PackagingStockView:
 
     def _rollup_balance_entries_to_usd(
         self, entries: list[tuple[float, str]]
-    ) -> Optional[float]:
+    ) -> float | None:
         """Сума балансів у USD (через NBU), якщо для всіх валют відомий курс; інакше None."""
         if not entries:
             return None
@@ -2252,7 +2249,7 @@ class PackagingStockView:
 
     def _rollup_balance_entries_to_ccy(
         self, entries: list[tuple[float, str]], target_ccy: str
-    ) -> Optional[float]:
+    ) -> float | None:
         """Σ усіх пар (сума, валюта), перерахованих у target_ccy через курси NBU до UAH."""
         t = str(target_ccy or "").upper().strip()
         if not entries or not t:
@@ -2288,7 +2285,7 @@ class PackagingStockView:
 
     def _native_and_usd_balance_lines_for_entries(
         self, entries: list[tuple[float, str]]
-    ) -> tuple[str, Optional[str]]:
+    ) -> tuple[str, str | None]:
         """Текст для колонок «Баланс» / «Баланс $»; друге значення None — колонку $ не показувати (усі суми вже в USD)."""
         if not entries:
             return "—", None
@@ -2318,11 +2315,11 @@ class PackagingStockView:
     def _packaging_remainder_strip_ui(
         self,
         *,
-        headline: Optional[str],
+        headline: str | None,
         pack_qty: float,
         goods_qty: float,
         native_balance_body: str,
-        usd_balance_body: Optional[str],
+        usd_balance_body: str | None,
         outer_bg: str = _ALT,
         outer_border: str = _HDR,
         tree_compact: bool = False,
@@ -2549,7 +2546,7 @@ class PackagingStockView:
 
     def _packaging_amount_to_usd(
         self, amount: float | None, ccy: str
-    ) -> Optional[float]:
+    ) -> float | None:
         if amount is None:
             return None
         c = str(ccy or "").upper().strip() or "USD"
@@ -2570,8 +2567,8 @@ class PackagingStockView:
         self,
         context_id: str,
         *,
-        shipped_goods_qty: Optional[float] = None,
-        balance_paid_amount: Optional[float] = None,
+        shipped_goods_qty: float | None = None,
+        balance_paid_amount: float | None = None,
     ) -> None:
         cid = str(context_id or "").strip()
         if not cid or self.subordinate_ro:
@@ -5021,7 +5018,7 @@ class PackagingStockView:
                     ),
                 ),
             ],
-            spacing=max(4, int(round(8 * 0.7))),
+            spacing=max(4, round(8 * 0.7)),
         )
 
         # Приховуємо таблицю лише для контексту «пакування без постачання товару» (goods_supplier_id порожній),
@@ -6711,7 +6708,7 @@ class PackagingStockView:
 
                 def _zp_blur_goods(e, _roid=str(oid)):
                     try:
-                        pl = {"zp_1c": str((e.control.value or "")).strip()[:60]}
+                        pl = {"zp_1c": str(e.control.value or "").strip()[:60]}
                         logger.info(
                             "pack_stock inline_commit goods: oid=%s payload=%s",
                             _roid[:24],
@@ -6729,7 +6726,7 @@ class PackagingStockView:
 
                 def _inv_blur_goods(e, _roid=str(oid)):
                     try:
-                        _new_inv = str((e.control.value or "")).strip()[:60]
+                        _new_inv = str(e.control.value or "").strip()[:60]
                         if _new_inv and self._is_pack_invoice_dup(_roid, _new_inv):
                             _old_inv = next(
                                 (

@@ -3,23 +3,21 @@ import contextlib
 import json
 import os
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 import flet as ft
 
 import fx_rates
 import i18n
 from logger import logger
-from views.async_view_build_helper import create_orders_header_loading_indicator
-from views.cost_price_stock_table import (
-    build_stock_counters,
-    build_stock_filter_bar,
-    build_stock_table,
-    build_stock_totals,
-    set_stock_query,
-)
-from views.number_format import format_grouped, row_text_matches, safe_float
 from views import product_naming
+from views.async_view_build_helper import \
+    create_orders_header_loading_indicator
+from views.cost_price_stock_table import (build_stock_counters,
+                                          build_stock_filter_bar,
+                                          build_stock_table,
+                                          build_stock_totals, set_stock_query)
+from views.number_format import format_grouped, row_text_matches, safe_float
 
 # ---------------------------------------------------------------------------
 # Theme colour shims — module defaults, shadowed by live theme at render time
@@ -49,7 +47,7 @@ def _th_from_view(view) -> dict:
     return get_active_theme(str(getattr(view, "manager_id", "") or ""))
 
 
-def _safe_float(v, default: Optional[float] = None) -> Optional[float]:
+def _safe_float(v, default: float | None = None) -> float | None:
     return safe_float(v, default)
 
 
@@ -304,7 +302,6 @@ class CostPriceStockView:
 
             def _ro(_e=None):
                 self._snack(self.t("cost_orders.readonly_notice", "Режим перегляду — редагування заборонено"), "#64748B")
-                return None
 
             return _ro
 
@@ -347,7 +344,7 @@ class CostPriceStockView:
         control.on_submit = _handle
         control.on_blur = _handle
 
-    def _resolve_region_id(self) -> Optional[str]:
+    def _resolve_region_id(self) -> str | None:
         raw = str(self.active_region or "").strip()
         if not raw:
             return None
@@ -774,6 +771,7 @@ class CostPriceStockView:
     def _restart_tab(self) -> None:
         """Full tab restart after column changes — saves to local+DB then rebuilds via ctrl+f5."""
         import contextlib as _ctx
+
         # Persist current state to local file immediately (synchronous).
         with _ctx.suppress(Exception):
             self._save_workspace_state_to_file()
@@ -1457,7 +1455,7 @@ class CostPriceStockView:
             "CNY": "¥",
         }.get(c, c)
 
-    def _fmt_money(self, val: Optional[float], ccy: str = "") -> str:
+    def _fmt_money(self, val: float | None, ccy: str = "") -> str:
         if val is None:
             return ""
         amount = format_grouped(val, decimals=2, trim=True)
@@ -1475,13 +1473,13 @@ class CostPriceStockView:
         return fx_rates.get_uah_rates()
 
     def _convert_currency(
-        self, amount: Optional[float], from_ccy: str, to_ccy: str
-    ) -> Optional[float]:
+        self, amount: float | None, from_ccy: str, to_ccy: str
+    ) -> float | None:
         return fx_rates.convert(amount, from_ccy, to_ccy)
 
     def _sales_price_for_tier(
         self, product: dict, tier: dict
-    ) -> tuple[Optional[float], str]:
+    ) -> tuple[float | None, str]:
         if not isinstance(product, dict) or not isinstance(tier, dict):
             return None, str((tier or {}).get("currency") or "USD").upper()
         sales = product.get("sales_prices_json")
@@ -2496,7 +2494,7 @@ class CostPriceStockView:
         for rows_list in (self._warehouse_rows, self._archived_warehouse_rows):
             for i, row in enumerate(rows_list):
                 if str(row.get("product_id") or "") == pid:
-                    rows_list[i].update(_patch)
+                    row.update(_patch)
                     # Оновлюємо unit_cost_blended у refs для _update_new_margin_inplace
                     _margin_refs = getattr(self, "_new_price_margin_refs", {}).get(pid)
                     if isinstance(_margin_refs, dict):
@@ -2669,11 +2667,11 @@ class CostPriceStockView:
             out.append(row)
         return out
 
-    def _target_margin(self, category_id: str) -> Optional[float]:
+    def _target_margin(self, category_id: str) -> float | None:
         return self.db.get_category_target_margin(category_id)
 
     def _margin_colors(
-        self, margin: Optional[float], target_margin_pct: Optional[float]
+        self, margin: float | None, target_margin_pct: float | None
     ) -> tuple[str, str]:
         if margin is None:
             return (_ALT2, "#64748B")
@@ -2938,7 +2936,7 @@ class CostPriceStockView:
             spacing=0,
         )
 
-    def _persist_and_render(self, success_text: Optional[str] = "Збережено") -> None:
+    def _persist_and_render(self, success_text: str | None = "Збережено") -> None:
         if success_text:
             self._snack(success_text, "#0EA5E9")
         self._render()
@@ -3318,7 +3316,7 @@ class CostPriceStockView:
         for i, order in enumerate(self._orders):
             if not isinstance(order, dict):
                 continue
-            oid = str((order.get("id") or "")).strip()
+            oid = str(order.get("id") or "").strip()
             if not oid:
                 continue
             existing = self._shared_orders_map.get(oid)
@@ -3335,7 +3333,7 @@ class CostPriceStockView:
         for i, local in enumerate(self._orders):
             if not isinstance(local, dict):
                 continue
-            oid = str((local.get("id") or "")).strip()
+            oid = str(local.get("id") or "").strip()
             if not oid:
                 continue
             shared = self._shared_orders_map.get(oid)
@@ -3364,7 +3362,7 @@ class CostPriceStockView:
             o
             for o in self._orders
             if not (
-                isinstance(o, dict) and str((o.get("id") or "")).strip() in deleted_set
+                isinstance(o, dict) and str(o.get("id") or "").strip() in deleted_set
             )
         ]
         return len(self._orders) < before
@@ -3381,7 +3379,7 @@ class CostPriceStockView:
         for i, local in enumerate(self._orders):
             if not isinstance(local, dict):
                 continue
-            oid = str((local.get("id") or "")).strip()
+            oid = str(local.get("id") or "").strip()
             if not oid:
                 continue
             shared = self._shared_orders_map.get(oid)
@@ -3461,7 +3459,7 @@ class CostPriceStockView:
         for i, local in enumerate(self._orders):
             if not isinstance(local, dict):
                 continue
-            oid = str((local.get("id") or "")).strip()
+            oid = str(local.get("id") or "").strip()
             if oid:
                 shared = self._shared_orders_map.get(oid)
                 if shared is not None:

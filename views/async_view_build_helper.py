@@ -1,9 +1,10 @@
 import asyncio
 import contextlib
 import os
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import flet as ft
+
 import i18n
 from logger import logger as _abh_logger
 
@@ -26,7 +27,7 @@ def run_async_build(
     *,
     page,
     build_sync: Callable[[], None],
-    loading_stub_sync: Optional[Callable[[], None]] = None,
+    loading_stub_sync: Callable[[], None] | None = None,
     delay_sec: float = 0.01,
     token_attr: str = "_async_build_token",
     indicator_attr: str = "_header_loading_indicator",
@@ -194,7 +195,7 @@ _VERIFYING_KEY = "_orders_cache_is_verifying"
 _PULSE_KEY_PREFIX = "_orders_cache_pulse_"
 
 
-def _verified_key(region_id: Optional[str]) -> str:
+def _verified_key(region_id: str | None) -> str:
     return f"_orders_cache_session_verified_{region_id or 'all'}"
 
 
@@ -210,7 +211,7 @@ def _get_orders_pulse(db, company_id: str) -> int:
 # Legacy helpers kept so existing callers in cost_price_orders_table.py compile.
 # They are no longer called by ensure_orders_cache_fresh.
 def _orders_snapshot_path(
-    app_data_dir: str, company_id: str, manager_id: str, region_id: Optional[str]
+    app_data_dir: str, company_id: str, manager_id: str, region_id: str | None
 ) -> str:
     def _safe(s: str) -> str:
         return (s or "").replace("/", "_").replace("\\", "_")
@@ -223,7 +224,6 @@ def _orders_snapshot_path(
 
 def _save_snapshot(*args, **kwargs) -> None:
     """Snapshot writes are disabled. Kept for import compatibility only."""
-    pass
 
 
 def _read_snapshot_pulse(path: str) -> int:
@@ -242,9 +242,9 @@ async def ensure_orders_cache_fresh(
     app_data_dir: str,
     company_id: str,
     manager_id: str,
-    region_id: Optional[str],
+    region_id: str | None,
     shared_orders_map: dict,
-    visible_product_ids: Optional[list] = None,
+    visible_product_ids: list | None = None,
 ) -> None:
     """Ensure shared_orders_map is up-to-date with the DB.
 
@@ -285,11 +285,7 @@ async def ensure_orders_cache_fresh(
         # - pulse=0 (server doesn't support pulse) → always reload on FIRST open per session
         #   This is critical: startup may populate cache with stale API-cached data.
         #   With pulse=0 we can't detect if server changed, so we always do one fresh load.
-        if db_pulse == 0:
-            needs_reload = True
-        elif not has_orders:
-            needs_reload = True
-        elif db_pulse != cached_pulse:
+        if db_pulse == 0 or not has_orders or db_pulse != cached_pulse:
             needs_reload = True
         else:
             needs_reload = False

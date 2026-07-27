@@ -1682,7 +1682,7 @@ class SuppliersView:
                 return
             existing_ids = supplier.get("enabled_delivery_method_ids")
             restricted = isinstance(existing_ids, list) and len(existing_ids) > 0
-            allowed_ids = set(existing_ids) if restricted else None
+            allowed_ids = set(existing_ids) if restricted else set()
             rows = []
             for m in methods:
                 mid = m.get("id")

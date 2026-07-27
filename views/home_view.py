@@ -8,9 +8,7 @@ import flet as ft
 import fx_rates
 import i18n
 from views.async_view_build_helper import (
-    create_orders_header_loading_indicator,
-    run_async_build,
-)
+    create_orders_header_loading_indicator, run_async_build)
 from views.number_format import safe_float
 
 # Sync-pulse scopes covering every table the Home KPI grid reads from.
@@ -2657,7 +2655,7 @@ class HomeView:
             except Exception:
                 return None
 
-        def _add_days_to_iso(iso10: str, days_val: float | int) -> str:
+        def _add_days_to_iso(iso10: str, days_val: float) -> str:
             base = _safe_iso_date(iso10)
             if base is None:
                 return ""
@@ -5352,7 +5350,7 @@ class HomeView:
             order_id = str(order.get("id") or "").strip()
             if not order_id:
                 continue
-            for idx, item in enumerate((order.get("items") or [])):
+            for idx, item in enumerate(order.get("items") or []):
                 if not isinstance(item, dict):
                     continue
                 pid = str(item.get("product_id") or "").strip()
@@ -6088,7 +6086,8 @@ class HomeView:
                 with __import__("contextlib").suppress(Exception):
                     cb.update()
 
-        from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
+        from views.mobile_layout_helpers import (is_mobile,
+                                                 make_scrollable_chip_row)
 
         if is_mobile(self.content_area.page):
             # A wrap=True row of one checkbox per subordinate can grow to

@@ -3986,10 +3986,11 @@ class ProductsView:
         _supplier_ctx = (
             product.get("supplier") if isinstance(product.get("supplier"), dict) else {}
         )
-        _supplier_enabled_ids = _supplier_ctx.get("enabled_delivery_method_ids")
-        _supplier_restricted = (
-            isinstance(_supplier_enabled_ids, list) and len(_supplier_enabled_ids) > 0
+        _supplier_enabled_ids_raw = _supplier_ctx.get("enabled_delivery_method_ids")
+        _supplier_enabled_ids = (
+            _supplier_enabled_ids_raw if isinstance(_supplier_enabled_ids_raw, list) else []
         )
+        _supplier_restricted = len(_supplier_enabled_ids) > 0
         selected_delivery_ids = set()
         for method in self.db.get_effective_delivery_methods_for_manager(
             company_id, self.manager_id, product_region_id

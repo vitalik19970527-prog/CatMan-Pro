@@ -12,7 +12,6 @@ from datetime import date, timedelta
 
 import flet as ft
 
-
 import i18n
 from logger import logger
 from views import themes as _themes

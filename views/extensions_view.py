@@ -15,6 +15,7 @@ except Exception:
     TK_AVAILABLE = False
 
 import flet as ft
+
 import i18n
 
 # ---------------------------------------------------------------------------
@@ -34,7 +35,8 @@ def _th_from_view(view) -> dict:
     return get_active_theme(str(getattr(view, 'manager_id', '') or ''))
 
 
-from gsm_parser_runner import FIELD_CATALOG, LAST_PARSE_LOG_PATH, run_gsm_parser
+from gsm_parser_runner import (FIELD_CATALOG, LAST_PARSE_LOG_PATH,
+                               run_gsm_parser)
 from logger import logger
 from views.gsm_parser_view import GsmParserView
 
@@ -652,7 +654,8 @@ class ExtensionsView:
 
     async def _log_auto_refresh_task(self):
         import asyncio as _aio
-        import views.gsm_parser_view as _gpv  # noqa: PLC0415
+
+        import views.gsm_parser_view as _gpv
         while True:
             await _aio.sleep(3)
             if self.gsm_detail_tab != "logs":

@@ -11,7 +11,6 @@ local_pg_manager.py's pg_bin_dir()) — no separate download/tooling needed.
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import subprocess
 import tempfile

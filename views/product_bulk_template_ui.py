@@ -96,6 +96,7 @@ def show_bulk_product_template_dialog(dashboard: Any, on_after_import=None) -> N
     db = getattr(dashboard, "db", None)
     if page is None or db is None:
         return
+    _t = i18n.bind(str(getattr(dashboard, "manager_id", "") or ""))
 
     locked_cid = str(getattr(dashboard, "locked_company_id", None) or "").strip()
     selected_company_global = getattr(dashboard, "selected_company_id", None)

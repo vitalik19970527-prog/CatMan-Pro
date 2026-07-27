@@ -6,14 +6,15 @@ import json
 import os
 import uuid
 from datetime import date, datetime, timedelta
-from typing import Optional
 
 import flet as ft
+
 import i18n
 from logger import logger
-from views.async_view_build_helper import create_orders_header_loading_indicator
-from views.number_format import format_grouped, row_text_matches, safe_float
 from views import product_naming
+from views.async_view_build_helper import \
+    create_orders_header_loading_indicator
+from views.number_format import format_grouped, row_text_matches, safe_float
 from views.orders_view import _wrap_text_for_width
 
 try:
@@ -61,7 +62,7 @@ def _safe_float(v, default=None):
     return safe_float(v, default)
 
 
-def _fmt_money(v: Optional[float]) -> str:
+def _fmt_money(v: float | None) -> str:
     if v is None:
         return ""
     return format_grouped(v, decimals=2, trim=True)
@@ -77,7 +78,7 @@ def _fmt_date(d) -> str:
         return raw[:10]
 
 
-def _parse_date(raw) -> Optional[date]:
+def _parse_date(raw) -> date | None:
     txt = str(raw or "").strip()
     if not txt:
         return None
@@ -89,10 +90,7 @@ def _parse_date(raw) -> Optional[date]:
 
 def _picker_event_iso_date(e) -> str:
     raw = getattr(e, "data", None)
-    if isinstance(raw, bool):
-        ctl = getattr(e, "control", None)
-        raw = getattr(ctl, "value", None) if ctl is not None else None
-    elif raw is None:
+    if isinstance(raw, bool) or raw is None:
         ctl = getattr(e, "control", None)
         raw = getattr(ctl, "value", None) if ctl is not None else None
 
@@ -148,7 +146,7 @@ def _picker_event_iso_date(e) -> str:
         return txt[:10]
 
 
-def _month_start(d: Optional[date] = None) -> date:
+def _month_start(d: date | None = None) -> date:
     cur = d or date.today()
     return date(cur.year, cur.month, 1)
 
@@ -236,7 +234,7 @@ class OrderScheduleView:
         ).strip()
         self.read_only = bool(self.user_data.get("subordinate_view_readonly"))
 
-        self._region_id: Optional[str] = None
+        self._region_id: str | None = None
         self._products: list[dict] = []
         self._groups: list[dict] = []
         self._tasks: list[dict] = []
@@ -331,7 +329,7 @@ class OrderScheduleView:
         self._col_sort_dir: int = 0  # 0=off, 1=asc, 2=desc
 
     def _ordered_schedule_right_columns(
-        self, show_archive: Optional[bool] = None
+        self, show_archive: bool | None = None
     ) -> list[str]:
         include_archive = (
             self._show_archive_column if show_archive is None else bool(show_archive)
@@ -397,7 +395,7 @@ class OrderScheduleView:
         except Exception:
             return 0
 
-    def _load_schedule_cache(self) -> Optional[int]:
+    def _load_schedule_cache(self) -> int | None:
         """Load tasks + groups from file. Returns cached pulse_ts or None on miss."""
         path = self._schedule_cache_path()
         if not os.path.exists(path):
@@ -1610,7 +1608,7 @@ class OrderScheduleView:
                 page.update()
 
         def _on_mode(e):
-            nm = str((e.control.value or "")).strip()
+            nm = str(e.control.value or "").strip()
             if nm not in valid_keys:
                 return
             cur_mode[0] = nm
@@ -2270,7 +2268,7 @@ class OrderScheduleView:
             with contextlib.suppress(Exception):
                 await self._top_h_scrollbar.scroll_to(offset=offset, duration=0)
 
-    def _row_for_group_id(self, gid: str) -> Optional[dict]:
+    def _row_for_group_id(self, gid: str) -> dict | None:
         """Return a minimal row dict for a group, looked up from self._groups."""
         gid = str(gid or "").strip()
         if not gid:
@@ -2325,7 +2323,7 @@ class OrderScheduleView:
         except Exception:
             pass
 
-    def _resolve_region_id(self) -> Optional[str]:
+    def _resolve_region_id(self) -> str | None:
         name = self.active_region
         if not name:
             return None
@@ -2362,9 +2360,7 @@ class OrderScheduleView:
                 str(_p.get("supplier_id") or "").strip(),
             )
             _ex = _prod_dedup.get(_key)
-            if _ex is None:
-                _prod_dedup[_key] = _p
-            elif str(_p.get("updated_at") or "") > str(_ex.get("updated_at") or ""):
+            if _ex is None or str(_p.get("updated_at") or "") > str(_ex.get("updated_at") or ""):
                 _prod_dedup[_key] = _p
         self._products = list(_prod_dedup.values())
         self._product_disambiguators_cache = None
@@ -2666,7 +2662,7 @@ class OrderScheduleView:
         return result
 
     def _product_display_name(
-        self, product: dict, disambiguators: Optional[dict] = None
+        self, product: dict, disambiguators: dict | None = None
     ) -> str:
         prod = product if isinstance(product, dict) else {}
         name = str(prod.get("name") or "").strip() or "-"
@@ -3051,7 +3047,7 @@ class OrderScheduleView:
             _ws_inactive_keys = set(
                 self._workspace_state.get("inactive_row_keys") or []
             )
-            _grp_key = f"g:{str(grp.get('id') or '')}"
+            _grp_key = f"g:{grp.get('id') or ''!s}"
             if is_note:
                 # Note row: no real products, just a display_label and optional category/levels
                 note_label = str(grp.get("display_label") or "").strip() or "—"
@@ -3122,7 +3118,7 @@ class OrderScheduleView:
                     if not str(label or "").strip():
                         continue
                     per_seed = {
-                        "key": f"g:{str(grp.get('id') or '')}:{pid}",
+                        "key": f"g:{grp.get('id') or ''!s}:{pid}",
                         "group_id": str(grp.get("id") or "").strip(),
                         "group_ids": [str(grp.get("id") or "").strip()],
                         "product_ids": [pid],
@@ -3614,7 +3610,7 @@ class OrderScheduleView:
         except Exception:
             pass
 
-    def _save_group(self, row: dict, *, forced_group_id: Optional[str] = None) -> str:
+    def _save_group(self, row: dict, *, forced_group_id: str | None = None) -> str:
         if self.read_only:
             return ""
         gid = (
@@ -3987,7 +3983,7 @@ class OrderScheduleView:
         dlg.actions_alignment = ft.MainAxisAlignment.END
         pg.show_dialog(dlg)
 
-    def _open_note_row_dialog(self, existing_row: Optional[dict] = None) -> None:
+    def _open_note_row_dialog(self, existing_row: dict | None = None) -> None:
         """Create or edit a custom 'note' row (placeholder with no Товари entry)."""
         pg = self._pg()
         if not pg:
@@ -4278,7 +4274,7 @@ class OrderScheduleView:
                 return
             note = str(note_f.value or "").strip()
             try:
-                term_days: Optional[int] = (
+                term_days: int | None = (
                     int(str(term_f.value or "").strip())
                     if str(term_f.value or "").strip()
                     else None
@@ -4627,8 +4623,8 @@ class OrderScheduleView:
             page.run_task(_refresh)
 
     def _convert_amount(
-        self, amount: Optional[float], from_ccy: str, to_ccy: str
-    ) -> Optional[float]:
+        self, amount: float | None, from_ccy: str, to_ccy: str
+    ) -> float | None:
         if amount is None:
             return None
         src = str(from_ccy or "USD").upper().strip() or "USD"
@@ -4637,7 +4633,7 @@ class OrderScheduleView:
             return float(amount)
         rates = self._uah_rates() or {}
 
-        def _uah(ccy: str) -> Optional[float]:
+        def _uah(ccy: str) -> float | None:
             if ccy == "UAH":
                 return 1.0
             return _safe_float(rates.get(ccy), None)
@@ -4648,7 +4644,7 @@ class OrderScheduleView:
             return None
         return float(amount) * (float(src_uah) / float(dst_uah))
 
-    def _auto_pricing_context(self, row: dict) -> tuple[bool, Optional[float], str]:
+    def _auto_pricing_context(self, row: dict) -> tuple[bool, float | None, str]:
         if self._display_mode != "name":
             return False, None, "USD"
         # Note rows use their own stored price/currency if set
@@ -4762,7 +4758,7 @@ class OrderScheduleView:
         self,
         src_task: dict,
         src_row: dict,
-        src_month: Optional[date],
+        src_month: date | None,
         dst_row: dict,
         dst_month: date,
     ) -> None:
@@ -4781,7 +4777,7 @@ class OrderScheduleView:
         dst_month_str = _month_title(dst_month, self.t)
 
         # Build adjusted dates for the destination.
-        def _adjusted(field: str) -> Optional[str]:
+        def _adjusted(field: str) -> str | None:
             raw = _parse_date(src_task.get(field))
             if not raw:
                 return None
@@ -4998,7 +4994,7 @@ class OrderScheduleView:
         self._schedule_rebuild()
 
     def _open_task_dialog(
-        self, row: dict, month_anchor: date, task: Optional[dict] = None
+        self, row: dict, month_anchor: date, task: dict | None = None
     ):
         if self.read_only or not self._is_group_owned(row):
             self._snack(self.t("schedule.snack.readonly_mode", "У режимі перегляду редагування недоступне"), _WARN_FG)
@@ -5538,7 +5534,7 @@ class OrderScheduleView:
             return _OK, _OK_FG
         return _WARN, _WARN_FG
 
-    def _task_card(self, row: dict, task: dict, month_anchor: date) -> ft.Container:
+    def _task_card(self, row: dict, task: dict, month_anchor: date) -> ft.Container | ft.Draggable:
         planned_amount = _safe_float(task.get("planned_amount"), None)
         planned_currency = (
             str(task.get("planned_currency") or "USD").upper().strip() or "USD"
@@ -5717,7 +5713,7 @@ class OrderScheduleView:
             if hr:
                 delta = -step if self._drag_scroll_dir == "left" else step
                 with contextlib.suppress(Exception):
-                    hr.scroll_to(delta=delta, duration=120)
+                    await hr.scroll_to(delta=delta, duration=120)
             await asyncio.sleep(0.12)
 
     def _archive_cell(self, row: dict, row_h: int) -> ft.Container:
@@ -5964,7 +5960,7 @@ class OrderScheduleView:
         row: dict,
         month_anchor: date,
         *,
-        cell_lookup_row: Optional[dict] = None,
+        cell_lookup_row: dict | None = None,
     ) -> None:
         """In-place update of one month cell's task list after a save or delete.
 
@@ -6364,8 +6360,8 @@ class OrderScheduleView:
 
     def _table_header_right(
         self,
-        visible_months: Optional[list[date]] = None,
-        show_archive_column: Optional[bool] = None,
+        visible_months: list[date] | None = None,
+        show_archive_column: bool | None = None,
     ) -> ft.Container:
         months = list(visible_months or self._visible_month_anchors())
         show_archive = (

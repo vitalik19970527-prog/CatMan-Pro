@@ -1,6 +1,8 @@
 """Shared help-popup utilities for views and modal dialogs."""
 from __future__ import annotations
+
 import contextlib
+
 import flet as ft
 
 

@@ -1,6 +1,6 @@
-from typing import Optional
 
 import flet as ft
+
 from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
 from views.number_format import format_maybe_numeric_text, safe_float
 from views.orders_view import _wrap_text_for_width
@@ -35,7 +35,7 @@ def _th_from_view(view) -> dict:
     return get_active_theme(str(getattr(view, 'manager_id', '') or ''))
 
 
-def _safe_float(v, default: Optional[float] = None) -> Optional[float]:
+def _safe_float(v, default: float | None = None) -> float | None:
     return safe_float(v, default)
 
 

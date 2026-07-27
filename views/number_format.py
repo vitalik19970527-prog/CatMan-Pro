@@ -1,5 +1,5 @@
 import re
-from typing import Any, Optional
+from typing import Any
 
 _CURRENCY_PREFIXES = ("$", "€", "¥", "₴")
 _CURRENCY_SUFFIX_RE = re.compile(r"^\s*([+-]?[\d\s'.,]+)\s*([A-Za-z$€¥₴%]{1,8})\s*$")
@@ -24,7 +24,7 @@ def normalize_numeric_input(raw: Any) -> str:
     return s.strip()
 
 
-def safe_float(raw: Any, default: Optional[float] = None) -> Optional[float]:
+def safe_float(raw: Any, default: float | None = None) -> float | None:
     try:
         s = normalize_numeric_input(raw)
         if s == "":
@@ -35,7 +35,7 @@ def safe_float(raw: Any, default: Optional[float] = None) -> Optional[float]:
 
 
 def format_grouped(
-    value: Any, decimals: Optional[int] = None, trim: bool = True
+    value: Any, decimals: int | None = None, trim: bool = True
 ) -> str:
     n = safe_float(value, None)
     if n is None:

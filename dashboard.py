@@ -1383,10 +1383,11 @@ class MainDashboard:
         interval = fast_interval
         idle_cycles = 0
         error_streak = 0
-        while True:
-            await asyncio.sleep(interval)
+
+        async def _poll_once():
+            nonlocal interval, idle_cycles, error_streak
             if mode == "cache_only":
-                continue
+                return
             if mode == "shared_live":
                 # The DB round trip here used to run directly on this
                 # coroutine (called synchronously, not awaited) — over
@@ -1416,12 +1417,12 @@ class MainDashboard:
                     logger.exception("Shared-live sync off-thread fetch failed")
                 self._flush_pending_sync_pulse_view_reload_if_due()
                 interval = fast_interval
-                continue
+                return
             self._flush_pending_sync_pulse_view_reload_if_due()
             try:
                 company_id = (self.company_id or "").strip()
                 if not company_id:
-                    continue
+                    return
 
                 pulses = await asyncio.to_thread(
                     self.db.get_companies_sync_pulses,
@@ -1431,7 +1432,7 @@ class MainDashboard:
                 )
                 current = pulses.get(company_id, {}) if isinstance(pulses, dict) else {}
                 if not isinstance(current, dict):
-                    continue
+                    return
 
                 changed = False
                 changed_scopes = set()
@@ -1480,6 +1481,19 @@ class MainDashboard:
                 interval = min(
                     60.0, max(5.0, interval * (1.6 + min(error_streak, 5) * 0.1))
                 )
+
+        # Check for remote changes immediately on login/startup instead of
+        # only after the first `interval` sleep -- otherwise edits made from
+        # another PC while this session was closed wouldn't be pulled in
+        # until several seconds after the dashboard was already on screen
+        # (and, if that first poll happened to fail -- e.g. the shared VPS
+        # briefly out of free connections -- potentially much later, since
+        # the local on-disk order/product snapshots are only ever refreshed
+        # by this same loop noticing a bumped pulse).
+        await _poll_once()
+        while True:
+            await asyncio.sleep(interval)
+            await _poll_once()
 
     def _app_data_dir(self):
         flet_storage = os.getenv("FLET_APP_STORAGE_DATA")

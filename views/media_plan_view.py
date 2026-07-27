@@ -7,12 +7,13 @@ import logging
 import os
 import uuid
 from datetime import date, datetime, timedelta
-from typing import Optional
 
 import flet as ft
+
 import i18n
-from views.async_view_build_helper import create_orders_header_loading_indicator
 from views import product_naming
+from views.async_view_build_helper import \
+    create_orders_header_loading_indicator
 from views.number_format import row_text_matches
 
 _log = logging.getLogger("media_plan")
@@ -119,7 +120,7 @@ def _jlist(v) -> list:
     return []
 
 
-def _days_ago(d_str: Optional[str]) -> Optional[int]:
+def _days_ago(d_str: str | None) -> int | None:
     if not d_str:
         return None
     try:
@@ -128,7 +129,7 @@ def _days_ago(d_str: Optional[str]) -> Optional[int]:
         return None
 
 
-def _fmt_date(d_str: Optional[str]) -> str:
+def _fmt_date(d_str: str | None) -> str:
     if not d_str:
         return "-"
     try:
@@ -137,7 +138,7 @@ def _fmt_date(d_str: Optional[str]) -> str:
         return str(d_str)[:10]
 
 
-def _day_colors(days: Optional[int]) -> tuple[str, str]:
+def _day_colors(days: int | None) -> tuple[str, str]:
     if days is None:
         return _N_BG, _N_FG
     if days < 14:
@@ -205,7 +206,7 @@ class MediaPlanView:
         self._products: list[dict] = []
         self._entries: list[dict] = []
         self._selected: set[str] = set()
-        self._region_id: Optional[str] = None
+        self._region_id: str | None = None
         self._quick_filter = str(quick_filter or "").strip().lower()
         self._search_text_query: str = ""
 
@@ -314,7 +315,7 @@ class MediaPlanView:
         return self._quick_filter == "stale_posts"
 
     @staticmethod
-    def _stale_bucket(days: Optional[int], post_dates: list[str]) -> str:
+    def _stale_bucket(days: int | None, post_dates: list[str]) -> str:
         if not post_dates:
             return "red"
         if days is None:
@@ -385,7 +386,7 @@ class MediaPlanView:
         except Exception:
             return 0
 
-    def _load_entries_cache(self) -> Optional[int]:
+    def _load_entries_cache(self) -> int | None:
         """Load entries from file cache. Returns cached pulse_ts or None on miss."""
         path = self._entries_cache_path()
         if not os.path.exists(path):
@@ -2516,7 +2517,7 @@ class MediaPlanView:
             with contextlib.suppress(Exception):
                 await self._top_h_scrollbar.scroll_to(offset=offset, duration=0)
 
-    def _resolve_region_id(self) -> Optional[str]:
+    def _resolve_region_id(self) -> str | None:
         name = self.active_region
         if not name:
             return None
@@ -2759,7 +2760,7 @@ class MediaPlanView:
         self._initial_loaded = True
 
     @staticmethod
-    def _latest_date(dates: list[str]) -> Optional[str]:
+    def _latest_date(dates: list[str]) -> str | None:
         if not dates:
             return None
         try:
@@ -2768,10 +2769,10 @@ class MediaPlanView:
             return None
 
     @staticmethod
-    def _picker_iso_date(ev) -> Optional[str]:
+    def _picker_iso_date(ev) -> str | None:
         """Extract an ISO date from DatePicker event without timezone day-shift."""
 
-        def _normalize(raw_val) -> Optional[str]:
+        def _normalize(raw_val) -> str | None:
             if raw_val is None:
                 return None
             if isinstance(raw_val, datetime):
@@ -2876,7 +2877,7 @@ class MediaPlanView:
         )
 
     def _product_display_name(
-        self, product: dict, suffixes: Optional[dict] = None
+        self, product: dict, suffixes: dict | None = None
     ) -> str:
         prod = product if isinstance(product, dict) else {}
         name = str(prod.get("name") or "").strip() or "-"
@@ -3844,7 +3845,7 @@ class MediaPlanView:
             padding=ft.padding.symmetric(horizontal=8, vertical=6),
         )
 
-    def _next_post_date_str(self) -> Optional[str]:
+    def _next_post_date_str(self) -> str | None:
         """Nearest allowed-weekday date with no existing post across all entries."""
         allowed = self._allowed_post_weekdays or {0, 1, 2, 3, 4, 5, 6}
         existing: set[date] = set()
@@ -4695,7 +4696,7 @@ class MediaPlanView:
                 ),
                 "category_level_sort_pos": {
                     str(cid or "").strip(): int(
-                        (
+                        
                             (
                                 self._category_level_pos_by_title.get(
                                     str(cid or "").strip()
@@ -4708,7 +4709,7 @@ class MediaPlanView:
                                 )
                             )
                             or 0
-                        )
+                        
                     )
                     for cid, t_key in (
                         self._category_level_sort_title_key or {}
@@ -4794,7 +4795,7 @@ class MediaPlanView:
         return sorted([d for d in post_dates if str(d)[:7] == prefix])
 
     @staticmethod
-    def _latest_gap_less_than_14(post_dates: list) -> tuple[bool, Optional[str]]:
+    def _latest_gap_less_than_14(post_dates: list) -> tuple[bool, str | None]:
         parsed = []
         for raw in post_dates or []:
             try:
@@ -4816,8 +4817,7 @@ class MediaPlanView:
         max_dates = 1
         for m in self._visible_month_anchors():
             n = min(3, len(self._dates_for_month(post_dates, m)))
-            if n > max_dates:
-                max_dates = n
+            max_dates = max(max_dates, n)
         row_h = int(self._table_layout.get("row_h") or _ROW_H)
         return max(row_h, 34 + max_dates * 24)
 

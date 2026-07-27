@@ -27,8 +27,8 @@ from collections import Counter
 from datetime import date, datetime, timedelta
 
 import flet as ft
-import i18n
 
+import i18n
 from gsm_parser_runner import fetch_and_apply_manual_ek_url
 
 logger = logging.getLogger("gsm_parser_view")
@@ -1676,7 +1676,8 @@ class GsmParserView:
             matplotlib.use("Agg")
             import matplotlib.dates as mdates
             import matplotlib.pyplot as plt
-            from matplotlib.ticker import FixedLocator, FuncFormatter, MaxNLocator
+            from matplotlib.ticker import (FixedLocator, FuncFormatter,
+                                           MaxNLocator)
 
             dates, ek_min_vals, ek_max_vals, shops_vals = [], [], [], []
             for h in history:
@@ -7514,9 +7515,10 @@ class GsmParserView:
                 with contextlib.suppress(Exception):
                     _sync_status_text.update()
                 try:
+                    from datetime import datetime as _dt
+
                     from gsm_parser_runner import LAST_PARSE_LOG_PATH
                     from xiaomi_regions_sync import sync_xiaomi_regions
-                    from datetime import datetime as _dt
 
                     # Append to the existing parser log (don't clear it)
                     def _slog(m: str):
@@ -8180,7 +8182,8 @@ class GsmParserView:
         )
 
         # Row 1 — user controls (all users)
-        from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
+        from views.mobile_layout_helpers import (is_mobile,
+                                                 make_scrollable_chip_row)
 
         _gsm_is_mobile = is_mobile(page_ctrl)
         if _gsm_is_mobile:

@@ -14,11 +14,10 @@ import threading
 import time
 import urllib.request
 from datetime import datetime
-from typing import Optional
 
 import flet as ft
-import i18n
 
+import i18n
 from logger import logger
 
 # ── Palette ────────────────────────────────────────────────────────────────
@@ -151,7 +150,7 @@ def _fetch_uah_rates_blocking() -> dict:
     return result
 
 
-def _convert(amount: float, from_ccy: str, to_ccy: str, rates: dict) -> Optional[float]:
+def _convert(amount: float, from_ccy: str, to_ccy: str, rates: dict) -> float | None:
     fc, tc = from_ccy.upper(), to_ccy.upper()
     if fc == tc:
         return amount
@@ -195,7 +194,7 @@ def _fmt_money(v: float, ccy: str) -> str:
     return s + _fmt_val(v)
 
 
-def _safe_float(v) -> Optional[float]:
+def _safe_float(v) -> float | None:
     try:
         return float(str(v or "").replace(",", ".").strip())
     except Exception:
@@ -851,7 +850,7 @@ def _open_cost(
     company_id: str,
     region_id: str,
     regions_list: list[str],
-    prefill: Optional[dict] = None,
+    prefill: dict | None = None,
     back_fn=None,
 ):
     pf = prefill or {}
@@ -920,7 +919,7 @@ def _open_cost(
     method_widgets: dict[str, dict] = {}
     tier_widgets:   dict[str, dict] = {}
 
-    def _rebuild_methods(methods: list[dict], pf_methods: dict, dm_overrides: Optional[dict] = None):
+    def _rebuild_methods(methods: list[dict], pf_methods: dict, dm_overrides: dict | None = None):
         method_widgets.clear()
         rows = []
         if not methods:
@@ -1288,7 +1287,7 @@ def _open_profit(
     company_id: str,
     region_id: str,
     regions_list: list[str],
-    prefill: Optional[dict] = None,
+    prefill: dict | None = None,
     back_fn=None,
 ):
     pf = prefill or {}
@@ -1564,7 +1563,7 @@ def _open_profit(
 # ─────────────────────────────────────────────────────────────────────────────
 # ── 4. Обертаємість / Забезпеченість (combined) ───────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
-def _open_turnover_coverage(page, db, manager_id: str, prefill: Optional[dict] = None, back_fn=None):
+def _open_turnover_coverage(page, db, manager_id: str, prefill: dict | None = None, back_fn=None):
     pf = prefill or {}
     dlg = _FloatDialog()
     _FW = 336  # field width
@@ -1841,10 +1840,10 @@ def open_calculators_modal(
     manager_id: str,
     company_id: str,
     region_id: str,
-    regions_list: Optional[list[str]] = None,
+    regions_list: list[str] | None = None,
     *,
-    prefill_type: Optional[str] = None,
-    prefill_data: Optional[dict] = None,
+    prefill_type: str | None = None,
+    prefill_data: dict | None = None,
 ):
     """Open the main calculators picker dialog."""
     _t = i18n.bind(str(manager_id or ""))

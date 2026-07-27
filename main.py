@@ -1,5 +1,4 @@
 import asyncio
-import io
 import os
 import socket
 import subprocess
@@ -28,32 +27,8 @@ from logger import logger
 from superadmin_dashboard import SuperAdminDashboard
 
 _SINGLE_INSTANCE_PORT = 49712
-_SINGLE_INSTANCE_LOCK_FILE = "catman_pro_single_instance.lock"
 _REGISTERED_SELECTABLE_TEXTS: "weakref.WeakSet[ft.Text]" = weakref.WeakSet()
 _CRASH_HOOKS_INSTALLED = False
-
-
-class _SingleInstanceFileLock:
-    def __init__(self, handle: io.TextIOBase, lock_len: int = 1):
-        self._handle = handle
-        self._lock_len = lock_len
-
-    def close(self):
-        handle = getattr(self, "_handle", None)
-        if handle is None:
-            return
-        self._handle = None
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, self._lock_len)
-        except Exception:
-            logger.exception("Failed to release single-instance file lock")
-        finally:
-            with suppress(Exception):
-                handle.close()
 
 
 class _NullLock:
@@ -61,91 +36,6 @@ class _NullLock:
 
     def close(self):
         pass
-
-
-def _pid_is_alive(pid: int) -> bool:
-    """Return True if a process with the given PID exists and is running."""
-    if pid <= 0:
-        return False
-    try:
-        if os.name == "nt":
-            import ctypes
-
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            STILL_ACTIVE = 259
-            handle = ctypes.windll.kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
-            )
-            if not handle:
-                return False
-            try:
-                exit_code = ctypes.c_ulong(0)
-                ctypes.windll.kernel32.GetExitCodeProcess(
-                    handle, ctypes.byref(exit_code)
-                )
-                return exit_code.value == STILL_ACTIVE
-            finally:
-                ctypes.windll.kernel32.CloseHandle(handle)
-        else:
-            os.kill(pid, 0)
-            return True
-    except (PermissionError, ProcessLookupError, OSError):
-        return False
-    except Exception:
-        return False
-
-
-def _acquire_single_instance_file_lock():
-    lock_path = os.path.join(tempfile.gettempdir(), _SINGLE_INSTANCE_LOCK_FILE)
-
-    def _try_lock(path: str):
-        try:
-            handle = open(path, "a+", encoding="utf-8")
-        except Exception:
-            logger.exception("Failed to open single-instance lock file")
-            return None
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            handle.seek(0)
-            handle.truncate(0)
-            handle.write(str(os.getpid()))
-            handle.flush()
-            return _SingleInstanceFileLock(handle)
-        except Exception:
-            with suppress(Exception):
-                handle.close()
-            return None
-
-    result = _try_lock(lock_path)
-    if result is not None:
-        return result
-
-    # Lock failed — check if the owning PID is actually alive.
-    # If it's a stale lock from a crashed process, remove it and retry once.
-    try:
-        with open(lock_path, "r", encoding="utf-8") as f:
-            stale_pid = int((f.read() or "0").strip())
-    except Exception:
-        stale_pid = 0
-
-    if stale_pid and not _pid_is_alive(stale_pid):
-        logger.warning(
-            "Stale single-instance lock detected (pid=%s no longer alive). Removing lock file.",
-            stale_pid,
-        )
-        with suppress(Exception):
-            os.remove(lock_path)
-        return _try_lock(lock_path)
-
-    return None
 
 
 def _acquire_single_instance_lock():
@@ -164,9 +54,9 @@ def _acquire_single_instance_lock():
     """
     port = _SINGLE_INSTANCE_PORT
 
-    def _probe_alive() -> bool:
+    def _probe_alive(timeout: float = 0.3) -> bool:
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        probe.settimeout(0.2)
+        probe.settimeout(timeout)
         try:
             probe.connect(("127.0.0.1", port))
             return True  # got a response → someone is listening
@@ -192,13 +82,28 @@ def _acquire_single_instance_lock():
     except OSError:
         with suppress(Exception):
             sock.close()
-        # Bind failed — check once more if a live server appeared (race)
-        if _probe_alive():
-            return None
-        # Can't bind but nothing is listening either (e.g. port reserved by OS).
-        # Be lenient: let the app start rather than blocking it forever.
+        # Bind failed because another process already holds the port — two
+        # launches racing to start at nearly the same moment (seen in
+        # practice: two `python main.py` runs a second apart, each still
+        # inside slow module-import startup when the other's probe ran).
+        # A single 0.2s probe could spuriously read "nobody home" under
+        # system load and this handler used to fall through to *allowing*
+        # a duplicate start — which is exactly the scenario it's meant to
+        # catch. Retry the confirmation a few times with growing timeouts
+        # before conceding; a live listener answers almost immediately, so
+        # this only adds real delay in the genuine "OS reserved the port"
+        # case this fallback exists for.
+        for retry_timeout in (0.3, 0.6, 1.0):
+            time.sleep(0.15)
+            if _probe_alive(retry_timeout):
+                return None
+        # Still nothing detected after retries — either the OS has this
+        # port reserved for something else, or a very unusual local
+        # condition. Be lenient: let the app start rather than blocking it
+        # forever.
         logger.warning(
-            "single_instance: could not bind port %d but no live server detected; allowing start",
+            "single_instance: could not bind port %d but no live server detected"
+            " after retries; allowing start",
             port,
         )
         return _NullLock()  # dummy — lets the app start
@@ -1323,7 +1228,7 @@ def main(page: ft.Page):
                 update_state["busy"] = False
                 download_button.disabled = False
 
-        def open_download(_):
+        async def open_download(_):
             if update_state["busy"]:
                 return
 
@@ -1350,7 +1255,7 @@ def main(page: ft.Page):
                 # own "Install this app?" dialog, which is the only install
                 # path available on the platform anyway.
                 with suppress(Exception):
-                    page.launch_url(url)
+                    await page.launch_url(url)
                 return
 
             page.run_task(_download_and_install, url)

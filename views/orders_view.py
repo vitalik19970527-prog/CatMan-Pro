@@ -8,17 +8,17 @@ import sys
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
 from datetime import date, datetime, timedelta
-from typing import Callable, Optional, Union
 
 import flet as ft
 
 import fx_rates
 import i18n
 from logger import logger
-from views.number_format import format_grouped, format_maybe_numeric_text, safe_float
 from views import product_naming
 from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
+from views.number_format import format_grouped, format_maybe_numeric_text, safe_float
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT and _PROJECT_ROOT not in sys.path:
@@ -134,7 +134,7 @@ def _datepicker_value_to_iso_date(picked) -> str:
         return raw[:10]
 
 
-def _days_between(d1_str: str, d2_str: str) -> Optional[int]:
+def _days_between(d1_str: str, d2_str: str) -> int | None:
     try:
         d1 = datetime.fromisoformat(d1_str[:10]).date() if d1_str else None
         d2 = datetime.fromisoformat(d2_str[:10]).date() if d2_str else None
@@ -145,15 +145,14 @@ def _days_between(d1_str: str, d2_str: str) -> Optional[int]:
     return None
 
 
-def _add_days_to_iso(base_date_str: str, days: Optional[float]) -> str:
+def _add_days_to_iso(base_date_str: str, days: float | None) -> str:
     try:
         base = str(base_date_str or "").strip()[:10]
         if not base:
             return ""
         d0 = datetime.fromisoformat(base).date()
         d_days = int(round(float(days or 0)))
-        if d_days < 0:
-            d_days = 0
+        d_days = max(d_days, 0)
         return (d0 + timedelta(days=d_days)).isoformat()
     except Exception:
         return ""
@@ -202,7 +201,7 @@ def _order_row_sort_key(order_row: dict) -> tuple:
 
 
 @functools.lru_cache(maxsize=4096)
-def _wrap_text_for_width(text: str, width_px: Optional[int]) -> str:
+def _wrap_text_for_width(text: str, width_px: int | None) -> str:
     raw = str(text or "")
     if not raw:
         return raw
@@ -398,8 +397,7 @@ class OrdersView:
             for k, v in OrdersView.SUBMISSION_LABELS.items()
         }
         self.MONTH_NAMES = {
-            k: self.t(f"orders.month.{k}", v)
-            for k, v in OrdersView.MONTH_NAMES.items()
+            k: self.t(f"orders.month.{k}", v) for k, v in OrdersView.MONTH_NAMES.items()
         }
         self.STATUS_TRANSITION_DATE = {
             k: (field_name, self.t(f"orders.transition_date.{k}", label))
@@ -523,7 +521,7 @@ class OrdersView:
         # фільтр рендеру дерева (_filtered_orders), лічильники рахуються з self._orders повністю.
         self._display_from_month: str = ""
         self._suppress_auto_render_until_ts = 0.0
-        self._counters_row: Optional[ft.Row] = None
+        self._counters_row: ft.Row | None = None
         self._invoice_panel_open_by_order = {}
         # order_id -> [{"id","kind","original_filename","file_size",...}, ...]
         self._order_attachments_cache: dict = {}
@@ -532,17 +530,17 @@ class OrdersView:
         self._content_v_offset: float = 0.0
         self._table_h_offsets: dict[str, float] = {}
         self._table_scroll_rows: dict[str, ft.Row] = {}
-        self._pinned_h_scrollbar: Optional[ft.Row] = None
+        self._pinned_h_scrollbar: ft.Row | None = None
         self._h_scrollbar_offset: float = 0.0
         self._h_sync_pending: bool = False
-        self._header_busy_box: Optional[ft.Container] = None
-        self._header_busy_text: Optional[ft.Text] = None
+        self._header_busy_box: ft.Container | None = None
+        self._header_busy_text: ft.Text | None = None
         self._header_busy_tokens: set[str] = set()
         self._editable_product_ids: set = set()
 
         self._page_loading = False
         self._orders_ui_ready = False
-        self._page_title_spinner: Optional[ft.ProgressRing] = None
+        self._page_title_spinner: ft.ProgressRing | None = None
         self._orders_cache: dict[str, dict] = {}
         # Safety net independent of whatever causes a stray full reload to
         # miss a row (stale snapshot pulse, DB replication lag, etc.) — every
@@ -570,9 +568,9 @@ class OrdersView:
         self._auto_expand_retries: int = 0
         self._sync_status: str = "synced"
         self._sync_error_count: int = 0
-        self._sync_indicator_text: Optional[ft.Text] = None
-        self._sync_indicator_dot: Optional[ft.Container] = None
-        self._sync_indicator_container: Optional[ft.Container] = None
+        self._sync_indicator_text: ft.Text | None = None
+        self._sync_indicator_dot: ft.Container | None = None
+        self._sync_indicator_container: ft.Container | None = None
         self._shared_date_picker_open: bool = False
         self._shared_date_picker_last_open_ts: float = 0.0
         self._open_order_btn = None
@@ -592,7 +590,7 @@ class OrdersView:
             if r.get("id") and r.get("name")
         }
         self._no_db_after_ready: bool = False
-        self._visible_column_keys_cache: Optional[set] = None
+        self._visible_column_keys_cache: set | None = None
         self._click_queue: list = []
         self._click_counter: int = 0
         self._load_table_layout_state()
@@ -806,7 +804,7 @@ class OrdersView:
 
                 if cat_id and not cat_name:
                     cat_name = str(
-                        ((category_map.get(cat_id) or {}).get("name") or "")
+                        (category_map.get(cat_id) or {}).get("name") or ""
                     ).strip()
 
                 card_index[pid] = {
@@ -834,7 +832,7 @@ class OrdersView:
         for item in items:
             if not isinstance(item, dict):
                 continue
-            pid = str((item.get("product_id") or "")).strip()
+            pid = str(item.get("product_id") or "").strip()
             product = products_by_id.get(pid) or {}
             cid = str(product.get("category_id") or "").strip()
             if cid:
@@ -858,16 +856,16 @@ class OrdersView:
                 return cat_name
         return ""
 
-    def _product_option_label_map(
-        self, products: Optional[list] = None
-    ) -> dict[str, str]:
+    def _product_option_label_map(self, products: list | None = None) -> dict[str, str]:
         """Return {product_id: display_name}, appending " | Кат: X" / " | Постач: Y"
         for products whose name repeats elsewhere in `products` — see
         views/product_naming.py for the shared disambiguation rule."""
         src = products if isinstance(products, list) else list(self._products or [])
 
         cat_name_by_id: dict[str, str] = {
-            str((c or {}).get("id") or "").strip(): str((c or {}).get("name") or "").strip()
+            str((c or {}).get("id") or "")
+            .strip(): str((c or {}).get("name") or "")
+            .strip()
             for c in (getattr(self, "_categories", None) or [])
             if isinstance(c, dict) and (c.get("id") or "") and (c.get("name") or "")
         }
@@ -896,11 +894,15 @@ class OrdersView:
                     if isinstance(p.get("supplier"), dict)
                     else ""
                 )
-                or (suppliers_by_id.get(str(p.get("supplier_id") or "").strip()) or {}).get("name", "")
+                or (
+                    suppliers_by_id.get(str(p.get("supplier_id") or "").strip()) or {}
+                ).get("name", "")
                 or ""
             ).strip()
 
-        valid = [p for p in src if isinstance(p, dict) and str(p.get("id") or "").strip()]
+        valid = [
+            p for p in src if isinstance(p, dict) and str(p.get("id") or "").strip()
+        ]
         suffixes = product_naming.compute_name_suffixes(
             valid, category_of=_category_of, supplier_of=_supplier_of
         )
@@ -1543,7 +1545,7 @@ class OrdersView:
         for i, order in enumerate(self._orders):
             if not isinstance(order, dict):
                 continue
-            oid = str((order.get("id") or "")).strip()
+            oid = str(order.get("id") or "").strip()
             if not oid:
                 continue
             existing = self._shared_orders_map.get(oid)
@@ -1561,7 +1563,7 @@ class OrdersView:
         for i, local in enumerate(self._orders):
             if not isinstance(local, dict):
                 continue
-            oid = str((local.get("id") or "")).strip()
+            oid = str(local.get("id") or "").strip()
             if not oid:
                 continue
             shared = self._shared_orders_map.get(oid)
@@ -1723,27 +1725,41 @@ class OrdersView:
             txt.value = self.t("orders.sync.synced", "Збережено")
             txt.color = "#059669"
             dot.bgcolor = "#059669"
-            ctr.tooltip = self.t("orders.sync.synced_tip", "Дані вже перенесені в БД. Натисніть для примусової повторної синхронізації.")
+            ctr.tooltip = self.t(
+                "orders.sync.synced_tip",
+                "Дані вже перенесені в БД. Натисніть для примусової повторної синхронізації.",
+            )
         elif status == "pending":
             txt.value = self.t("orders.sync.pending", "Локально")
             txt.color = "#B45309"
             dot.bgcolor = "#F59E0B"
-            ctr.tooltip = self.t("orders.sync.pending_tip", "Дані збережені в кеші та ще не перенесені в БД. Натисніть для примусової синхронізації.")
+            ctr.tooltip = self.t(
+                "orders.sync.pending_tip",
+                "Дані збережені в кеші та ще не перенесені в БД. Натисніть для примусової синхронізації.",
+            )
         elif status == "syncing":
             txt.value = self.t("orders.sync.syncing", "Оновлення...")
             txt.color = "#1D4ED8"
             dot.bgcolor = "#3B82F6"
-            ctr.tooltip = self.t("orders.sync.syncing_tip", "Йде передача локальних змін у БД.")
+            ctr.tooltip = self.t(
+                "orders.sync.syncing_tip", "Йде передача локальних змін у БД."
+            )
         elif status == "unsaved":
             txt.value = self.t("orders.sync.unsaved", "Не збережено")
             txt.color = "#DC2626"
             dot.bgcolor = "#DC2626"
-            ctr.tooltip = self.t("orders.sync.unsaved_tip", "Є зміни в таблиці, які ще не потрапили навіть у кеш. Натисніть для примусового збереження і синхронізації.")
+            ctr.tooltip = self.t(
+                "orders.sync.unsaved_tip",
+                "Є зміни в таблиці, які ще не потрапили навіть у кеш. Натисніть для примусового збереження і синхронізації.",
+            )
         elif status == "error":
             txt.value = self.t("orders.sync.error", "Не збережено")
             txt.color = "#DC2626"
             dot.bgcolor = "#DC2626"
-            ctr.tooltip = self.t("orders.sync.error_tip", "Зміни залишилися лише локально. Натисніть для повторної передачі в БД.")
+            ctr.tooltip = self.t(
+                "orders.sync.error_tip",
+                "Зміни залишилися лише локально. Натисніть для повторної передачі в БД.",
+            )
         with contextlib.suppress(Exception):
             ctr.update()
 
@@ -1763,11 +1779,22 @@ class OrdersView:
         def _on_force_sync(_):
             self._flush_unsaved_local_drafts()
             if self._outbox_flush_running:
-                self._show_snack(self.t("orders.sync.already_running", "Синхронізація вже виконується"), "#1D4ED8")
+                self._show_snack(
+                    self.t(
+                        "orders.sync.already_running", "Синхронізація вже виконується"
+                    ),
+                    "#1D4ED8",
+                )
                 return
             if not self._outbox:
                 self._refresh_sync_indicator_state()
-                self._show_snack(self.t("orders.sync.no_local_changes", "Немає локальних змін для синхронізації"), "#0F766E")
+                self._show_snack(
+                    self.t(
+                        "orders.sync.no_local_changes",
+                        "Немає локальних змін для синхронізації",
+                    ),
+                    "#0F766E",
+                )
                 return
             page = self._page()
             if page and hasattr(page, "run_task"):
@@ -1777,7 +1804,12 @@ class OrdersView:
                 except Exception:
                     logger.exception("orders: failed to start force sync task")
             self._set_sync_status("error", 1)
-            self._show_snack(self.t("orders.sync.start_failed", "Не вдалося запустити синхронізацію"), "#DC2626")
+            self._show_snack(
+                self.t(
+                    "orders.sync.start_failed", "Не вдалося запустити синхронізацію"
+                ),
+                "#DC2626",
+            )
 
         self._sync_indicator_container = ft.Container(
             content=ft.Row(
@@ -1891,8 +1923,9 @@ class OrdersView:
             if flushed_count > 0 and not self._outbox:
                 try:
                     new_pulse = await asyncio.to_thread(self._orders_scope_pulse_ts)
-                    if new_pulse > self._orders_snapshot_pulse_ts:
-                        self._orders_snapshot_pulse_ts = new_pulse
+                    self._orders_snapshot_pulse_ts = max(
+                        self._orders_snapshot_pulse_ts, new_pulse
+                    )
                     # Tell all tabs: this pulse increase is from our own session.
                     with contextlib.suppress(Exception):
                         self._shared_orders_map["__session_db_pulse__"] = new_pulse
@@ -1954,10 +1987,8 @@ class OrdersView:
                     self._debug_print("sync timer no outbox items to flush")
         except asyncio.CancelledError:
             self._debug_print("sync timer cancelled")
-            pass
         except Exception as ex:
             self._debug_print(f"sync timer loop error: {ex}")
-            pass
 
     def _start_sync_timer(self) -> None:
         if self._sync_timer_task is not None:
@@ -2133,8 +2164,7 @@ class OrdersView:
             if new_pulse > cached_pulse:
                 # Check if this increase is from our own session's DB writes.
                 session_db_pulse = int(
-                    (self._shared_orders_map or {}).get("__session_db_pulse__", 0)
-                    or 0
+                    (self._shared_orders_map or {}).get("__session_db_pulse__", 0) or 0
                 )
                 if new_pulse <= session_db_pulse:
                     # Our own write — update cached pulse, no reload needed.
@@ -2715,7 +2745,7 @@ class OrdersView:
         current_index = rows_col.controls.index(target)
         new_key = _order_row_sort_key(order_row)
         order_by_id = {
-            str((o.get("id") or "")).strip(): o
+            str(o.get("id") or "").strip(): o
             for o in self._orders
             if isinstance(o, dict)
         }
@@ -2723,7 +2753,7 @@ class OrdersView:
         other_controls = [ctrl for ctrl in rows_col.controls if ctrl is not target]
         insert_pos = 0
         for ctrl in other_controls:
-            ctrl_id = str((getattr(ctrl, "key", None) or "")).strip()
+            ctrl_id = str(getattr(ctrl, "key", None) or "").strip()
             existing_order = order_by_id.get(ctrl_id) or self._orders_cache.get(ctrl_id)
             if not isinstance(existing_order, dict):
                 return False
@@ -2792,12 +2822,12 @@ class OrdersView:
             new_key = _order_row_sort_key(new_order)
             insert_pos = 0
             order_by_id = {
-                str((o.get("id") or "")).strip(): o
+                str(o.get("id") or "").strip(): o
                 for o in self._orders
                 if isinstance(o, dict)
             }
             for idx, ctrl in enumerate(rows_col.controls):
-                ctrl_id = str((getattr(ctrl, "key", None) or "")).strip()
+                ctrl_id = str(getattr(ctrl, "key", None) or "").strip()
                 existing_order = order_by_id.get(ctrl_id) or self._orders_cache.get(
                     ctrl_id
                 )
@@ -3102,8 +3132,7 @@ class OrdersView:
             inv = row.get("invoice_no") or ""
             try:
                 n = int(str(inv).lstrip("0") or "0")
-                if n > max_num:
-                    max_num = n
+                max_num = max(max_num, n)
             except Exception:
                 pass
         return str(max_num + 1).zfill(3)
@@ -3332,7 +3361,7 @@ class OrdersView:
             f"load lookups finished suppliers={len(self._suppliers)} products={len(self._products)} delivery_methods={len(self._delivery_methods)} editable_products={len(self._editable_product_ids)} include_products={include_products} in {time.monotonic() - start:.3f}s"
         )
 
-    def _delivery_method_tariff(self, method_row: Optional[dict]):
+    def _delivery_method_tariff(self, method_row: dict | None):
         row = method_row if isinstance(method_row, dict) else {}
         price = _safe_float(
             (
@@ -3465,7 +3494,7 @@ class OrdersView:
                 pass
         return {}
 
-    def _compute_rate_to_usd(self, ccy: str, rates_map: dict) -> Optional[float]:
+    def _compute_rate_to_usd(self, ccy: str, rates_map: dict) -> float | None:
         ccy = (ccy or "USD").upper()
         if ccy == "USD":
             return 1.0
@@ -3508,7 +3537,7 @@ class OrdersView:
         amount: float,
         from_ccy: str,
         to_ccy: str,
-    ) -> Optional[float]:
+    ) -> float | None:
         return fx_rates.convert(amount, from_ccy, to_ccy)
 
     def _page(self):
@@ -3608,23 +3637,51 @@ class OrdersView:
 
     def _show_help(self) -> None:
         from views.help_utils import show_modal_help
+
         page = self._page()
         if not page:
             return
         t = self.t
-        show_modal_help(page, t("orders.help.title", "Довідка — Замовлення"), [
-            t("orders.help.desc",
-              "Таблиця замовлень з угрупуванням рік → місяць → постачальник."
-              " Усі зміни зберігаються локально і синхронізуються з БД кожні 45 сек."),
-            (t("orders.help.steps_title", "Як користуватись"), None),
-            t("orders.help.step1", "1. Чіпи статусів вгорі — швидкий фільтр за статусом, оплатою або обліком."),
-            t("orders.help.step2", "2. Блок фільтрів — звужте список за постачальником, категорією, товаром або місяцями."),
-            t("orders.help.step3", "3. Натисніть «+» щоб створити нове замовлення (коротка форма)."),
-            t("orders.help.step4", "4. Клацніть на рядку замовлення → відкриється повна форма редагування."),
-            t("orders.help.step5", "5. Значок ▶ ліворуч від рядка розгортає деталі товарів замовлення."),
-            t("orders.help.step6", "6. Кнопка ☰ (колонки) — налаштування видимості і ширини стовпців."),
-            t("orders.help.step7", "7. Значок 🗑 з'являється при наведенні — видаляє замовлення після підтвердження."),
-        ])
+        show_modal_help(
+            page,
+            t("orders.help.title", "Довідка — Замовлення"),
+            [
+                t(
+                    "orders.help.desc",
+                    "Таблиця замовлень з угрупуванням рік → місяць → постачальник."
+                    " Усі зміни зберігаються локально і синхронізуються з БД кожні 45 сек.",
+                ),
+                (t("orders.help.steps_title", "Як користуватись"), None),
+                t(
+                    "orders.help.step1",
+                    "1. Чіпи статусів вгорі — швидкий фільтр за статусом, оплатою або обліком.",
+                ),
+                t(
+                    "orders.help.step2",
+                    "2. Блок фільтрів — звужте список за постачальником, категорією, товаром або місяцями.",
+                ),
+                t(
+                    "orders.help.step3",
+                    "3. Натисніть «+» щоб створити нове замовлення (коротка форма).",
+                ),
+                t(
+                    "orders.help.step4",
+                    "4. Клацніть на рядку замовлення → відкриється повна форма редагування.",
+                ),
+                t(
+                    "orders.help.step5",
+                    "5. Значок ▶ ліворуч від рядка розгортає деталі товарів замовлення.",
+                ),
+                t(
+                    "orders.help.step6",
+                    "6. Кнопка ☰ (колонки) — налаштування видимості і ширини стовпців.",
+                ),
+                t(
+                    "orders.help.step7",
+                    "7. Значок 🗑 з'являється при наведенні — видаляє замовлення після підтвердження.",
+                ),
+            ],
+        )
 
     def _show_snack(self, text: str, color: str = "#059669"):
         page = self._page()
@@ -3639,7 +3696,7 @@ class OrdersView:
                 )
             )
 
-    def _begin_header_busy(self, text: str = "Завантаження...") -> Optional[str]:
+    def _begin_header_busy(self, text: str = "Завантаження...") -> str | None:
         token = str(uuid.uuid4())
         self._header_busy_tokens.add(token)
         box = self._header_busy_box
@@ -3651,7 +3708,7 @@ class OrdersView:
                 box.update()
         return token
 
-    def _end_header_busy(self, token: Optional[str] = None):
+    def _end_header_busy(self, token: str | None = None):
         if not token:
             return
         self._header_busy_tokens.discard(str(token))
@@ -3833,7 +3890,7 @@ class OrdersView:
 
                     for pos in range(1, 7):
                         nid = str(
-                            ((card.get("level_node_ids") or {}).get(pos) or "")
+                            (card.get("level_node_ids") or {}).get(pos) or ""
                         ).strip()
                         if not nid:
                             continue
@@ -3962,8 +4019,8 @@ class OrdersView:
     def _order_receive_date_iso(
         self,
         order: dict,
-        products_by_id: Optional[dict] = None,
-        delivery_by_id: Optional[dict] = None,
+        products_by_id: dict | None = None,
+        delivery_by_id: dict | None = None,
     ) -> str:
         if not isinstance(order, dict):
             return ""
@@ -4065,7 +4122,7 @@ class OrdersView:
     def _order_payment_date_iso(
         self,
         order: dict,
-        products_by_id: Optional[dict] = None,
+        products_by_id: dict | None = None,
     ) -> str:
         """Estimated payment date = order_date + production_term_days (no delivery)."""
         if not isinstance(order, dict):
@@ -4138,7 +4195,7 @@ class OrdersView:
     def _order_payment_month_key(
         self,
         order: dict,
-        products_by_id: Optional[dict] = None,
+        products_by_id: dict | None = None,
     ) -> str:
         iso = self._order_payment_date_iso(order, products_by_id=products_by_id)
         return iso[:7] if len(iso) >= 7 else ""
@@ -4146,8 +4203,8 @@ class OrdersView:
     def _order_receive_month_key(
         self,
         order: dict,
-        products_by_id: Optional[dict] = None,
-        delivery_by_id: Optional[dict] = None,
+        products_by_id: dict | None = None,
+        delivery_by_id: dict | None = None,
     ) -> str:
         try:
             cached = (order or {}).get("_receive_month")
@@ -4527,9 +4584,9 @@ class OrdersView:
 
         total_orders = 0
         try:
-            total_orders = int(len([o for o in all_orders if isinstance(o, dict)]))
+            total_orders = len([o for o in all_orders if isinstance(o, dict)])
         except Exception:
-            total_orders = int(len(all_orders or []))
+            total_orders = len(all_orders or [])
 
         group_total = [
             _chip(
@@ -4672,7 +4729,7 @@ class OrdersView:
         except Exception:
             pass
 
-    def _build_payment_summary_panel(self) -> Optional[ft.Container]:
+    def _build_payment_summary_panel(self) -> ft.Container | None:
         month = self._filter_payment_month
         if month == "all":
             return None
@@ -4739,7 +4796,7 @@ class OrdersView:
         has_non_usd = any(c != "USD" for c in ccy_totals)
         COL_W = 150
 
-        def _to_usd(ccys: dict) -> Optional[float]:
+        def _to_usd(ccys: dict) -> float | None:
             total = 0.0
             for c, v in ccys.items():
                 if c == "USD":
@@ -4985,25 +5042,33 @@ class OrdersView:
 
         self._level_filter_dd_by_key = {}
 
-        delivery_options = [("all", self.t("orders.filter.all_deliveries", "Всі доставки"))] + [
+        delivery_options = [
+            ("all", self.t("orders.filter.all_deliveries", "Всі доставки"))
+        ] + [
             (did, dname)
             for did, dname in sorted(
                 facets["deliveries"].items(), key=lambda kv: (kv[1] or "").lower()
             )
         ]
-        supplier_options = [("all", self.t("orders.filter.all_suppliers", "Всі постачальники"))] + [
+        supplier_options = [
+            ("all", self.t("orders.filter.all_suppliers", "Всі постачальники"))
+        ] + [
             (sid, (sname or "")[:44])
             for sid, sname in sorted(
                 facets["suppliers"].items(), key=lambda kv: (kv[1] or "").lower()
             )
         ]
-        category_options = [("all", self.t("orders.filter.all_categories", "Всі категорії"))] + [
+        category_options = [
+            ("all", self.t("orders.filter.all_categories", "Всі категорії"))
+        ] + [
             (cid, (cname or "")[:44])
             for cid, cname in sorted(
                 facets["categories"].items(), key=lambda kv: (kv[1] or "").lower()
             )
         ]
-        product_options = [("all", self.t("orders.filter.all_products", "Всі товари"))] + [
+        product_options = [
+            ("all", self.t("orders.filter.all_products", "Всі товари"))
+        ] + [
             (pid, (pname or "")[:38])
             for pid, pname in sorted(
                 facets["products"].items(), key=lambda kv: (kv[1] or "").lower()
@@ -5027,16 +5092,28 @@ class OrdersView:
             self._schedule_filter_render()
 
         supplier_dd = _menu_filter(
-            self.t("orders.filter.supplier", "Постачальник"), self._filter_supplier_id, supplier_options, on_supplier
+            self.t("orders.filter.supplier", "Постачальник"),
+            self._filter_supplier_id,
+            supplier_options,
+            on_supplier,
         )
         category_dd = _menu_filter(
-            self.t("orders.filter.category", "Категорія"), self._filter_category_id, category_options, on_category
+            self.t("orders.filter.category", "Категорія"),
+            self._filter_category_id,
+            category_options,
+            on_category,
         )
         delivery_dd = _menu_filter(
-            self.t("orders.filter.delivery", "Доставка"), self._filter_delivery_id, delivery_options, on_delivery
+            self.t("orders.filter.delivery", "Доставка"),
+            self._filter_delivery_id,
+            delivery_options,
+            on_delivery,
         )
         product_dd = _menu_filter(
-            self.t("orders.filter.product", "Товар"), self._filter_product_id, product_options, on_product
+            self.t("orders.filter.product", "Товар"),
+            self._filter_product_id,
+            product_options,
+            on_product,
         )
 
         self._status_filter_dd = None
@@ -5057,7 +5134,9 @@ class OrdersView:
         ) -> ft.PopupMenuButton:
             is_active = selected_value != "all"
             month_map = {k: v for k, v in options}
-            label = month_map.get(selected_value, self.t("orders.filter.all_months", "Всі місяці"))
+            label = month_map.get(
+                selected_value, self.t("orders.filter.all_months", "Всі місяці")
+            )
             items = [
                 ft.PopupMenuItem(
                     content=ft.Text(lbl, size=popup_text_size),
@@ -5133,7 +5212,9 @@ class OrdersView:
         )
 
         filters_label = ft.Container(
-            content=ft.Text(self.t("orders.filter.label", "Фільтри:"), size=9, color=_TEXT),
+            content=ft.Text(
+                self.t("orders.filter.label", "Фільтри:"), size=9, color=_TEXT
+            ),
             padding=ft.padding.only(right=2),
         )
 
@@ -5190,7 +5271,9 @@ class OrdersView:
         facets = self._orders_facets()
         enabled_level_rows = facets.get("enabled_level_rows") or []
 
-        self._supplier_filter_dd.options = [_opt("all", self.t("orders.filter.all_suppliers", "Всі постачальники"))] + [
+        self._supplier_filter_dd.options = [
+            _opt("all", self.t("orders.filter.all_suppliers", "Всі постачальники"))
+        ] + [
             _opt(sid, (sname or "")[:44])
             for sid, sname in sorted(
                 facets["suppliers"].items(), key=lambda kv: (kv[1] or "").lower()
@@ -5204,7 +5287,9 @@ class OrdersView:
         self._supplier_filter_dd.value = self._filter_supplier_id
 
         if self._delivery_filter_dd:
-            self._delivery_filter_dd.options = [_opt("all", self.t("orders.filter.all_deliveries", "Всі доставки"))] + [
+            self._delivery_filter_dd.options = [
+                _opt("all", self.t("orders.filter.all_deliveries", "Всі доставки"))
+            ] + [
                 _opt(did, dname)
                 for did, dname in sorted(
                     facets["deliveries"].items(), key=lambda kv: (kv[1] or "").lower()
@@ -5218,7 +5303,9 @@ class OrdersView:
             self._delivery_filter_dd.value = self._filter_delivery_id
 
         if self._product_filter_dd:
-            self._product_filter_dd.options = [_opt("all", self.t("orders.filter.all_products", "Всі товари"))] + [
+            self._product_filter_dd.options = [
+                _opt("all", self.t("orders.filter.all_products", "Всі товари"))
+            ] + [
                 _opt(pid, (pname or "")[:38])
                 for pid, pname in sorted(
                     facets["products"].items(), key=lambda kv: (kv[1] or "").lower()
@@ -5232,7 +5319,9 @@ class OrdersView:
             self._product_filter_dd.value = self._filter_product_id
 
         if self._category_filter_dd:
-            self._category_filter_dd.options = [_opt("all", self.t("orders.filter.all_categories", "Всі категорії"))] + [
+            self._category_filter_dd.options = [
+                _opt("all", self.t("orders.filter.all_categories", "Всі категорії"))
+            ] + [
                 _opt(cid, (cname or "")[:44])
                 for cid, cname in sorted(
                     facets["categories"].items(), key=lambda kv: (kv[1] or "").lower()
@@ -5247,9 +5336,9 @@ class OrdersView:
 
         if self._status_filter_dd:
             visible_statuses = [s for s in self.STATUSES if s in facets["statuses"]]
-            self._status_filter_dd.options = [_opt("all", self.t("orders.filter.all_statuses", "Всі статуси"))] + [
-                _opt(s, self.STATUS_LABELS.get(s, s)) for s in visible_statuses
-            ]
+            self._status_filter_dd.options = [
+                _opt("all", self.t("orders.filter.all_statuses", "Всі статуси"))
+            ] + [_opt(s, self.STATUS_LABELS.get(s, s)) for s in visible_statuses]
             if not any(
                 str(getattr(opt, "key", "")) == str(self._filter_status)
                 for opt in (self._status_filter_dd.options or [])
@@ -5258,7 +5347,9 @@ class OrdersView:
             self._status_filter_dd.value = self._filter_status
 
         if self._payment_filter_dd:
-            self._payment_filter_dd.options = [_opt("all", self.t("orders.filter.all_payments", "Всі оплати"))] + [
+            self._payment_filter_dd.options = [
+                _opt("all", self.t("orders.filter.all_payments", "Всі оплати"))
+            ] + [
                 _opt(k, self.PAYMENT_LABELS.get(k, k))
                 for k in ["unpaid", "advance", "transferred", "paid"]
                 if k in facets["payments"]
@@ -5271,7 +5362,9 @@ class OrdersView:
             self._payment_filter_dd.value = self._filter_payment
 
         if self._submission_filter_dd:
-            self._submission_filter_dd.options = [_opt("all", self.t("orders.filter.all_1c", "Всі статуси обліку"))] + [
+            self._submission_filter_dd.options = [
+                _opt("all", self.t("orders.filter.all_1c", "Всі статуси обліку"))
+            ] + [
                 _opt(k, self.SUBMISSION_LABELS.get(k, k))
                 for k in ["not_submitted", "submitted"]
                 if k in facets["submissions"]
@@ -5299,7 +5392,14 @@ class OrdersView:
                 continue
             nodes_for_level = (facets.get("level_nodes") or {}).get(level_key) or {}
             dd.label = title
-            dd.options = [_opt("all", self.t("orders.filter.all_prefix", "Всі: {title}").format(title=title))] + [
+            dd.options = [
+                _opt(
+                    "all",
+                    self.t("orders.filter.all_prefix", "Всі: {title}").format(
+                        title=title
+                    ),
+                )
+            ] + [
                 _opt(node_id, (node_name or "")[:44])
                 for node_id, node_name in sorted(
                     nodes_for_level.items(), key=lambda kv: (kv[1] or "").lower()
@@ -5388,7 +5488,11 @@ class OrdersView:
                 sup_section_controls
                 or [
                     ft.Container(
-                        content=ft.Text(self.t("orders.empty_state", "Немає замовлень"), size=11, color=_TEXT),
+                        content=ft.Text(
+                            self.t("orders.empty_state", "Немає замовлень"),
+                            size=11,
+                            color=_TEXT,
+                        ),
                         padding=ft.padding.symmetric(horizontal=16, vertical=8),
                     )
                 ],
@@ -6144,7 +6248,9 @@ class OrdersView:
                     self._auto_expand_retries = 0
 
             if _loading_text is not None and _expand_ok:
-                _loading_text.value = self.t("orders.loading", "Завантаження замовлень...")
+                _loading_text.value = self.t(
+                    "orders.loading", "Завантаження замовлень..."
+                )
                 with contextlib.suppress(Exception):
                     _loading_text.update()
 
@@ -6560,11 +6666,11 @@ class OrdersView:
     def _make_collapsible(
         self,
         header_content: ft.Control,
-        body_controls: Optional[list] = None,
+        body_controls: list | None = None,
         initially_open: bool = True,
         bg_header: str = "#EFF6FF",
         border_color: str = "#CBD5E1",
-        body_factory: Optional[Callable[[], list]] = None,
+        body_factory: Callable[[], list] | None = None,
         label: str = "",
     ) -> ft.Container:
         controls = list(body_controls or [])
@@ -6892,47 +6998,137 @@ class OrdersView:
             {"key": "log", "label": self.t("orders.col.log", "Плече"), "width": 45},
             *(
                 [
-                    {"key": "date_payment", "label": self.t("orders.col.date_payment", "Оплата"), "width": 50},
-                    {"key": "date_receive", "label": self.t("orders.col.date_receive", "Отрим"), "width": 50},
-                    {"key": "dur_acc", "label": self.t("orders.col.dur_acc", "Відхил"), "width": 45},
+                    {
+                        "key": "date_payment",
+                        "label": self.t("orders.col.date_payment", "Оплата"),
+                        "width": 50,
+                    },
+                    {
+                        "key": "date_receive",
+                        "label": self.t("orders.col.date_receive", "Отрим"),
+                        "width": 50,
+                    },
+                    {
+                        "key": "dur_acc",
+                        "label": self.t("orders.col.dur_acc", "Відхил"),
+                        "width": 45,
+                    },
                 ]
                 if self._show_dates_block
                 else []
             ),
             {"key": "inv", "label": self.t("orders.col.inv", "Інвойс"), "width": 50},
-            {"key": "order1c", "label": self.t("orders.col.order1c", "ЗП обліку"), "width": 50},
-            {"key": "product", "label": self.t("orders.col.product", "Товар"), "width": 120},
-            {"key": "status", "label": self.t("orders.col.status", "Статус"), "width": 70},
-            {"key": "delivery", "label": self.t("orders.col.delivery", "Тип доставки"), "width": 55},
-            {"key": "comment", "label": self.t("orders.col.comment", "Коментар"), "width": 75},
+            {
+                "key": "order1c",
+                "label": self.t("orders.col.order1c", "ЗП обліку"),
+                "width": 50,
+            },
+            {
+                "key": "product",
+                "label": self.t("orders.col.product", "Товар"),
+                "width": 120,
+            },
+            {
+                "key": "status",
+                "label": self.t("orders.col.status", "Статус"),
+                "width": 70,
+            },
+            {
+                "key": "delivery",
+                "label": self.t("orders.col.delivery", "Тип доставки"),
+                "width": 55,
+            },
+            {
+                "key": "comment",
+                "label": self.t("orders.col.comment", "Коментар"),
+                "width": 75,
+            },
             {"key": "qty", "label": self.t("orders.col.qty", "К-сть"), "width": 55},
-            {"key": "amount", "label": self.t("orders.col.amount", "Вартість"), "width": 65},
+            {
+                "key": "amount",
+                "label": self.t("orders.col.amount", "Вартість"),
+                "width": 65,
+            },
             *(
                 []
                 if hide_amount_usd
-                else [{"key": "amount_usd", "label": self.t("orders.col.amount_usd", "Варт. $"), "width": 65}]
+                else [
+                    {
+                        "key": "amount_usd",
+                        "label": self.t("orders.col.amount_usd", "Варт. $"),
+                        "width": 65,
+                    }
+                ]
             ),
-            {"key": "payment", "label": self.t("orders.col.payment", "Сплата"), "width": 55},
-            {"key": "submission", "label": self.t("orders.col.submission", "Внесення даних"), "width": 60},
+            {
+                "key": "payment",
+                "label": self.t("orders.col.payment", "Сплата"),
+                "width": 55,
+            },
+            {
+                "key": "submission",
+                "label": self.t("orders.col.submission", "Внесення даних"),
+                "width": 60,
+            },
         ]
         if self._show_dates_block:
             cols.extend(
                 [
-                    {"key": "date_prod_end", "label": self.t("orders.col.date_prod_end", "Готово"), "width": 60},
-                    {"key": "dur_prod", "label": self.t("orders.col.dur_prod", "Терм вир-ва"), "width": 45},
-                    {"key": "date_wh", "label": self.t("orders.col.date_wh", "На складі"), "width": 60},
-                    {"key": "dur_deliv", "label": self.t("orders.col.dur_deliv", "Терм дос-ки"), "width": 45},
-                    {"key": "date_1c", "label": self.t("orders.col.date_1c", "Прийомка"), "width": 60},
-                    {"key": "term_acc", "label": self.t("orders.col.term_acc", "Терм прий-ки"), "width": 45},
+                    {
+                        "key": "date_prod_end",
+                        "label": self.t("orders.col.date_prod_end", "Готово"),
+                        "width": 60,
+                    },
+                    {
+                        "key": "dur_prod",
+                        "label": self.t("orders.col.dur_prod", "Терм вир-ва"),
+                        "width": 45,
+                    },
+                    {
+                        "key": "date_wh",
+                        "label": self.t("orders.col.date_wh", "На складі"),
+                        "width": 60,
+                    },
+                    {
+                        "key": "dur_deliv",
+                        "label": self.t("orders.col.dur_deliv", "Терм дос-ки"),
+                        "width": 45,
+                    },
+                    {
+                        "key": "date_1c",
+                        "label": self.t("orders.col.date_1c", "Прийомка"),
+                        "width": 60,
+                    },
+                    {
+                        "key": "term_acc",
+                        "label": self.t("orders.col.term_acc", "Терм прий-ки"),
+                        "width": 45,
+                    },
                 ]
             )
         if self._show_cost_block:
             cols.extend(
                 [
-                    {"key": "w_prev", "label": self.t("orders.col.w_prev", "Вага розр"), "width": 50},
-                    {"key": "w_fact", "label": self.t("orders.col.w_fact", "Вага факт"), "width": 50},
-                    {"key": "tariff", "label": self.t("orders.col.tariff", "Тариф"), "width": 30},
-                    {"key": "unit_cost", "label": self.t("orders.col.unit_cost", "С/В"), "width": 30},
+                    {
+                        "key": "w_prev",
+                        "label": self.t("orders.col.w_prev", "Вага розр"),
+                        "width": 50,
+                    },
+                    {
+                        "key": "w_fact",
+                        "label": self.t("orders.col.w_fact", "Вага факт"),
+                        "width": 50,
+                    },
+                    {
+                        "key": "tariff",
+                        "label": self.t("orders.col.tariff", "Тариф"),
+                        "width": 30,
+                    },
+                    {
+                        "key": "unit_cost",
+                        "label": self.t("orders.col.unit_cost", "С/В"),
+                        "width": 30,
+                    },
                 ]
             )
         cols.append(
@@ -7009,14 +7205,14 @@ class OrdersView:
     def _table_cell(
         self,
         text: str = "",
-        width: Optional[int] = None,
+        width: int | None = None,
         expand: bool = False,
-        size: Union[int, float] = 8,
+        size: float = 8,
         bold: bool = False,
         color: str = "#1F2937",
-        height: Optional[int] = None,
+        height: int | None = None,
         no_wrap: bool = True,
-        max_lines: Optional[int] = 1,
+        max_lines: int | None = 1,
         bgcolor: str = "#FFFFFF",
         text_align: ft.TextAlign = ft.TextAlign.CENTER,
     ) -> ft.Container:
@@ -7057,7 +7253,7 @@ class OrdersView:
             ),
         )
 
-    def _build_table_header(self, specs: Optional[list] = None) -> ft.Container:
+    def _build_table_header(self, specs: list | None = None) -> ft.Container:
         cells = []
         specs = specs if isinstance(specs, list) else self._table_col_specs()
 
@@ -7169,9 +7365,18 @@ class OrdersView:
             label=self.t(
                 "orders.col_settings.display_from_month", "Перший місяць відображення"
             ),
-            value=(self._display_from_month if self._display_from_month in _dfm_months else ""),
+            value=(
+                self._display_from_month
+                if self._display_from_month in _dfm_months
+                else ""
+            ),
             options=[
-                ft.dropdown.Option("", self.t("orders.col_settings.show_all_history", "Показати всю історію"))
+                ft.dropdown.Option(
+                    "",
+                    self.t(
+                        "orders.col_settings.show_all_history", "Показати всю історію"
+                    ),
+                )
             ]
             + [ft.dropdown.Option(m, _dfm_label(m)) for m in _dfm_months],
             width=320,
@@ -7249,22 +7454,52 @@ class OrdersView:
 
         def _tbl_help(_):
             from views.help_utils import show_modal_help
-            show_modal_help(page, self.t("orders.dlg.column_settings", "Розміри таблиці"), [
-                self.t("orders.col_help.step1", "1. Відмітьте колонки, які хочете бачити в таблиці."),
-                self.t("orders.col_help.step2", "2. Введіть висоту рядка в пікселях (рекомендовано 36–48, менше = більше рядків)."),
-                self.t("orders.col_help.step4", "4. Задайте ширину кожної колонки або залиште 0 для авто."),
-                self.t("orders.col_help.step5", "5. «Зберегти» — налаштування синхронізуються між усіма пристроями."),
-                self.t("orders.col_help.step6", "«Скинути» — повертає всі ширини до стандартних значень."),
-            ])
+
+            show_modal_help(
+                page,
+                self.t("orders.dlg.column_settings", "Розміри таблиці"),
+                [
+                    self.t(
+                        "orders.col_help.step1",
+                        "1. Відмітьте колонки, які хочете бачити в таблиці.",
+                    ),
+                    self.t(
+                        "orders.col_help.step2",
+                        "2. Введіть висоту рядка в пікселях (рекомендовано 36–48, менше = більше рядків).",
+                    ),
+                    self.t(
+                        "orders.col_help.step4",
+                        "4. Задайте ширину кожної колонки або залиште 0 для авто.",
+                    ),
+                    self.t(
+                        "orders.col_help.step5",
+                        "5. «Зберегти» — налаштування синхронізуються між усіма пристроями.",
+                    ),
+                    self.t(
+                        "orders.col_help.step6",
+                        "«Скинути» — повертає всі ширини до стандартних значень.",
+                    ),
+                ],
+            )
 
         dlg = ft.AlertDialog(
             modal=True,
             title=ft.Row(
                 [
-                    ft.Text(self.t("orders.dlg.column_settings", "Розміри таблиці"), weight="bold", expand=True),
-                    ft.IconButton(icon=ft.Icons.HELP_OUTLINE, icon_size=16, tooltip=self.t("common.help.tooltip", "Довідка"), on_click=_tbl_help),
+                    ft.Text(
+                        self.t("orders.dlg.column_settings", "Розміри таблиці"),
+                        weight="bold",
+                        expand=True,
+                    ),
+                    ft.IconButton(
+                        icon=ft.Icons.HELP_OUTLINE,
+                        icon_size=16,
+                        tooltip=self.t("common.help.tooltip", "Довідка"),
+                        on_click=_tbl_help,
+                    ),
                 ],
-                vertical_alignment=ft.CrossAxisAlignment.CENTER, tight=True,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                tight=True,
             ),
             content=ft.Container(
                 width=620,
@@ -7275,7 +7510,12 @@ class OrdersView:
                             size=12,
                             color=_TEXT,
                         ),
-                        ft.Text(self.t("orders.section.visible_columns", "Видимі колонки"), size=11, weight="w600", color=_TEXT),
+                        ft.Text(
+                            self.t("orders.section.visible_columns", "Видимі колонки"),
+                            size=11,
+                            weight="w600",
+                            color=_TEXT,
+                        ),
                         cols_pick_col,
                         row_h_f,
                         ft.Divider(height=8, color=_BORDER),
@@ -7297,7 +7537,7 @@ class OrdersView:
         )
         page.show_dialog(dlg)
 
-    def _build_orders_table(self, orders: list, table_key: str = "") -> ft.Container:
+    def _build_orders_table(self, orders: list, table_key: str = "") -> ft.Container | ft.Row:
         hide_amount_usd = False
         try:
             first = (orders or [None])[0] or {}
@@ -7327,7 +7567,8 @@ class OrdersView:
             str((o or {}).get("id") or "").strip()
             for o in (orders or [])
             if isinstance(o, dict)
-            and str((o or {}).get("id") or "").strip() not in self._order_attachments_cache
+            and str((o or {}).get("id") or "").strip()
+            not in self._order_attachments_cache
         ]
         if _uncached_ids:
             with contextlib.suppress(Exception):
@@ -7371,7 +7612,7 @@ class OrdersView:
         )
 
     def _build_order_row(
-        self, order: dict, specs: Optional[list] = None, row_idx: int = 0
+        self, order: dict, specs: list | None = None, row_idx: int = 0
     ) -> ft.Container:
         row_h = int(max(26, min(72, self._table_row_height)))
         row_bg = _PANEL if row_idx % 2 == 0 else _ALT  # чергування панель/альт
@@ -7424,8 +7665,8 @@ class OrdersView:
 
         def _resolve_actual_weights(
             items_list: list,
-            total_override: Optional[float] = None,
-            prod_map: Optional[dict] = None,
+            total_override: float | None = None,
+            prod_map: dict | None = None,
         ):
             prev_weights = []
             manual_weights = []
@@ -7480,7 +7721,7 @@ class OrdersView:
 
         def _effective_item_pricing(item: dict):
             it = item if isinstance(item, dict) else {}
-            pid = str((it.get("product_id") or "")).strip()
+            pid = str(it.get("product_id") or "").strip()
             prod = products_by_id.get(pid)
 
             p = _safe_float((it or {}).get("purchase_price"), None)
@@ -7528,7 +7769,7 @@ class OrdersView:
             draft_order.get("amount_manual_override"), None
         )
 
-        def _items_total_usd(items_list: list) -> Optional[float]:
+        def _items_total_usd(items_list: list) -> float | None:
             if manual_amount_override is not None:
                 manual_conv = self._convert_currency_amount(
                     manual_amount_override,
@@ -7585,7 +7826,7 @@ class OrdersView:
             _amount_with_ccy(amount_usd_text, "USD") if amount_usd_text else ""
         )
 
-        def _need_lines_for_text(txt: str, w: Optional[int]) -> int:
+        def _need_lines_for_text(txt: str, w: int | None) -> int:
             try:
                 width = int(w or 0)
             except Exception:
@@ -7724,9 +7965,9 @@ class OrdersView:
         tariff_ccy = (
             (draft_order.get("delivery_price_currency_snapshot") or "").upper().strip()
         )
-        delivery_type_id = str((order.get("delivery_type_id") or "")).strip()
+        delivery_type_id = str(order.get("delivery_type_id") or "").strip()
         delivery_type_name = str(
-            (order.get("delivery_type_name") or order.get("delivery_type") or "")
+            order.get("delivery_type_name") or order.get("delivery_type") or ""
         ).strip()
 
         selected_delivery_row = (
@@ -7764,7 +8005,7 @@ class OrdersView:
             products_by_id=products_by_id,
         )
 
-        def _safe_iso_date(value: str) -> Optional[date]:
+        def _safe_iso_date(value: str) -> date | None:
             raw = str(value or "").strip()[:10]
             if len(raw) != 10 or raw[4] != "-" or raw[7] != "-":
                 return None
@@ -7795,7 +8036,7 @@ class OrdersView:
                 else:
                     date_receive_bg = "#FEE2E2"  # red — today or overdue
 
-        deviation_days: Optional[int] = None
+        deviation_days: int | None = None
         deviation_text = ""
         deviation_bg = row_bg
         if receive_dt is not None:
@@ -7804,7 +8045,7 @@ class OrdersView:
             deviation_text = f"{deviation_days} дн."
             deviation_bg = "#DBEAFE" if deviation_days <= 0 else "#FEE2E2"
 
-        def _current_tariff_usd() -> tuple[Optional[float], str, Optional[float], str]:
+        def _current_tariff_usd() -> tuple[float | None, str, float | None, str]:
             t = _safe_float(draft_order.get("delivery_price_snapshot"), None)
             t_ccy = (
                 (
@@ -7861,10 +8102,20 @@ class OrdersView:
 
                 # Cost-price pivot: this item's own currency if the purchase
                 # price and logistics tariff share one currency, otherwise USD.
-                item_ccy = str(
-                    (base_item_ccy if manual_amount_override is not None and len(draft_items) == 1 else ccy)
+                item_ccy = (
+                    str(
+                        (
+                            base_item_ccy
+                            if manual_amount_override is not None
+                            and len(draft_items) == 1
+                            else ccy
+                        )
+                        or "USD"
+                    )
+                    .upper()
+                    .strip()
                     or "USD"
-                ).upper().strip() or "USD"
+                )
                 pivot_ccy = (
                     fx_rates.resolve_pivot_currency([item_ccy, _tccy])
                     if _t is not None
@@ -7893,7 +8144,7 @@ class OrdersView:
                     else 0.0
                 )
                 if q > 0 and goods_pivot is not None:
-                    item_unit_cost_usd_l.append(((goods_pivot + ship_pivot) / q))
+                    item_unit_cost_usd_l.append((goods_pivot + ship_pivot) / q)
                 else:
                     item_unit_cost_usd_l.append(None)
                 item_unit_cost_ccy_l.append(pivot_ccy)
@@ -7913,7 +8164,9 @@ class OrdersView:
                 item_unit_cost_ccy.append("USD")
             item_unit_cost_usd[_ui] = float(_calc)
             item_unit_cost_ccy[_ui] = (
-                str((_dit or {}).get("unit_cost_calc_currency") or "USD").upper().strip()
+                str((_dit or {}).get("unit_cost_calc_currency") or "USD")
+                .upper()
+                .strip()
                 or "USD"
             )
 
@@ -8020,7 +8273,7 @@ class OrdersView:
         def _cell(
             key: str,
             text: str = "",
-            size: Union[int, float] = 8,
+            size: float = 8,
             bold: bool = False,
             color: str = _TEXT,
             bgcolor: str = row_bg,
@@ -8107,7 +8360,10 @@ class OrdersView:
                         ft.Icons.EDIT_OUTLINED,
                         icon_size=13,
                         on_click=_edit_fn(),
-                        tooltip=self.t("orders.tooltip.edit", "Редагувати (в т.ч. декілька товарів)"),
+                        tooltip=self.t(
+                            "orders.tooltip.edit",
+                            "Редагувати (в т.ч. декілька товарів)",
+                        ),
                     )
                 )
 
@@ -8429,7 +8685,9 @@ class OrdersView:
                     skip_ui_refresh=skip_ui_refresh,
                 )
             else:
-                self._show_snack(self.t("orders.err.save_failed", "Не вдалося зберегти"), "#DC2626")
+                self._show_snack(
+                    self.t("orders.err.save_failed", "Не вдалося зберегти"), "#DC2626"
+                )
 
         def _queue_draft_for_sync():
             updated = _build_persistable_draft_snapshot()
@@ -8497,7 +8755,12 @@ class OrdersView:
                                     skip_ui_refresh=_skip_ui,
                                 )
                             else:
-                                self._show_snack(self.t("orders.err.save_failed", "Не вдалося зберегти"), "#DC2626")
+                                self._show_snack(
+                                    self.t(
+                                        "orders.err.save_failed", "Не вдалося зберегти"
+                                    ),
+                                    "#DC2626",
+                                )
                             break
                     finally:
                         draft_commit_state["running"] = False
@@ -8523,7 +8786,9 @@ class OrdersView:
                     skip_ui_refresh=skip_ui_refresh,
                 )
             else:
-                self._show_snack(self.t("orders.err.save_failed", "Не вдалося зберегти"), "#DC2626")
+                self._show_snack(
+                    self.t("orders.err.save_failed", "Не вдалося зберегти"), "#DC2626"
+                )
 
         def _mark_dirty_and_update():
             _set_dirty(True)
@@ -8616,12 +8881,18 @@ class OrdersView:
                         if self._upsert_order(updated):
                             _set_dirty(False)
                         else:
-                            self._show_snack(self.t("orders.err.save_failed", "Не вдалося зберегти"), "#DC2626")
+                            self._show_snack(
+                                self.t("orders.err.save_failed", "Не вдалося зберегти"),
+                                "#DC2626",
+                            )
             else:
                 if self._upsert_order(updated):
                     _set_dirty(False)
                 else:
-                    self._show_snack(self.t("orders.err.save_failed", "Не вдалося зберегти"), "#DC2626")
+                    self._show_snack(
+                        self.t("orders.err.save_failed", "Не вдалося зберегти"),
+                        "#DC2626",
+                    )
 
         def _commit_date_fast(field_name: str, raw_value: str) -> None:
             v = str(raw_value or "").strip()[:10]
@@ -8901,7 +9172,9 @@ class OrdersView:
             display_width = max(int(width or 80), 40)
             # When a quick-view button is shown alongside the cell, the text
             # gets less room to wrap into so it doesn't run under the button.
-            label_wrap_width = max(display_width - 20, 24) if quick_view else display_width
+            label_wrap_width = (
+                max(display_width - 20, 24) if quick_view else display_width
+            )
             selected_label = _wrap_text_for_width(selected_label, label_wrap_width)
 
             label_text = ft.Text(
@@ -8972,13 +9245,20 @@ class OrdersView:
                         expand=True,
                     )
                     if quick_view and k:
-                        from views.product_quick_view import product_icon_btn as _row_qv_btn
+                        from views.product_quick_view import (
+                            product_icon_btn as _row_qv_btn,
+                        )
+
                         rows.append(
                             ft.Row(
                                 [
                                     _row_text_cell,
                                     _row_qv_btn(
-                                        k, self.content_area, self.db, self.user_data, size=14
+                                        k,
+                                        self.content_area,
+                                        self.db,
+                                        self.user_data,
+                                        size=14,
                                     ),
                                 ],
                                 spacing=0,
@@ -9002,7 +9282,8 @@ class OrdersView:
                     ),
                     actions=[
                         ft.TextButton(
-                            self.t("common.cancel", "Скасувати"), on_click=lambda _: self._close_dlg(dlg_ref[0])
+                            self.t("common.cancel", "Скасувати"),
+                            on_click=lambda _: self._close_dlg(dlg_ref[0]),
                         ),
                     ],
                     actions_alignment=ft.MainAxisAlignment.END,
@@ -9018,15 +9299,24 @@ class OrdersView:
                 padding=ft.padding.all(0),
                 on_click=_open_choice_dialog,
                 content=label_text,
-                tooltip=ft.Tooltip(message=full_label, wait_duration=0) if full_label else None,
+                tooltip=(
+                    ft.Tooltip(message=full_label, wait_duration=0)
+                    if full_label
+                    else None
+                ),
             )
             if quick_view and current_value:
                 from views.product_quick_view import product_icon_btn as _cell_qv_btn
+
                 cell_content = ft.Row(
                     [
                         btn,
                         _cell_qv_btn(
-                            current_value, self.content_area, self.db, self.user_data, size=13
+                            current_value,
+                            self.content_area,
+                            self.db,
+                            self.user_data,
+                            size=13,
                         ),
                     ],
                     spacing=0,
@@ -9130,7 +9420,6 @@ class OrdersView:
                         picker.update()
                     except Exception:
                         self._shared_date_picker_open = False
-                        pass
                     _apply_date_value(out, defer_commit=True, page_ref=page)
 
                 def _dismissed(_e):
@@ -9152,7 +9441,6 @@ class OrdersView:
                     picker.update()
                 except Exception:
                     self._shared_date_picker_open = False
-                    pass
 
             return ft.Container(
                 width=width,
@@ -9187,6 +9475,7 @@ class OrdersView:
             product_cell.tooltip = ft.Tooltip(message=product_text, wait_duration=0)
         if _main_pid:
             from views.product_quick_view import product_icon_btn
+
             _prod_qv_btn = product_icon_btn(
                 _main_pid, self.content_area, self.db, self.user_data, size=10
             )
@@ -9512,7 +9801,7 @@ class OrdersView:
                     and (p.get("id") or "")
                     and (
                         not cur_supplier
-                        or str((p.get("supplier_id") or "")).strip() == cur_supplier
+                        or str(p.get("supplier_id") or "").strip() == cur_supplier
                     )
                 ]
                 if cur_supplier and not prod_options:
@@ -9575,7 +9864,7 @@ class OrdersView:
                     ft.dropdown.Option(s, self.STATUS_LABELS[s]) for s in self.STATUSES
                 ],
                 on_change=lambda v: (
-                    draft_order.update({"status": str((v or "production")).strip()}),
+                    draft_order.update({"status": str(v or "production").strip()}),
                     _optimistic_commit_draft(),
                 ),
                 bgcolor=status_bg,
@@ -9591,14 +9880,15 @@ class OrdersView:
                 if _dm_supplier_id
                 else None
             )
-            _dm_enabled_ids = (
+            _dm_enabled_ids_raw = (
                 _dm_supplier_row.get("enabled_delivery_method_ids")
                 if isinstance(_dm_supplier_row, dict)
                 else None
             )
-            _dm_restricted = (
-                isinstance(_dm_enabled_ids, list) and len(_dm_enabled_ids) > 0
+            _dm_enabled_ids = (
+                _dm_enabled_ids_raw if isinstance(_dm_enabled_ids_raw, list) else []
             )
+            _dm_restricted = len(_dm_enabled_ids) > 0
             _dm_methods = (
                 [
                     m
@@ -9613,9 +9903,7 @@ class OrdersView:
                 for m in _dm_methods
                 if isinstance(m, dict) and (m.get("id") or "")
             ]
-            current_delivery_id = str(
-                (draft_order.get("delivery_type_id") or "")
-            ).strip()
+            current_delivery_id = str(draft_order.get("delivery_type_id") or "").strip()
             if current_delivery_id and not any(
                 str(getattr(opt, "key", "")) == current_delivery_id
                 for opt in delivery_options
@@ -9687,9 +9975,7 @@ class OrdersView:
                     ft.dropdown.Option(k, v) for k, v in self.PAYMENT_LABELS.items()
                 ],
                 on_change=lambda v: (
-                    draft_order.update(
-                        {"payment_status": str((v or "unpaid")).strip()}
-                    ),
+                    draft_order.update({"payment_status": str(v or "unpaid").strip()}),
                     _optimistic_commit_draft(),
                 ),
                 bgcolor=payment_bg,
@@ -9704,7 +9990,7 @@ class OrdersView:
                 ],
                 on_change=lambda v: (
                     draft_order.update(
-                        {"submission_status": str((v or "not_submitted")).strip()}
+                        {"submission_status": str(v or "not_submitted").strip()}
                     ),
                     _optimistic_commit_draft(),
                 ),
@@ -9814,13 +10100,15 @@ class OrdersView:
         # Color of the +/- cell indicates invoice/packing attachment fill status.
         _row_atts = self._order_attachments_cache.get(order_id, []) if order_id else []
         _has_inv = any(str((a or {}).get("kind") or "") == "invoice" for a in _row_atts)
-        _has_pack = any(str((a or {}).get("kind") or "") == "packing" for a in _row_atts)
+        _has_pack = any(
+            str((a or {}).get("kind") or "") == "packing" for a in _row_atts
+        )
         if _has_inv and _has_pack:
-            _expand_bg = "#D1FAE5"   # green — both tables have data
+            _expand_bg = "#D1FAE5"  # green — both tables have data
         elif _has_inv or _has_pack:
-            _expand_bg = "#FEF9C3"   # yellow — one table has data
+            _expand_bg = "#FEF9C3"  # yellow — one table has data
         else:
-            _expand_bg = "#FEE2E2"   # red — both empty
+            _expand_bg = "#FEE2E2"  # red — both empty
 
         expand_btn = ft.IconButton(
             icon=(
@@ -9846,15 +10134,17 @@ class OrdersView:
             content=ft.Row(
                 [
                     lines_expand_cell,
-                    (_expand_cell_ctr := ft.Container(
-                        width=expand_col_w,
-                        height=row_h,
-                        alignment=ft.Alignment(0, 0),
-                        border=ft.border.all(1, "#CBD5E1"),
-                        border_radius=0,
-                        bgcolor=_expand_bg,
-                        content=expand_btn,
-                    )),
+                    (
+                        _expand_cell_ctr := ft.Container(
+                            width=expand_col_w,
+                            height=row_h,
+                            alignment=ft.Alignment(0, 0),
+                            border=ft.border.all(1, "#CBD5E1"),
+                            border_radius=0,
+                            bgcolor=_expand_bg,
+                            content=expand_btn,
+                        )
+                    ),
                     ft.Container(
                         width=delete_col_w,
                         height=row_h,
@@ -9978,7 +10268,9 @@ class OrdersView:
                         item_unit_cost_usd[idx], decimals=2
                     )
                     _uc_ccy_i = (
-                        item_unit_cost_ccy[idx] if idx < len(item_unit_cost_ccy) else "USD"
+                        item_unit_cost_ccy[idx]
+                        if idx < len(item_unit_cost_ccy)
+                        else "USD"
                     )
                     if _uc_ccy_i and _uc_ccy_i != "USD":
                         item_unit_cost_text = f"{item_unit_cost_text} {_uc_ccy_i}"
@@ -10090,6 +10382,7 @@ class OrdersView:
                 )
                 if _it_pid:
                     from views.product_quick_view import product_icon_btn
+
                     _pit_qv_btn = product_icon_btn(
                         _it_pid, self.content_area, self.db, self.user_data, size=10
                     )
@@ -10253,7 +10546,7 @@ class OrdersView:
                         and (p.get("id") or "")
                         and (
                             not cur_supplier
-                            or str((p.get("supplier_id") or "")).strip() == cur_supplier
+                            or str(p.get("supplier_id") or "").strip() == cur_supplier
                         )
                     ]
                     if cur_supplier and not prod_options:
@@ -10405,7 +10698,7 @@ class OrdersView:
                                 _mark_dirty_and_update()
 
                         current_manual_w = _safe_float(
-                            (draft_items[idx] if idx < len(draft_items) else {}).get(
+                            (it if idx < len(draft_items) else {}).get(
                                 "weight_actual_kg"
                             ),
                             None,
@@ -10609,7 +10902,7 @@ class OrdersView:
                         )
                         with open(tmp_path, "wb") as fh:
                             fh.write(data)
-                        os.startfile(tmp_path)  # noqa: S606
+                        os.startfile(tmp_path)
                     except Exception as ex:
                         self._show_snack(f"Помилка відкриття: {ex}", "#DC2626")
 
@@ -10702,11 +10995,7 @@ class OrdersView:
                             "#DC2626",
                         )
                         return
-                    ext = (
-                        upl_name.rsplit(".", 1)[-1].lower()
-                        if "." in upl_name
-                        else ""
-                    )
+                    ext = upl_name.rsplit(".", 1)[-1].lower() if "." in upl_name else ""
                     mime = (
                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         if ext == "xlsx"
@@ -10749,7 +11038,11 @@ class OrdersView:
                         pg.run_task(_fn)
 
                 def _run_upload(
-                    _e=None, _kind=kind, _fname=fname, _has_file=has_file, _fn=_do_upload
+                    _e=None,
+                    _kind=kind,
+                    _fname=fname,
+                    _has_file=has_file,
+                    _fn=_do_upload,
                 ):
                     pg = self._page()
                     if not pg:
@@ -10887,7 +11180,7 @@ class OrdersView:
                         ft.Text(
                             self.t(
                                 "orders.help.attachment_desc",
-                                'Прикріпіть файл Інвойсу та файл Пакувального листа '
+                                "Прикріпіть файл Інвойсу та файл Пакувального листа "
                                 "(Excel) до цього замовлення. Керівники бачать і можуть "
                                 "завантажити на ПК файли підлеглих, але не можуть їх "
                                 "додавати чи видаляти.",
@@ -11021,8 +11314,12 @@ class OrdersView:
 
         dlg = ft.AlertDialog(
             modal=True,
-            title=ft.Text(self.t("orders.dlg.delete_title", "Видалити замовлення?"), weight="bold"),
-            content=ft.Text(self.t("common.irreversible", "Цю дію неможливо скасувати."), size=13),
+            title=ft.Text(
+                self.t("orders.dlg.delete_title", "Видалити замовлення?"), weight="bold"
+            ),
+            content=ft.Text(
+                self.t("common.irreversible", "Цю дію неможливо скасувати."), size=13
+            ),
             actions=[
                 ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=cancel),
                 ft.FilledButton(self.t("common.delete", "Видалити"), on_click=confirm),
@@ -11060,20 +11357,47 @@ class OrdersView:
 
         def _rate_help(_):
             from views.help_utils import show_modal_help
-            show_modal_help(page, self.t("orders.nbu_unavailable", "НБУ недоступний"), [
-                self.t("orders.rate_help.desc", "Введіть курс: скільки USD коштує 1 одиниця вказаної валюти."),
-                self.t("orders.rate_help.example", "Приклад CNY: якщо 1 USD = 7.25 CNY → введіть 0.138 (= 1 ÷ 7.25)."),
-                self.t("orders.rate_help.skip", "«Пропустити» — збереже замовлення без USD-конвертації."),
-            ])
+
+            show_modal_help(
+                page,
+                self.t("orders.nbu_unavailable", "НБУ недоступний"),
+                [
+                    self.t(
+                        "orders.rate_help.desc",
+                        "Введіть курс: скільки USD коштує 1 одиниця вказаної валюти.",
+                    ),
+                    self.t(
+                        "orders.rate_help.example",
+                        "Приклад CNY: якщо 1 USD = 7.25 CNY → введіть 0.138 (= 1 ÷ 7.25).",
+                    ),
+                    self.t(
+                        "orders.rate_help.skip",
+                        "«Пропустити» — збереже замовлення без USD-конвертації.",
+                    ),
+                ],
+            )
 
         dlg = ft.AlertDialog(
             modal=True,
             title=ft.Row(
                 [
-                    ft.Text(self.t("orders.nbu_unavailable_body", "НБУ недоступний — введіть курс вручну"), weight="bold", expand=True),
-                    ft.IconButton(icon=ft.Icons.HELP_OUTLINE, icon_size=16, tooltip=self.t("common.help.tooltip", "Довідка"), on_click=_rate_help),
+                    ft.Text(
+                        self.t(
+                            "orders.nbu_unavailable_body",
+                            "НБУ недоступний — введіть курс вручну",
+                        ),
+                        weight="bold",
+                        expand=True,
+                    ),
+                    ft.IconButton(
+                        icon=ft.Icons.HELP_OUTLINE,
+                        icon_size=16,
+                        tooltip=self.t("common.help.tooltip", "Довідка"),
+                        on_click=_rate_help,
+                    ),
                 ],
-                vertical_alignment=ft.CrossAxisAlignment.CENTER, tight=True,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                tight=True,
             ),
             content=ft.Container(
                 padding=12,
@@ -11098,7 +11422,7 @@ class OrdersView:
         )
         page.show_dialog(dlg)
 
-    async def _open_quick_add_order_dialog(self, busy_token: Optional[str] = None):
+    async def _open_quick_add_order_dialog(self, busy_token: str | None = None):
         page = self._page()
         if not page:
             self._end_header_busy(busy_token)
@@ -11534,25 +11858,49 @@ class OrdersView:
             "Створити",
             on_click=lambda e: page.run_task(_save(e)),
         )
+
         def _qadd_help(_):
             from views.help_utils import show_modal_help
-            show_modal_help(page, self.t("orders.dlg.add_title", "Додати замовлення"), [
-                self.t("orders.qadd_help.step1", "1. Оберіть Регіон зі списку."),
-                self.t("orders.qadd_help.step2", "2. Натисніть на поле «Дата» і виберіть дату замовлення з календаря."),
-                self.t("orders.qadd_help.step3", "3. Оберіть Статус замовлення."),
-                self.t("orders.qadd_help.step4", "4. Оберіть Постачальника зі списку."),
-                self.t("orders.qadd_help.step5", "5. Натисніть «Створити»."),
-                self.t("orders.qadd_help.note", "Після створення можна відкрити замовлення для заповнення решти полів."),
-            ])
+
+            show_modal_help(
+                page,
+                self.t("orders.dlg.add_title", "Додати замовлення"),
+                [
+                    self.t("orders.qadd_help.step1", "1. Оберіть Регіон зі списку."),
+                    self.t(
+                        "orders.qadd_help.step2",
+                        "2. Натисніть на поле «Дата» і виберіть дату замовлення з календаря.",
+                    ),
+                    self.t("orders.qadd_help.step3", "3. Оберіть Статус замовлення."),
+                    self.t(
+                        "orders.qadd_help.step4", "4. Оберіть Постачальника зі списку."
+                    ),
+                    self.t("orders.qadd_help.step5", "5. Натисніть «Створити»."),
+                    self.t(
+                        "orders.qadd_help.note",
+                        "Після створення можна відкрити замовлення для заповнення решти полів.",
+                    ),
+                ],
+            )
 
         dlg = ft.AlertDialog(
             modal=True,
             title=ft.Row(
                 [
-                    ft.Text(self.t("orders.dlg.add_title", "Додати замовлення"), weight="bold", expand=True),
-                    ft.IconButton(icon=ft.Icons.HELP_OUTLINE, icon_size=16, tooltip=self.t("common.help.tooltip", "Довідка"), on_click=_qadd_help),
+                    ft.Text(
+                        self.t("orders.dlg.add_title", "Додати замовлення"),
+                        weight="bold",
+                        expand=True,
+                    ),
+                    ft.IconButton(
+                        icon=ft.Icons.HELP_OUTLINE,
+                        icon_size=16,
+                        tooltip=self.t("common.help.tooltip", "Довідка"),
+                        on_click=_qadd_help,
+                    ),
                 ],
-                vertical_alignment=ft.CrossAxisAlignment.CENTER, tight=True,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                tight=True,
             ),
             content=ft.Container(
                 width=560,
@@ -11595,7 +11943,7 @@ class OrdersView:
 
         _show_quick_add_safe()
 
-    def _open_order_dialog(self, existing=None, busy_token: Optional[str] = None):
+    def _open_order_dialog(self, existing=None, busy_token: str | None = None):
         page = self._page()
         if not page:
             self._end_header_busy(busy_token)
@@ -11610,7 +11958,7 @@ class OrdersView:
 
         is_new = existing is None
         row = existing if isinstance(existing, dict) else {}
-        new_dialog_order_id = str((row.get("id") or str(uuid.uuid4()))).strip()
+        new_dialog_order_id = str(row.get("id") or str(uuid.uuid4())).strip()
         save_state = {"in_progress": False}
         self._dialog_editing_order_id = (
             "" if is_new else str(row.get("id") or "").strip()
@@ -11622,8 +11970,16 @@ class OrdersView:
             value=mode_state["value"],
             content=ft.Row(
                 [
-                    ft.Radio(value="single", label=self.t("orders.mode.single", "1 замовлення = 1 товар")),
-                    ft.Radio(value="multi", label=self.t("orders.mode.multi", "1 замовлення = декілька товарів")),
+                    ft.Radio(
+                        value="single",
+                        label=self.t("orders.mode.single", "1 замовлення = 1 товар"),
+                    ),
+                    ft.Radio(
+                        value="multi",
+                        label=self.t(
+                            "orders.mode.multi", "1 замовлення = декілька товарів"
+                        ),
+                    ),
                 ],
                 spacing=16,
             ),
@@ -11674,7 +12030,7 @@ class OrdersView:
             region_id = str(region_id or "").strip()
             if region_id and region_id not in self._region_id_by_name_map.values():
                 region_id = self._region_id_by_name(region_id) or ""
-            region_id = region_id or None
+            region_id_opt: str | None = region_id or None
             if getattr(self, "_no_db_after_ready", False) and getattr(
                 self, "_orders_ui_ready", False
             ):
@@ -11689,7 +12045,7 @@ class OrdersView:
             suppliers = (
                 self.db.get_suppliers(
                     self.company_id,
-                    region_id,
+                    region_id_opt,
                     manager_id=self.manager_id,
                 )
                 or []
@@ -11698,7 +12054,7 @@ class OrdersView:
                 self.db.get_effective_delivery_methods_for_manager(
                     self.company_id,
                     self.manager_id,
-                    region_id=region_id,
+                    region_id=region_id_opt,
                 )
                 or []
             )
@@ -11986,8 +12342,10 @@ class OrdersView:
                         display_name,
                         content=product_naming.with_instant_tooltip(
                             ft.Text(
-                                display_name, size=13,
-                                no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS,
+                                display_name,
+                                size=13,
+                                no_wrap=True,
+                                overflow=ft.TextOverflow.ELLIPSIS,
                             ),
                             display_name,
                         ),
@@ -12271,12 +12629,13 @@ class OrdersView:
                 if sid
                 else None
             )
-            enabled_ids = (
+            enabled_ids_raw = (
                 supplier_row.get("enabled_delivery_method_ids")
                 if isinstance(supplier_row, dict)
                 else None
             )
-            restricted = isinstance(enabled_ids, list) and len(enabled_ids) > 0
+            enabled_ids = enabled_ids_raw if isinstance(enabled_ids_raw, list) else []
+            restricted = len(enabled_ids) > 0
             all_methods = lookup_state["delivery_methods"] or []
             methods = (
                 [
@@ -12295,8 +12654,7 @@ class OrdersView:
                     (
                         m
                         for m in all_methods
-                        if isinstance(m, dict)
-                        and str(m.get("id") or "") == current_val
+                        if isinstance(m, dict) and str(m.get("id") or "") == current_val
                     ),
                     None,
                 )
@@ -12421,7 +12779,12 @@ class OrdersView:
             padding=ft.padding.only(top=4),
             content=ft.Column(
                 [
-                    ft.Text(self.t("orders.section.transition_dates", "Дати переходів"), size=13, weight="bold", color=_TEXT),
+                    ft.Text(
+                        self.t("orders.section.transition_dates", "Дати переходів"),
+                        size=13,
+                        weight="bold",
+                        color=_TEXT,
+                    ),
                     ft.Row(
                         [date_shipped_f, date_arrived_f, date_accepted_f],
                         spacing=8,
@@ -12465,18 +12828,33 @@ class OrdersView:
                 ),
                 form_error_text,
                 ft.Divider(height=6, color=_BORDER),
-                ft.Text(self.t("orders.section.basic_info", "Основна інформація"), size=13, weight="bold", color=_TEXT),
+                ft.Text(
+                    self.t("orders.section.basic_info", "Основна інформація"),
+                    size=13,
+                    weight="bold",
+                    color=_TEXT,
+                ),
                 ft.Row(
                     [order_date_f, invoice_no_f, order_no_1c_f], spacing=8, wrap=True
                 ),
                 ft.Row([supplier_wrapper, delivery_dd], spacing=8, wrap=True),
                 comment_f,
                 ft.Divider(height=6, color=_BORDER),
-                ft.Text(self.t("orders.section.products", "Товари"), size=13, weight="bold", color=_TEXT),
+                ft.Text(
+                    self.t("orders.section.products", "Товари"),
+                    size=13,
+                    weight="bold",
+                    color=_TEXT,
+                ),
                 items_col,
                 add_item_btn,
                 ft.Divider(height=6, color=_BORDER),
-                ft.Text(self.t("orders.section.statuses", "Статуси"), size=13, weight="bold", color=_TEXT),
+                ft.Text(
+                    self.t("orders.section.statuses", "Статуси"),
+                    size=13,
+                    weight="bold",
+                    color=_TEXT,
+                ),
                 ft.Row([status_dd, payment_dd, submission_dd], spacing=8, wrap=True),
                 dates_section,
             ],
@@ -12825,7 +13203,13 @@ class OrdersView:
                             ok = self._upsert_order(dict(snap))
                         if not ok:
                             _rollback_after_failed_save()
-                            self._show_snack(self.t("orders.err.save_local_failed", "Не вдалося зберегти локально"), "#DC2626")
+                            self._show_snack(
+                                self.t(
+                                    "orders.err.save_local_failed",
+                                    "Не вдалося зберегти локально",
+                                ),
+                                "#DC2626",
+                            )
                             self._end_header_busy(save_busy_token)
                             busy_released = True
                             return
@@ -12899,7 +13283,10 @@ class OrdersView:
                     self._show_snack("Локально збережено")
                 else:
                     _rollback_after_failed_save()
-                    self._show_snack(self.t("orders.err.save_failed", "Не вдалося зберегти"), "#DC2626")
+                    self._show_snack(
+                        self.t("orders.err.save_failed", "Не вдалося зберегти"),
+                        "#DC2626",
+                    )
             finally:
                 self._end_header_busy(save_busy_token)
 
@@ -12908,33 +13295,79 @@ class OrdersView:
 
         def _order_help(_):
             from views.help_utils import show_modal_help
-            show_modal_help(page, self.t("orders.dlg.edit_title", "Редагувати замовлення"), [
-                self.t("orders.edit_help.step1", "1. Оберіть режим: «1 товар» або «декілька товарів» в одному замовленні."),
-                self.t("orders.edit_help.step2", "2. Вкажіть Регіон і Дату замовлення (📅 відкриває календар)."),
-                self.t("orders.edit_help.step3", "3. Оберіть Постачальника і Спосіб доставки."),
-                self.t("orders.edit_help.step4", "4. Заповніть товар, кількість, суму, валюту та курс."),
-                self.t("orders.edit_help.step5", "5. Вкажіть № Інвойсу та № обліку (якщо є)."),
-                self.t("orders.edit_help.step6", "6. Встановіть Статус і дати кожного етапу: виробництво → відправка → склад → прийом."),
-                self.t("orders.edit_help.step7", "7. Введіть фактичну вагу для розпаковки."),
-                self.t("orders.edit_help.step8", "8. Натисніть «Зберегти». Зміни синхронізуються у фоні."),
-            ])
 
-        save_btn = ft.FilledButton(self.t("common.save", "Зберегти"), on_click=save_click)
+            show_modal_help(
+                page,
+                self.t("orders.dlg.edit_title", "Редагувати замовлення"),
+                [
+                    self.t(
+                        "orders.edit_help.step1",
+                        "1. Оберіть режим: «1 товар» або «декілька товарів» в одному замовленні.",
+                    ),
+                    self.t(
+                        "orders.edit_help.step2",
+                        "2. Вкажіть Регіон і Дату замовлення (📅 відкриває календар).",
+                    ),
+                    self.t(
+                        "orders.edit_help.step3",
+                        "3. Оберіть Постачальника і Спосіб доставки.",
+                    ),
+                    self.t(
+                        "orders.edit_help.step4",
+                        "4. Заповніть товар, кількість, суму, валюту та курс.",
+                    ),
+                    self.t(
+                        "orders.edit_help.step5",
+                        "5. Вкажіть № Інвойсу та № обліку (якщо є).",
+                    ),
+                    self.t(
+                        "orders.edit_help.step6",
+                        "6. Встановіть Статус і дати кожного етапу: виробництво → відправка → склад → прийом.",
+                    ),
+                    self.t(
+                        "orders.edit_help.step7",
+                        "7. Введіть фактичну вагу для розпаковки.",
+                    ),
+                    self.t(
+                        "orders.edit_help.step8",
+                        "8. Натисніть «Зберегти». Зміни синхронізуються у фоні.",
+                    ),
+                ],
+            )
+
+        save_btn = ft.FilledButton(
+            self.t("common.save", "Зберегти"), on_click=save_click
+        )
         dlg = ft.AlertDialog(
             modal=True,
             title=ft.Row(
                 [
                     ft.Text(
-                        self.t("orders.dlg.new_title", "Нове замовлення") if is_new else self.t("orders.dlg.edit_title", "Редагувати замовлення"),
-                        weight="bold", expand=True,
+                        (
+                            self.t("orders.dlg.new_title", "Нове замовлення")
+                            if is_new
+                            else self.t(
+                                "orders.dlg.edit_title", "Редагувати замовлення"
+                            )
+                        ),
+                        weight="bold",
+                        expand=True,
                     ),
-                    ft.IconButton(icon=ft.Icons.HELP_OUTLINE, icon_size=16, tooltip=self.t("common.help.tooltip", "Довідка"), on_click=_order_help),
+                    ft.IconButton(
+                        icon=ft.Icons.HELP_OUTLINE,
+                        icon_size=16,
+                        tooltip=self.t("common.help.tooltip", "Довідка"),
+                        on_click=_order_help,
+                    ),
                 ],
-                vertical_alignment=ft.CrossAxisAlignment.CENTER, tight=True,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                tight=True,
             ),
             content=ft.Container(width=720, content=dlg_body),
             actions=[
-                ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=close_dialog),
+                ft.TextButton(
+                    self.t("common.cancel", "Скасувати"), on_click=close_dialog
+                ),
                 save_btn,
             ],
             actions_alignment=ft.MainAxisAlignment.END,
@@ -13208,7 +13641,11 @@ class OrdersView:
         self._header_orders_loading_indicator = ft.Row(
             [
                 ft.ProgressRing(width=16, height=16, stroke_width=2, color=_TEXT),
-                ft.Text(self.t("orders.loading", "Завантаження замовлень..."), size=11, color=_TEXT),
+                ft.Text(
+                    self.t("orders.loading", "Завантаження замовлень..."),
+                    size=11,
+                    color=_TEXT,
+                ),
             ],
             spacing=6,
             visible=False,
@@ -13269,7 +13706,9 @@ class OrdersView:
                                                 icon=ft.Icons.HELP_OUTLINE,
                                                 icon_size=18,
                                                 icon_color=_TEXT,
-                                                tooltip=self.t("common.help.tooltip", "Довідка"),
+                                                tooltip=self.t(
+                                                    "common.help.tooltip", "Довідка"
+                                                ),
                                                 on_click=lambda _e: self._show_help(),
                                             ),
                                         ],
