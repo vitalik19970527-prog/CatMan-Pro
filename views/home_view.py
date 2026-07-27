@@ -5034,15 +5034,17 @@ class HomeView:
                 continue
             unit_cost = float(amount) / float(qty)
             prod = products_by_id.get(str(pid).strip())
+            if prod is None:
+                # Archived/deleted product — get_products() excludes archived
+                # by default, and stock inputs carry no name snapshot of
+                # their own, so there's no way to show it meaningfully. Skip
+                # it entirely rather than lumping unrelated archived
+                # products together under one generic "Видалений товар" row
+                # that used to still count toward the visible averages.
+                continue
 
             if "name" in selected_key_set:
-                # prod can be missing here (archived/deleted product — get_products()
-                # excludes archived by default) — stock inputs carry no name snapshot
-                # of their own, so fall back to a readable label instead of the raw id.
-                display_name = str(
-                    (prod.get("name") if isinstance(prod, dict) else "")
-                    or "Видалений товар"
-                ).strip()
+                display_name = str(prod.get("name") or "").strip()
                 if display_name:
                     buckets.setdefault(("name", display_name), []).append(unit_cost)
 
@@ -5473,15 +5475,16 @@ class HomeView:
             unit_cost_blended = sum(candidates) / len(candidates)
 
             prod = products_by_id.get(pid)
+            if prod is None:
+                # Archived/deleted product — get_products() excludes archived
+                # by default. Skip it entirely (same as the pure-stock cost
+                # card) rather than lumping unrelated archived products
+                # together under one generic "Видалений товар" row that
+                # used to still count toward the visible averages.
+                continue
 
             if "name" in selected_key_set:
-                # prod can be missing here (archived/deleted product — get_products()
-                # excludes archived by default) — fall back to a readable label
-                # instead of leaking the raw product id into the UI.
-                display_name = str(
-                    (prod.get("name") if isinstance(prod, dict) else "")
-                    or "Видалений товар"
-                ).strip()
+                display_name = str(prod.get("name") or "").strip()
                 if display_name:
                     buckets.setdefault(("name", display_name), []).append(
                         unit_cost_blended
