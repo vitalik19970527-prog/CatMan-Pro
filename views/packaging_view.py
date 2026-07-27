@@ -44,6 +44,11 @@ class PackagingView:
     META_TEXT_SIZE = 12
     EMPTY_TEXT_SIZE = 14
     ALL_REGIONS_KEY = "__all_regions__"
+    # Persists the archive-section collapse toggle across PackagingView
+    # re-instantiation (a fresh instance is created on every tab load and
+    # every background sync-pulse reload, so a plain `self` attribute would
+    # reset to collapsed every time). Keyed by company_id.
+    _archive_collapsed_by_company: dict = {}
 
     def __init__(self, content_area, user_data, db, current_region_name):
         self.content_area = content_area
@@ -559,12 +564,11 @@ class PackagingView:
             )
             or []
         )
-        collapsed = getattr(self, "_packaging_archive_collapsed", True)
+        state_key = str(self.company_id or "")
+        collapsed = PackagingView._archive_collapsed_by_company.get(state_key, True)
 
         def _toggle(_):
-            self._packaging_archive_collapsed = not getattr(
-                self, "_packaging_archive_collapsed", True
-            )
+            PackagingView._archive_collapsed_by_company[state_key] = not collapsed
             self.load_packaging()
 
         header = ft.Container(

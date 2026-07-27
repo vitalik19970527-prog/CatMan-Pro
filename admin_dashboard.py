@@ -791,6 +791,12 @@ class AdminDashboard:
         if self.current_tab == "infrastructure":
             self.show_infrastructure_settings(None)
             return
+        if self.current_tab == "company":
+            self.show_company_settings(None)
+            return
+        if self.current_tab == "hierarchy":
+            self.show_hierarchy(None)
+            return
         if from_sync and self.current_tab == "overview":
             return
         self.show_overview(None)
@@ -1704,8 +1710,17 @@ class AdminDashboard:
                 self.db.get_manager_allowed_region_ids(manager_id)
             )
             all_checks = {}
+            # If this manager is restricted to specific region(s), only offer
+            # those regions in the picker — an admin should never be able to
+            # pick a region here that the manager isn't allowed to see.
+            selectable_regions = (
+                [r for r in regions if r.get("id") in manager_allowed_region_ids]
+                if manager_allowed_region_ids
+                else regions
+            )
             region_options = [
-                ft.dropdown.Option(key=r.get("id"), text=r.get("name")) for r in regions
+                ft.dropdown.Option(key=r.get("id"), text=r.get("name"))
+                for r in selectable_regions
             ]
             if len(region_options) > 1:
                 region_options = [
@@ -1717,11 +1732,13 @@ class AdminDashboard:
                 options=region_options,
                 value=(
                     ALL_REGIONS_KEY
-                    if len(regions) > 1
-                    else (regions[0].get("id") if regions else None)
+                    if len(selectable_regions) > 1
+                    else (
+                        selectable_regions[0].get("id") if selectable_regions else None
+                    )
                 ),
                 width=320,
-                visible=len(regions) > 1,
+                visible=len(selectable_regions) > 1,
             )
             tree_col = ft.Column([], spacing=2)
 
@@ -1731,6 +1748,8 @@ class AdminDashboard:
                 effective_region_ids = None
                 if region_id and region_id != ALL_REGIONS_KEY:
                     effective_region_ids = {region_id}
+                    if manager_allowed_region_ids:
+                        effective_region_ids &= manager_allowed_region_ids
                 elif manager_allowed_region_ids:
                     effective_region_ids = manager_allowed_region_ids
                 if effective_region_ids is not None:
@@ -2484,11 +2503,68 @@ class AdminDashboard:
                 for r in region_rows
                 if isinstance(r, dict) and r.get("id")
             }
+
+            nodes_all = self.db.get_company_catalog_nodes(company_id)
+            # Keep hierarchy correct: perform one warm-up sync per company per session.
+            if company_id not in self._catalog_sync_warmup_done:
+                self.db.sync_company_catalog_nodes(company_id)
+                self._catalog_sync_warmup_done.add(company_id)
+                nodes_all = self.db.get_company_catalog_nodes(company_id)
+            allowed_types = {"category", "subcategory", "series", "brand"}
+            nodes_all = [
+                n
+                for n in nodes_all
+                if isinstance(n, dict)
+                and n.get("id")
+                and n.get("node_type") in allowed_types
+            ]
+
+            def _rebuild_creation_catalog_tree(_=None):
+                # Only offer categories from region(s) checked above — a new
+                # user restricted to one region must not be assignable
+                # categories from a region they don't have access to.
+                checked_region_ids = {
+                    rid for rid, cb in regions_checks.items() if cb.value
+                }
+                catalog_checks.clear()
+                if not checked_region_ids:
+                    catalog_checks_block.controls = [
+                        ft.Text(
+                            "Спочатку оберіть регіон(и) вище",
+                            size=11,
+                            color="grey600",
+                        )
+                    ]
+                else:
+                    nodes = [
+                        n
+                        for n in nodes_all
+                        if n.get("node_type") != "category"
+                        or n.get("region_id") in checked_region_ids
+                    ]
+                    tree_controls, tree_checks = _build_catalog_tree(
+                        nodes, regions_by_id
+                    )
+                    catalog_checks.update(tree_checks)
+                    catalog_checks_block.controls = tree_controls or [
+                        ft.Text(
+                            "У компанії немає елементів каталогу",
+                            size=11,
+                            color="grey600",
+                        )
+                    ]
+                with contextlib.suppress(Exception):
+                    catalog_checks_block.update()
+
             for reg in region_rows:
                 if not isinstance(reg, dict) or not reg.get("id"):
                     continue
                 rid = reg.get("id")
-                cb, cb_row = self._wide_checkbox_row(reg.get("name", "Регіон"), False)
+                cb, cb_row = self._wide_checkbox_row(
+                    reg.get("name", "Регіон"),
+                    False,
+                    on_change=_rebuild_creation_catalog_tree,
+                )
                 regions_checks[rid] = cb
                 regions_checks_block.controls.append(cb_row)
             if not regions_checks_block.controls:
@@ -2496,29 +2572,7 @@ class AdminDashboard:
                     ft.Text("У компанії немає регіонів", size=11, color="grey600")
                 )
 
-            nodes = self.db.get_company_catalog_nodes(company_id)
-            # Keep hierarchy correct: perform one warm-up sync per company per session.
-            if company_id not in self._catalog_sync_warmup_done:
-                self.db.sync_company_catalog_nodes(company_id)
-                self._catalog_sync_warmup_done.add(company_id)
-                nodes = self.db.get_company_catalog_nodes(company_id)
-            allowed_types = {"category", "subcategory", "series", "brand"}
-            nodes = [
-                n
-                for n in nodes
-                if isinstance(n, dict)
-                and n.get("id")
-                and n.get("node_type") in allowed_types
-            ]
-            tree_controls, tree_checks = _build_catalog_tree(nodes, regions_by_id)
-            catalog_checks.update(tree_checks)
-            catalog_checks_block.controls = tree_controls
-            if not tree_controls:
-                catalog_checks_block.controls.append(
-                    ft.Text(
-                        "У компанії немає елементів каталогу", size=11, color="grey600"
-                    )
-                )
+            _rebuild_creation_catalog_tree()
 
         def on_create_company_change(_):
             company_name_f.visible = (
@@ -2882,6 +2936,14 @@ class AdminDashboard:
             # Get categories already assigned to anyone in this company
             assigned_category_ids = set(self.db.get_assigned_category_ids(company_id))
 
+            # If this manager is restricted to specific region(s), only offer
+            # categories from those regions — a manager with access to one
+            # region should never be able to be assigned categories from
+            # another region.
+            manager_allowed_region_ids = set(
+                self.db.get_manager_allowed_region_ids(manager_id)
+            )
+
             # Filter to show only unassigned categories (first owner assignment)
             categories = [
                 n
@@ -2889,6 +2951,10 @@ class AdminDashboard:
                 if isinstance(n, dict)
                 and n.get("node_type") == "category"
                 and n.get("id") not in assigned_category_ids
+                and (
+                    not manager_allowed_region_ids
+                    or n.get("region_id") in manager_allowed_region_ids
+                )
             ]
 
             selected_ids = set(
@@ -6371,11 +6437,28 @@ class AdminDashboard:
         categories_block = ft.Column(spacing=4)
         category_checks = {}
 
-        def load_regions():
+        def load_regions(manager_id=None):
             regions = self.db.get_company_regions(company_id)
+            # If the selected manager is restricted to specific region(s),
+            # only offer those — never let the admin browse/assign categories
+            # from a region the manager doesn't have access to.
+            manager_allowed_region_ids = (
+                set(self.db.get_manager_allowed_region_ids(manager_id))
+                if manager_id
+                else set()
+            )
+            selectable_regions = (
+                [
+                    r
+                    for r in regions
+                    if isinstance(r, dict) and r.get("id") in manager_allowed_region_ids
+                ]
+                if manager_allowed_region_ids
+                else regions
+            )
             region_options = [
                 ft.dropdown.Option(key=r.get("id"), text=r.get("name"))
-                for r in regions
+                for r in selectable_regions
                 if isinstance(r, dict) and r.get("id")
             ]
             if len(region_options) > 1:
@@ -6412,10 +6495,18 @@ class AdminDashboard:
                 return
 
             target_region_id = None if region_id == ALL_REGIONS_KEY else region_id
+            manager_allowed_region_ids = set(
+                self.db.get_manager_allowed_region_ids(manager_id)
+            )
             categories = [
                 c
                 for c in self.db.get_company_categories(company_id, target_region_id)
-                if isinstance(c, dict) and c.get("id")
+                if isinstance(c, dict)
+                and c.get("id")
+                and (
+                    not manager_allowed_region_ids
+                    or c.get("region_id") in manager_allowed_region_ids
+                )
             ]
             categories.sort(key=lambda c: (c.get("name") or "").lower())
 
@@ -6478,6 +6569,7 @@ class AdminDashboard:
                 self.page.update()
 
         def on_manager_change(_):
+            load_regions(manager_f.value)
             load_categories_for_manager(region_f.value, manager_f.value)
             if self.page:
                 self.page.update()
@@ -6485,8 +6577,8 @@ class AdminDashboard:
         region_f.on_select = on_region_change
         manager_f.on_select = on_manager_change
 
-        load_regions()
         load_managers()
+        load_regions(manager_f.value)
         load_categories_for_manager(region_f.value, manager_f.value)
 
         def save_click(_):

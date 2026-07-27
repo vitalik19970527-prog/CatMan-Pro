@@ -9179,6 +9179,47 @@ class DataManager:
             return {}
         return out
 
+    def get_managers_with_supplier_access(
+        self, company_id: str, supplier_id: str, region_id: str | None = None
+    ) -> list[dict]:
+        """
+        Regular managers (admins/superadmins excluded — they see everything by
+        default, not a meaningful "who has access" choice) who currently have
+        view access to this supplier via their category/product scope.
+
+        Used by PaymentsView so that when a manual settlement (opening balance /
+        compensation) is created for a supplier multiple people can see, the
+        user can choose exactly who it should be attributed to — instead of it
+        silently always being tied to whoever happens to be logged in.
+        """
+        cid = str(company_id or "").strip()
+        sid = str(supplier_id or "").strip()
+        if not cid or not sid:
+            return []
+        admin_roles = {
+            "адмін", "админ", "admin", "суперадмін", "суперадмин", "superadmin",
+        }
+        out = []
+        for m in self.get_company_managers(cid) or []:
+            if not isinstance(m, dict) or not m.get("id"):
+                continue
+            if m.get("is_blocked") or m.get("is_approved") is False:
+                continue
+            role_slug = str(m.get("role") or "").strip().lower().replace(" ", "")
+            if role_slug in admin_roles:
+                continue
+            mid = str(m.get("id"))
+            ctx = self._get_manager_visible_scope_context(cid, mid, region_id)
+            if ctx.get("restricted") and sid not in (ctx.get("supplier_ids") or set()):
+                continue
+            if not ctx.get("restricted") and not ctx.get("supplier_ids"):
+                # Unrestricted-but-empty context only happens for admin-like
+                # roles (already filtered above) or a manager with literally
+                # no scope assigned yet — either way, not a real access grant.
+                continue
+            out.append({"id": mid, "full_name": m.get("full_name") or mid})
+        return out
+
     def upsert_supplier_settlement(self, payload: dict) -> bool:
         if not self._use_postgres():
             return bool(

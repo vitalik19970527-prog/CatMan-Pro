@@ -123,6 +123,12 @@ class SuperAdminDashboard:
         self._sa_header_ref = None
         self._sa_modules_row_ref = None
         self._sa_expanded_companies: set[str] = set()
+        # Персистить розгорнуті/згорнуті ExpansionTile у вкладці "Інфраструктура"
+        # (дані доступу, БД компаній) через будь-які перемальовування вкладки.
+        self._infra_expanded_tiles: dict = {}
+        # Те саме для розгорнутих переписок у "Підтримка"/"Заявки" — інакше
+        # відкрита переписка згортається на кожному фоновому sync-pulse.
+        self._bot_thread_expanded: dict = {}
 
     # ── nav-icon helper ───────────────────────────────────────────────────────
     def _sa_nav_btn(
@@ -1416,6 +1422,9 @@ class SuperAdminDashboard:
         if self.current_tab == "leads_inbox":
             self.show_leads_inbox(None)
             return
+        if self.current_tab == "hierarchy":
+            self.show_hierarchy(None)
+            return
         self.show_overview(None)
 
     def _show_snack(self, text, color):
@@ -1718,10 +1727,10 @@ class SuperAdminDashboard:
 
         messages_container = ft.Container(content=ft.Text("", size=1))
         loaded = {"done": False}
+        thread_key = (bot_name, tg_user_id)
+        is_open = self._bot_thread_expanded.get(thread_key, False)
 
-        def _on_expand(ev):
-            if not bool(getattr(ev.control, "expanded", False)):
-                return
+        def _load_thread_now():
             if loaded["done"]:
                 return
             loaded["done"] = True
@@ -1740,6 +1749,15 @@ class SuperAdminDashboard:
 
             self.page.run_task(_load_thread)
 
+        def _on_expand(ev):
+            expanded_now = bool(getattr(ev.control, "expanded", False))
+            self._bot_thread_expanded[thread_key] = expanded_now
+            if expanded_now:
+                _load_thread_now()
+
+        if is_open:
+            _load_thread_now()
+
         return ft.ExpansionTile(
             title=ft.Row(
                 [
@@ -1755,6 +1773,7 @@ class SuperAdminDashboard:
                     ),
                 ]
             ),
+            expanded=is_open,
             on_change=_on_expand,
             controls=[messages_container],
         )
@@ -3764,12 +3783,13 @@ class SuperAdminDashboard:
             )
 
         def _make_collapsible_section(title, controls, initially_open=False):
-            body = ft.Column(controls, spacing=8, visible=initially_open)
+            is_open = self._company_sections_state.get(title, initially_open)
+            body = ft.Column(controls, spacing=8, visible=is_open)
             toggle_btn = ft.TextButton(
                 title,
                 icon=(
                     ft.Icons.KEYBOARD_ARROW_DOWN
-                    if initially_open
+                    if is_open
                     else ft.Icons.KEYBOARD_ARROW_RIGHT
                 ),
                 style=ft.ButtonStyle(
@@ -3779,6 +3799,7 @@ class SuperAdminDashboard:
 
             def _toggle(_):
                 body.visible = not body.visible
+                self._company_sections_state[title] = body.visible
                 toggle_btn.icon = (
                     ft.Icons.KEYBOARD_ARROW_DOWN
                     if body.visible
@@ -5284,10 +5305,18 @@ class SuperAdminDashboard:
 
                 delete_old_btn.on_click = _delete_old
 
+                _tile_key = ("auth_db", label)
+
+                def _on_tile_change(e, _key=_tile_key):
+                    self._infra_expanded_tiles[_key] = bool(
+                        getattr(e.control, "expanded", False)
+                    )
+
                 return ft.ExpansionTile(
                     title=ft.Text(label, size=13, weight=ft.FontWeight.W_600),
                     subtitle=cur_label,
-                    expanded=False,
+                    expanded=self._infra_expanded_tiles.get(_tile_key, False),
+                    on_change=_on_tile_change,
                     controls=[
                         ft.Container(
                             padding=ft.padding.only(left=8, right=8, bottom=12),
@@ -5376,12 +5405,20 @@ class SuperAdminDashboard:
                         with contextlib.suppress(Exception):
                             status_text.update()
 
+                _tile_key = ("pending_company_db", cid)
+
+                def _on_tile_change(e, _key=_tile_key):
+                    self._infra_expanded_tiles[_key] = bool(
+                        getattr(e.control, "expanded", False)
+                    )
+
                 return ft.ExpansionTile(
                     title=ft.Text(cname, size=13, weight=ft.FontWeight.W_600),
                     subtitle=ft.Text(
                         "Очікує адресу VPS", size=11, color="orange700"
                     ),
-                    expanded=True,
+                    expanded=self._infra_expanded_tiles.get(_tile_key, True),
+                    on_change=_on_tile_change,
                     controls=[
                         ft.Container(
                             padding=ft.padding.only(left=8, right=8, bottom=12),
@@ -5507,10 +5544,18 @@ class SuperAdminDashboard:
 
                 move_btn.on_click = _do_move
 
+                _tile_key = ("company_db", cid)
+
+                def _on_tile_change(e, _key=_tile_key):
+                    self._infra_expanded_tiles[_key] = bool(
+                        getattr(e.control, "expanded", False)
+                    )
+
                 return ft.ExpansionTile(
                     title=ft.Text(cname, size=13, weight=ft.FontWeight.W_600),
                     subtitle=cur_label,
-                    expanded=False,
+                    expanded=self._infra_expanded_tiles.get(_tile_key, False),
+                    on_change=_on_tile_change,
                     controls=[
                         ft.Container(
                             padding=ft.padding.only(left=8, right=8, bottom=12),
@@ -5564,6 +5609,13 @@ class SuperAdminDashboard:
                         )
                         for r in _registry
                     ]
+                    _local_tile_key = ("local_storage_company", _cid)
+
+                    def _on_local_tile_change(e, _key=_local_tile_key):
+                        self._infra_expanded_tiles[_key] = bool(
+                            getattr(e.control, "expanded", False)
+                        )
+
                     company_tiles.append(
                         ft.ExpansionTile(
                             title=ft.Text(_cname, size=13, weight=ft.FontWeight.W_600),
@@ -5574,7 +5626,10 @@ class SuperAdminDashboard:
                                 size=11,
                                 color="grey600",
                             ),
-                            expanded=False,
+                            expanded=self._infra_expanded_tiles.get(
+                                _local_tile_key, False
+                            ),
+                            on_change=_on_local_tile_change,
                             controls=[
                                 ft.Container(
                                     padding=ft.padding.only(left=8, right=8, bottom=12),

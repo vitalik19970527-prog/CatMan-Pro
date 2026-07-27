@@ -2545,6 +2545,43 @@ class ProductsView:
                 reverse=(self._product_sort_order == "desc"),
             )
 
+            def _group_ids_by_name(id_name_map: dict) -> dict:
+                """Same catalog level name can exist as several distinct
+                nodes (e.g. a brand re-created under different subcategories)
+                — group them under one chip by exact name instead of showing
+                one duplicate chip per underlying node id."""
+                groups: dict = {}
+                for _id, _name in id_name_map.items():
+                    _key = str(_name or "").strip()
+                    if not _key or not _id:
+                        continue
+                    groups.setdefault(_key, set()).add(_id)
+                return groups
+
+            def _multi_btn_group(text, ids, selected_ids, on_click):
+                ids = {str(x).strip() for x in (ids or []) if str(x).strip()}
+                selected = bool(ids & selected_ids)
+
+                def _make_style(is_sel):
+                    return ft.ButtonStyle(
+                        padding=ft.padding.symmetric(horizontal=7, vertical=1),
+                        text_style=ft.TextStyle(size=10, weight="w500"),
+                        bgcolor=(_BORDER if is_sel else None),
+                    )
+
+                btn = ft.OutlinedButton(text, height=26, style=_make_style(selected))
+
+                def _on_click(_, _ids=ids, b=btn, _sids=selected_ids):
+                    will_select = not bool(_ids & _sids)
+                    b.style = _make_style(will_select)
+                    import contextlib as _cl
+                    with _cl.suppress(Exception):
+                        b.update()
+                    on_click(_ids)
+
+                btn.on_click = _on_click
+                return btn
+
             def _multi_btn(text, key, selected_ids, on_click):
                 selected = key in selected_ids
 
@@ -2604,14 +2641,14 @@ class ProductsView:
                 self.load_products()
                 self._emit_state_changed()
 
-            def _toggle_subcategory(level_id):
-                key = str(level_id or "").strip()
-                if not key:
+            def _toggle_subcategory_group(ids):
+                ids = {str(x).strip() for x in (ids or []) if str(x).strip()}
+                if not ids:
                     return
-                if key in self._selected_subcategory_filter_ids:
-                    self._selected_subcategory_filter_ids.discard(key)
+                if ids & self._selected_subcategory_filter_ids:
+                    self._selected_subcategory_filter_ids -= ids
                 else:
-                    self._selected_subcategory_filter_ids.add(key)
+                    self._selected_subcategory_filter_ids |= ids
                 self.load_products()
                 self._emit_state_changed()
 
@@ -2620,14 +2657,14 @@ class ProductsView:
                 self.load_products()
                 self._emit_state_changed()
 
-            def _toggle_brand(level_id):
-                key = str(level_id or "").strip()
-                if not key:
+            def _toggle_brand_group(ids):
+                ids = {str(x).strip() for x in (ids or []) if str(x).strip()}
+                if not ids:
                     return
-                if key in self._selected_brand_filter_ids:
-                    self._selected_brand_filter_ids.discard(key)
+                if ids & self._selected_brand_filter_ids:
+                    self._selected_brand_filter_ids -= ids
                 else:
-                    self._selected_brand_filter_ids.add(key)
+                    self._selected_brand_filter_ids |= ids
                 self.load_products()
                 self._emit_state_changed()
 
@@ -2636,14 +2673,14 @@ class ProductsView:
                 self.load_products()
                 self._emit_state_changed()
 
-            def _toggle_series(level_id):
-                key = str(level_id or "").strip()
-                if not key:
+            def _toggle_series_group(ids):
+                ids = {str(x).strip() for x in (ids or []) if str(x).strip()}
+                if not ids:
                     return
-                if key in self._selected_series_filter_ids:
-                    self._selected_series_filter_ids.discard(key)
+                if ids & self._selected_series_filter_ids:
+                    self._selected_series_filter_ids -= ids
                 else:
-                    self._selected_series_filter_ids.add(key)
+                    self._selected_series_filter_ids |= ids
                 self.load_products()
                 self._emit_state_changed()
 
@@ -2691,15 +2728,16 @@ class ProductsView:
                         _clear_subcategories, not self._selected_subcategory_filter_ids
                     )
                 ]
-                for sid, sname in sorted(
-                    subcategory_map.items(), key=lambda x: (x[1] or "").lower()
+                for sname, sids in sorted(
+                    _group_ids_by_name(subcategory_map).items(),
+                    key=lambda x: (x[0] or "").lower(),
                 ):
                     sub_controls.append(
-                        _multi_btn(
+                        _multi_btn_group(
                             sname,
-                            sid,
+                            sids,
                             self._selected_subcategory_filter_ids,
-                            _toggle_subcategory,
+                            _toggle_subcategory_group,
                         )
                     )
                 self._subcategory_filter_host.controls = sub_controls
@@ -2713,12 +2751,16 @@ class ProductsView:
                 brand_controls = [
                     _clear_btn(_clear_brands, not self._selected_brand_filter_ids)
                 ]
-                for bid, bname in sorted(
-                    brand_map.items(), key=lambda x: (x[1] or "").lower()
+                for bname, bids in sorted(
+                    _group_ids_by_name(brand_map).items(),
+                    key=lambda x: (x[0] or "").lower(),
                 ):
                     brand_controls.append(
-                        _multi_btn(
-                            bname, bid, self._selected_brand_filter_ids, _toggle_brand
+                        _multi_btn_group(
+                            bname,
+                            bids,
+                            self._selected_brand_filter_ids,
+                            _toggle_brand_group,
                         )
                     )
                 self._brand_filter_host.controls = brand_controls
@@ -2732,12 +2774,16 @@ class ProductsView:
                 series_controls = [
                     _clear_btn(_clear_series, not self._selected_series_filter_ids)
                 ]
-                for sid, sname in sorted(
-                    series_map.items(), key=lambda x: (x[1] or "").lower()
+                for sname, sids in sorted(
+                    _group_ids_by_name(series_map).items(),
+                    key=lambda x: (x[0] or "").lower(),
                 ):
                     series_controls.append(
-                        _multi_btn(
-                            sname, sid, self._selected_series_filter_ids, _toggle_series
+                        _multi_btn_group(
+                            sname,
+                            sids,
+                            self._selected_series_filter_ids,
+                            _toggle_series_group,
                         )
                     )
                 self._series_filter_host.controls = series_controls
@@ -3931,12 +3977,28 @@ class ProductsView:
                 spacing=2,
             )
 
+        # Narrow the cost-price/margin table down to only the delivery
+        # methods this product's supplier actually ships by (set on the
+        # supplier, "Якими способами доставки веземо товар цього
+        # постачальника") — an unset/empty list on the supplier means
+        # unrestricted (every region method applies, same as before this
+        # feature existed), so untouched suppliers keep showing everything.
+        _supplier_ctx = (
+            product.get("supplier") if isinstance(product.get("supplier"), dict) else {}
+        )
+        _supplier_enabled_ids = _supplier_ctx.get("enabled_delivery_method_ids")
+        _supplier_restricted = (
+            isinstance(_supplier_enabled_ids, list) and len(_supplier_enabled_ids) > 0
+        )
         selected_delivery_ids = set()
         for method in self.db.get_effective_delivery_methods_for_manager(
             company_id, self.manager_id, product_region_id
         ):
-            if isinstance(method, dict) and method.get("id"):
-                selected_delivery_ids.add(method.get("id"))
+            if not isinstance(method, dict) or not method.get("id"):
+                continue
+            if _supplier_restricted and method.get("id") not in _supplier_enabled_ids:
+                continue
+            selected_delivery_ids.add(method.get("id"))
         profitability_controls = self._profitability_controls(
             product, selected_delivery_ids
         )

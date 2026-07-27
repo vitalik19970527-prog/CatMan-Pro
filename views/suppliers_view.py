@@ -68,6 +68,11 @@ class SuppliersView:
     META_TEXT_SIZE = 12
     EMPTY_TEXT_SIZE = 14
     ALL_REGIONS_KEY = "__all_regions__"
+    # Persists the archive-section collapse toggle across SuppliersView
+    # re-instantiation (a fresh instance is created on every tab load and
+    # every background sync-pulse reload, so a plain `self` attribute would
+    # reset to collapsed every time). Keyed by company_id.
+    _archive_collapsed_by_company: dict = {}
 
     @staticmethod
     def _normalize_currency_code(raw, default="USD"):
@@ -842,12 +847,11 @@ class SuppliersView:
             )
             or []
         )
-        collapsed = getattr(self, "_suppliers_archive_collapsed", True)
+        state_key = str(self.company_id or "")
+        collapsed = SuppliersView._archive_collapsed_by_company.get(state_key, True)
 
         def _toggle(_):
-            self._suppliers_archive_collapsed = not getattr(
-                self, "_suppliers_archive_collapsed", True
-            )
+            SuppliersView._archive_collapsed_by_company[state_key] = not collapsed
             self.load_suppliers()
 
         header = ft.Container(
@@ -1645,6 +1649,66 @@ class SuppliersView:
         temp_payment_images = {}  # field_id -> local_path
         current_payment_images = {}  # field_id -> existing url
 
+        # Which of the region's delivery methods this supplier's goods
+        # actually ship by — used to narrow the cost-price/margin table on
+        # the product card and the delivery-type choices in Orders down to
+        # just what applies to this supplier, instead of every method the
+        # company has for the region. An empty/missing list means
+        # "unrestricted" (every method applies) — this is the default for
+        # both brand-new suppliers and every supplier that existed before
+        # this feature, so nothing already filled in changes behavior until
+        # someone explicitly unchecks something here.
+        delivery_methods_section = ft.Column(spacing=4)
+        delivery_methods_checks: dict = {}
+
+        def _rebuild_delivery_methods_section():
+            delivery_methods_checks.clear()
+            work_company_id = _get_work_company_id()
+            region_id = region_f.value or supplier.get("region_id")
+            methods = (
+                self.db.get_company_delivery_methods(work_company_id, region_id)
+                if work_company_id and region_id
+                else []
+            )
+            methods = [m for m in methods if isinstance(m, dict) and m.get("id")]
+            if not methods:
+                delivery_methods_section.controls = [
+                    ft.Text(
+                        "Оберіть регіон — спершу там мають бути налаштовані способи доставки",
+                        size=11,
+                        color="grey600",
+                    )
+                ]
+                return
+            existing_ids = supplier.get("enabled_delivery_method_ids")
+            restricted = isinstance(existing_ids, list) and len(existing_ids) > 0
+            allowed_ids = set(existing_ids) if restricted else None
+            rows = []
+            for m in methods:
+                mid = m.get("id")
+                cb = ft.Checkbox(
+                    label=str(m.get("name") or mid),
+                    value=(not restricted) or (mid in allowed_ids),
+                )
+                delivery_methods_checks[mid] = cb
+                rows.append(cb)
+            delivery_methods_section.controls = [
+                ft.Text(
+                    "Якими способами доставки веземо товар цього постачальника",
+                    weight="bold",
+                    size=13,
+                ),
+                ft.Text(
+                    "Впливає на таблицю собівартості/рентабельності товару і на "
+                    "вибір способу доставки в замовленнях. Позначте лише "
+                    "актуальні для цього постачальника — за замовчуванням "
+                    "враховуються всі.",
+                    size=11,
+                    color="grey600",
+                ),
+                *rows,
+            ]
+
         def _legacy_payment_fields_map():
             return {
                 "swift": {"text_value": supplier.get("swift") or "", "image_url": ""},
@@ -2074,6 +2138,7 @@ class SuppliersView:
                 region_f.value = region_f.options[0].key if region_f.options else None
             # Rebuild dynamic payment fields for the selected company.
             _rebuild_payment_section()
+            _rebuild_delivery_methods_section()
             if not is_edit and self.is_privileged:
                 users_loaded[0] = False
                 users_col.controls = []
@@ -2084,6 +2149,8 @@ class SuppliersView:
             with contextlib.suppress(Exception):
                 payment_section.update()
             with contextlib.suppress(Exception):
+                delivery_methods_section.update()
+            with contextlib.suppress(Exception):
                 users_col.update()
 
         if self.is_superadmin:
@@ -2091,13 +2158,17 @@ class SuppliersView:
 
         def _on_region_change(_):
             _rebuild_payment_section()
+            _rebuild_delivery_methods_section()
             with contextlib.suppress(Exception):
                 payment_section.update()
+            with contextlib.suppress(Exception):
+                delivery_methods_section.update()
 
         region_f.on_select = _on_region_change
 
         # initial payment section build
         _rebuild_payment_section()
+        _rebuild_delivery_methods_section()
 
         # ВИПРАВЛЕНО: функція вибору файлів
         async def start_picking(target):
@@ -2250,6 +2321,20 @@ class SuppliersView:
                     except Exception:
                         logger.exception("Upload payment image failed")
 
+                # An empty list means "unrestricted" (every region delivery
+                # method applies) — saved whenever nothing was explicitly
+                # narrowed down (all checked, or none checked at all/no
+                # methods to choose from), so this never blocks the cost
+                # table by accident.
+                _checked_delivery_ids = [
+                    mid for mid, cb in delivery_methods_checks.items() if cb.value
+                ]
+                _enabled_delivery_method_ids = (
+                    _checked_delivery_ids
+                    if 0 < len(_checked_delivery_ids) < len(delivery_methods_checks)
+                    else []
+                )
+
                 data = {
                     "company_id": work_company_id,
                     "region_id": region_f.value,
@@ -2262,6 +2347,7 @@ class SuppliersView:
                     "alipay_qr": final_alipay_qr,
                     "wechat_qr": final_wechat_qr,
                     "notes": notes_f.value,
+                    "enabled_delivery_method_ids": _enabled_delivery_method_ids,
                 }
 
                 # Build payment_fields payload if company has configured effective fields.
@@ -2437,6 +2523,8 @@ class SuppliersView:
                     user_selection_section,
                     ft.Divider(),
                     payment_section,
+                    ft.Divider(),
+                    delivery_methods_section,
                     notes_f,
                 ],
                 tight=True,

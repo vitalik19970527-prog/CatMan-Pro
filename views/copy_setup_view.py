@@ -38,6 +38,13 @@ class CopySetupView:
     META_TEXT_SIZE = 12
     COPY_PANEL_HEIGHT = 520
 
+    # Persists which sections are expanded across CopySetupView re-instantiation
+    # (a fresh instance is created on every tab load and every background
+    # sync-pulse reload, so a plain `self._section_state` would reset to
+    # `default_open` every time — see _make_section below). Keyed by
+    # (company_id, section_key); resets on app restart, which is fine.
+    _section_state_by_company: dict = {}
+
     def __init__(
         self, content_area, user_data, db, on_open_module=None, consume_dirty_scope=None
     ):
@@ -48,7 +55,9 @@ class CopySetupView:
         self.company_id = self.user_data.get("company_id")
         self.on_open_module = on_open_module
         self.consume_dirty_scope = consume_dirty_scope or (lambda x: False)
-        self._section_state = {}
+        self._section_state = CopySetupView._section_state_by_company.setdefault(
+            str(self.company_id or ""), {}
+        )
 
     def _show_help(self) -> None:
         page = self.content_area.page if self.content_area else None
