@@ -7410,6 +7410,79 @@ class PaymentsView:
 
         return section
 
+    def _build_settlement_who_picker(self, supplier_id: str):
+        """Checkbox picker for who a NEW manual settlement (opening balance /
+        compensation) should be attributed to, when more than one manager
+        currently has access to this supplier.
+
+        A settlement always belongs to exactly one manager_id — "applying it
+        to several people" means creating one independent copy per selected
+        person (see callers), so later removing one person's access, or
+        editing their copy's amount, never touches anyone else's. Returns
+        (control_or_None, get_selected_ids). control is None when there's
+        nobody else to choose from — callers should skip showing it and just
+        use get_selected_ids() (which returns [self.manager_id]).
+        """
+        my_id = str(self.manager_id or "").strip()
+        try:
+            managers = (
+                self.db.get_managers_with_supplier_access(
+                    self.company_id, supplier_id, self._effective_region_id()
+                )
+                or []
+            )
+        except Exception:
+            managers = []
+        if my_id and not any(
+            str(m.get("id") or "").strip() == my_id for m in managers
+        ):
+            managers = [
+                {"id": my_id, "full_name": self.user_data.get("full_name") or my_id}
+            ] + list(managers)
+        if len(managers) <= 1:
+            return None, (lambda: [my_id] if my_id else [])
+
+        checks: dict = {}
+        rows: list = []
+        for m in managers:
+            mid = str(m.get("id") or "").strip()
+            if not mid or mid in checks:
+                continue
+            label = str(m.get("full_name") or mid)
+            if mid == my_id:
+                label += " " + self.t("payments.settlement_who.me_suffix", "(я)")
+            cb = ft.Checkbox(label=label, value=(mid == my_id))
+            checks[mid] = cb
+            rows.append(cb)
+
+        picker_col = ft.Column(spacing=2)
+
+        def _select_all(_):
+            for cb in checks.values():
+                cb.value = True
+            with contextlib.suppress(Exception):
+                picker_col.update()
+
+        picker_col.controls = [
+            ft.Text(
+                self.t("payments.settlement_who.title", "Кому зарахувати цей запис"),
+                size=10,
+                weight="bold",
+            ),
+            *rows,
+            ft.TextButton(
+                self.t("payments.settlement_who.select_all", "Обрати всіх"),
+                icon=ft.Icons.DONE_ALL,
+                on_click=_select_all,
+            ),
+        ]
+
+        def _get_selected():
+            selected = [mid for mid, cb in checks.items() if cb.value]
+            return selected or ([my_id] if my_id else [])
+
+        return picker_col, _get_selected
+
     def _open_opening_balance_dialog(
         self, supplier_id: str, supplier_name: str, supplier_ccy: str
     ):
@@ -7452,22 +7525,44 @@ class PaymentsView:
         comment_f = ft.TextField(label=self.t("orders.field.comment", "Коментар"), value="", text_size=10)
         comment_f.value = existing_cmt
 
+        # Only offer "who is this for" when creating a fresh balance — editing
+        # an existing one must keep updating that exact same manager's row,
+        # never fan it out to other people.
+        who_picker, get_selected_manager_ids = (
+            (None, lambda: [str(self.manager_id or "")])
+            if existing_open
+            else self._build_settlement_who_picker(supplier_id)
+        )
+
         def _save(_):
             amt = _safe_float(amount_f.value, 0.0) or 0.0
-            payload = {
-                "id": (existing_open or {}).get("id") or "",
-                "company_id": self.company_id,
-                "region_id": self.region_id,
-                "supplier_id": supplier_id,
-                "supplier_name": supplier_name,
-                "currency": supplier_ccy,
-                "amount": float(amt),
-                "type": "opening_balance",
-                "comment": str(comment_f.value or ""),
-                "manager_id": self.manager_id or "",
-                "created_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat(),
-            }
+            target_manager_ids = (
+                [(existing_open or {}).get("manager_id") or self.manager_id or ""]
+                if existing_open
+                else get_selected_manager_ids()
+            )
+            for idx, mid in enumerate(target_manager_ids):
+                payload = {
+                    "id": (
+                        (existing_open or {}).get("id") or ""
+                        if existing_open
+                        else ""
+                    ),
+                    "company_id": self.company_id,
+                    "region_id": self.region_id,
+                    "supplier_id": supplier_id,
+                    "supplier_name": supplier_name,
+                    "currency": supplier_ccy,
+                    "amount": float(amt),
+                    "type": "opening_balance",
+                    "comment": str(comment_f.value or ""),
+                    "manager_id": mid or "",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+                self._persist_settlement_async(
+                    payload, rebuild_after=(idx == len(target_manager_ids) - 1)
+                )
             try:
                 page.pop_dialog()
             except Exception:
@@ -7475,7 +7570,6 @@ class PaymentsView:
                     page.pop_dialog()
                 except Exception:
                     pass
-            self._persist_settlement_async(payload, rebuild_after=True)
 
         def _balance_help(_):
             from views.help_utils import show_modal_help
@@ -7494,7 +7588,10 @@ class PaymentsView:
                 ],
                 vertical_alignment=ft.CrossAxisAlignment.CENTER, tight=True,
             ),
-            content=ft.Column([amount_f, comment_f], tight=True),
+            content=ft.Column(
+                [amount_f, comment_f, *([who_picker] if who_picker else [])],
+                tight=True,
+            ),
             actions=[
                 ft.TextButton(
                     self.t("common.cancel", "Скасувати"),
@@ -7615,6 +7712,14 @@ class PaymentsView:
         )
         is_edit = bool(
             isinstance(existing, dict) and str(existing.get("id") or "").strip()
+        )
+        # Only offer "who is this for" when creating a fresh compensation —
+        # editing an existing one must keep updating that exact same
+        # manager's row, never fan it out to other people.
+        who_picker, get_selected_manager_ids = (
+            (None, lambda: [str(self.manager_id or "")])
+            if is_edit
+            else self._build_settlement_who_picker(supplier_id)
         )
         if is_edit and isinstance(existing, dict):
             # Prefill editable fields
@@ -8025,30 +8130,39 @@ class PaymentsView:
                 if zp_choice == OTHER_KEY
                 else zp_choice
             )
-            payload = {
-                "id": (
-                    str(existing.get("id") or "").strip()
-                    if is_edit and isinstance(existing, dict)
-                    else ""
-                ),
-                "company_id": self.company_id,
-                "region_id": self.region_id,
-                "supplier_id": supplier_id,
-                "supplier_name": supplier_name,
-                "currency": supplier_ccy,
-                "amount": float(-abs(amt)),
-                "type": "compensation",
-                "product_id": pid,
-                "product_name": prod_name,
-                "invoice_no": inv_eff,
-                "order_no_1c": zp_eff,
-                "manual_invoice": bool(inv_choice == OTHER_KEY),
-                "manual_order_no_1c": bool(zp_choice == OTHER_KEY),
-                "comment": str(comment_f.value or ""),
-                "manager_id": self.manager_id or "",
-                "created_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat(),
-            }
+            target_manager_ids = (
+                [str(existing.get("manager_id") or self.manager_id or "")]
+                if is_edit and isinstance(existing, dict)
+                else get_selected_manager_ids()
+            )
+            for idx, mid in enumerate(target_manager_ids):
+                payload = {
+                    "id": (
+                        str(existing.get("id") or "").strip()
+                        if is_edit and isinstance(existing, dict)
+                        else ""
+                    ),
+                    "company_id": self.company_id,
+                    "region_id": self.region_id,
+                    "supplier_id": supplier_id,
+                    "supplier_name": supplier_name,
+                    "currency": supplier_ccy,
+                    "amount": float(-abs(amt)),
+                    "type": "compensation",
+                    "product_id": pid,
+                    "product_name": prod_name,
+                    "invoice_no": inv_eff,
+                    "order_no_1c": zp_eff,
+                    "manual_invoice": bool(inv_choice == OTHER_KEY),
+                    "manual_order_no_1c": bool(zp_choice == OTHER_KEY),
+                    "comment": str(comment_f.value or ""),
+                    "manager_id": mid or "",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+                self._persist_settlement_async(
+                    payload, rebuild_after=(idx == len(target_manager_ids) - 1)
+                )
             try:
                 page.pop_dialog()
             except Exception:
@@ -8056,7 +8170,6 @@ class PaymentsView:
                     page.pop_dialog()
                 except Exception:
                     pass
-            self._persist_settlement_async(payload, rebuild_after=True)
 
         def _comp_help(_):
             from views.help_utils import show_modal_help
@@ -8085,6 +8198,7 @@ class PaymentsView:
                     ft.Row([zp_dd, zp_manual_f], spacing=8),
                     comment_f,
                     amount_f,
+                    *([who_picker] if who_picker else []),
                 ],
                 tight=True,
             ),
