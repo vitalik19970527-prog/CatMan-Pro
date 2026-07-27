@@ -138,6 +138,18 @@ class DataManager:
         # connection — sharing one across threads let their queries interleave
         # on the same socket and hang indefinitely under load (see _pg()).
         self._company_conns: dict[str, psycopg.Connection] = {}
+        # Guards _ensure_company_schema/_backfill_owner_tables so only the
+        # FIRST thread to open a connection for a given company runs the DDL
+        # bootstrap batch — every other concurrent background thread (tab
+        # rebuilds via asyncio.to_thread, see _company_conns above) just gets
+        # its own connection without re-running the same ALTER/CREATE INDEX
+        # statements. Without this, several threads opening their first
+        # per-thread connection at once (e.g. multiple views loading right
+        # after login) each ran the full DDL batch concurrently and Postgres
+        # deadlocked on the shared tables (observed as repeated
+        # DeadlockDetected errors + very slow/hung startup).
+        self._schema_bootstrap_lock = threading.Lock()
+        self._schema_bootstrapped_companies: set[str] = set()
         self._timeout_s = float(timeout_s)
         # Active company — set via set_company() after login. self._pg() resolves
         # to this company's own dedicated database.
@@ -515,14 +527,21 @@ class DataManager:
             dsn = self._resolve_company_dsn(cid)
             conn = psycopg.connect(dsn, autocommit=True, row_factory=dict_row)
             self._company_conns[cache_key] = conn
-            try:
-                self._ensure_company_schema(conn)
-                self._backfill_owner_tables(conn)
-            except Exception:
-                logger.exception(
-                    "company schema bootstrap failed for cid=%s (later DDL may be skipped)",
-                    cid,
-                )
+            with self._schema_bootstrap_lock:
+                needs_bootstrap = cid not in self._schema_bootstrapped_companies
+                if needs_bootstrap:
+                    self._schema_bootstrapped_companies.add(cid)
+            if needs_bootstrap:
+                try:
+                    self._ensure_company_schema(conn)
+                    self._backfill_owner_tables(conn)
+                except Exception:
+                    logger.exception(
+                        "company schema bootstrap failed for cid=%s (later DDL may be skipped)",
+                        cid,
+                    )
+                    with self._schema_bootstrap_lock:
+                        self._schema_bootstrapped_companies.discard(cid)
         return conn
 
     def _evict_company_connections(self, company_id: str) -> None:
@@ -544,6 +563,11 @@ class DataManager:
             if conn is not None:
                 with contextlib.suppress(Exception):
                     conn.close()
+        # Force the next _pg() call to re-run schema bootstrap: after
+        # DROP DATABASE or repointing to a new DSN/host, the physical target
+        # is different (or gone) and can't be assumed already-bootstrapped.
+        with self._schema_bootstrap_lock:
+            self._schema_bootstrapped_companies.discard(cid)
 
     @staticmethod
     def _ddl_packaging_supply_tables() -> list[str]:

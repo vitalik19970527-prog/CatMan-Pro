@@ -1246,7 +1246,7 @@ class SuppliersView:
             getattr(dlg, "open", None),
             len(getattr(page, "overlay", []) or []),
         )
-        page.close(dlg)
+        page.pop_dialog()
         logger.info(
             "[modal:suppliers] close:finish dlg=%s@%s open=%s overlay_after=%s",
             type(dlg).__name__,

@@ -1,25 +1,54 @@
-Як зібрати програму (CatManPro.exe)
+Як зібрати програму (CatMan Pro / CatMan SupAdm)
 ====================================
 
 1. Двічі клацніть файл "Зібрати програму.bat" у цій папці.
    Відкриється вікно "CatManPro Release Builder".
 
 2. У полі "Version" впишіть номер нової версії у форматі MAJOR.MINOR.PATCH
-   (наприклад: 1.1.3).
+   (наприклад: 1.2.8).
 
-3. Позначте, що саме зібрати:
+3. Оберіть, який застосунок збирати ("Which app"):
+   - CatMan Pro (main) — звичайний застосунок
+   - CatMan SupAdm (superadmin mini-app) — панель суперадміна
+   - Both — обидва одразу
+
+4. Позначте, що саме зібрати ("Build targets"):
    - Installer (Setup .exe) — інсталятор для Windows
-   - Portable (.exe) — окремий файл без встановлення
    - Android APK — збірка для Android
+   (можна обидва одразу; портативної/бездистрибутивної збірки .exe
+   без встановлення цей інструмент не робить)
 
-4. Натисніть "Build selected" і зачекайте — весь процес і його лог
-   показуються прямо у вікні. Зазвичай Setup + Portable займають кілька
-   хвилин, залежно від ПК.
+5. "Skip code protection" — залиште увімкненим для швидкої локальної
+   збірки без Nuitka-компіляції (швидше, зручно для тестів). Вимкніть,
+   якщо потрібна фінальна релізна збірка із захистом коду перед видачею
+   застосунку в оренду.
 
-5. Коли з'явиться "Build finished successfully" — готові файли лежать тут:
-   ..\.program\CatManPro-<версія>\.setup\CatManPro-Setup-<версія>.exe
-   ..\.program\CatManPro-<версія>\.portable\CatManPro-portable.exe
-   ..\.program\CatManPro-<версія>\.apk\CatManPro-android.apk (якщо позначали APK)
+6. Натисніть "Build selected" і зачекайте — весь процес і його лог
+   показуються прямо у вікні. Installer займає кілька хвилин; APK
+   значно довше (перша збірка APK може тривати 15-30+ хвилин, бо
+   Android/Flutter-збірка якісно важча за десктопну).
+
+7. Коли з'явиться "Build finished successfully" — готові файли лежать тут
+   (X.X.X — введена версія):
+
+   CatMan Pro:
+     ..\.program\CatManPro-X.X.X\CatManPro\.setup\CatManPro-Setup-X.X.X.exe
+     ..\.program\CatManPro-X.X.X\CatManPro\.apk\CatManPro-android.apk
+
+   CatMan SupAdm:
+     ..\.program\CatManPro-X.X.X\CatManSupAdm\.setup\CatManSupAdm-Setup-X.X.X.exe
+     ..\.program\CatManPro-X.X.X\CatManSupAdm\.apk\CatManSupAdm-android.apk
+
+   Якщо позначено "Copy result(s) to Desktop" — готові файли додатково
+   копіюються на Робочий стіл одразу після кожної збірки.
+
+Перед першою збіркою APK на новому ПК:
+   - Потрібні встановлені Flutter SDK, Android SDK (з platform-tools і
+     build-tools), Java JDK 17, і увімкнений Windows Developer Mode
+     (Налаштування → Для розробників) — без цього Flutter-збірка APK
+     впаде з помилкою про symlink.
+   - Змінні середовища JAVA_HOME, ANDROID_HOME, FLUTTER_HOME мають бути
+     виставлені постійно (через "Змінні середовища" у Windows).
 
 Примітка: сам скрипт збірки (build_release.ps1) та інсталятор (.iss)
 залишились у папці "scripts" в корені проєкту — цей інструмент лише

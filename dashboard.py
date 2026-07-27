@@ -2190,7 +2190,7 @@ class MainDashboard:
 
         def _close():
             with contextlib.suppress(Exception):
-                self.page.close(_dlg[0])
+                self.page.pop_dialog()
 
         def _open_here(_):
             _close()
@@ -2804,7 +2804,7 @@ class MainDashboard:
 
             def _close_dialog(dialog):
                 try:
-                    self.page.close(dialog)
+                    self.page.pop_dialog()
                 except Exception:
                     try:
                         dialog.open = False
@@ -3478,7 +3478,7 @@ class MainDashboard:
 
             def _close():
                 with contextlib.suppress(Exception):
-                    self.page.close(_dlg[0])
+                    self.page.pop_dialog()
 
             def _open_here(_):
                 _close()
@@ -4402,7 +4402,7 @@ class MainDashboard:
             actions=[
                 ft.FilledButton(
                     self.t("common.help.close", "Зрозуміло"),
-                    on_click=lambda _e: self.page.close(dlg),
+                    on_click=lambda _e: self.page.pop_dialog(),
                 ),
             ],
             actions_alignment=ft.MainAxisAlignment.END,

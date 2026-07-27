@@ -165,7 +165,7 @@ class ExtensionsView:
             title=ft.Text("Успішно"),
             content=ft.Text(str(message or "Збережено")),
             actions=[
-                ft.FilledButton("OK", on_click=lambda _e: page.close(dlg)),
+                ft.FilledButton("OK", on_click=lambda _e: page.pop_dialog()),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
@@ -1445,7 +1445,7 @@ class ExtensionsView:
                     border_radius=8,
                 ),
                 actions=[
-                    ft.TextButton("Закрити", on_click=lambda _: _page.close(dlg) if _page else None),
+                    ft.TextButton("Закрити", on_click=lambda _: _page.pop_dialog() if _page else None),
                 ],
             )
             if _page:

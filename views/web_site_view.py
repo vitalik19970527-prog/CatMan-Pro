@@ -27,6 +27,7 @@ import re
 
 import flet as ft
 
+import fx_rates
 import i18n
 from github_publisher import GitHubPublisher, load_publish_config, save_publish_config
 from logger import logger
@@ -55,6 +56,7 @@ LANGS = ["uk", "en", "pl", "zh", "de"]
 LANG_LABELS = {"uk": "UA", "en": "EN", "pl": "PL", "zh": "中文", "de": "DE"}
 
 I18N_JS_REL = "js/i18n.js"
+PRICE_HTML_FILE = "pages/pricing.html"
 
 PAGE_TITLES = {
     "index.html": "Головна",
@@ -190,6 +192,251 @@ def set_i18n_entry(text: str, lang: str, key: str, value: str) -> tuple[str, boo
 
 
 # ==================================================================
+# pages/pricing.html — generic price-token scanner/editor. One regex finds
+# every "NNN&nbsp;₴[<span class="price-usd">...$MM...</span>]" occurrence
+# on the page (price tables, GSM card, one-time services list, bundle
+# cards) instead of one hand-written pattern per markup shape. Each token's
+# label is the nearest preceding HTML text node that isn't itself a price
+# ("₴" or a bare number) — for the two 4-column tables this naturally
+# reuses the row's own label cell for every column, since the price cells
+# in between get filtered out as label candidates.
+# ==================================================================
+
+_PRICE_TOKEN_RE = re.compile(
+    r'(?P<uah>\d+(?:[.,]\d+)?)&nbsp;₴'
+    r'(?:\s*<span class="price-usd">(?P<usd_inner>[^<]*)</span>)?'
+)
+_USD_NUM_RE = re.compile(r'\$(\d+(?:[.,]\d+)?)')
+_TEXT_NODE_RE = re.compile(r'>([^<>]+)<')
+_PRICE_COLUMN_LABELS = ["1 людина", "5 людей", "10 людей", "15 людей"]
+# UI chrome that sits right before some price occurrences but is never a
+# useful label on its own (a mandatory-tab badge, a repeated CTA button,
+# a bare "/міс" suffix, ...) — skipped so the nearest REAL label (row name,
+# card title, sub-row heading) is used instead.
+_LABEL_EXCLUDE = {"обов'язково", "одноразово", "написати менеджеру", "/міс", "міс"}
+
+# Bundle cards (section 5, "16 готових тарифів") have their own clean h3
+# title that the generic nearest-text-node heuristic can't reliably reach —
+# it grabs the description paragraph, or a dual-row's OWN sub-label without
+# the bundle name attached, or (past the last card) the repeated CTA button.
+# Parsed separately with real markup anchors and spliced in over the
+# generic tokens for that section instead.
+_BUNDLE_H3_RE = re.compile(r'<h3[^>]*data-i18n="bundle\.\d+\.name"[^>]*>([^<]+)</h3>')
+_BUNDLE_SINGLE_PRICE_RE = re.compile(
+    r'<p class="price-value">(?P<uah>\d+(?:[.,]\d+)?)&nbsp;₴\s*<span class="price-usd">(?P<usd_inner>[^<]*)</span>'
+)
+_BUNDLE_DUAL_ROW_RE = re.compile(
+    r'<span[^>]*>(?P<sublabel>[^<]+)</span><span class="price-dual-value">'
+    r'(?P<uah>\d+(?:[.,]\d+)?)&nbsp;₴\s*<span class="price-usd">(?P<usd_inner>[^<]*)</span>'
+)
+
+
+def _split_usd_inner(usd_inner: str | None) -> tuple[str, str, str]:
+    """(usd_value, usd_prefix, usd_suffix) — usd_inner is a price-usd span's
+    raw inner text ("$1", "/ $4.5", ...); prefix/suffix are whatever
+    surrounds the bare number so it round-trips exactly on re-render."""
+    if usd_inner is None:
+        return "", "", ""
+    um = _USD_NUM_RE.search(usd_inner)
+    if not um:
+        return "", usd_inner, ""
+    return um.group(1), usd_inner[: um.start()], usd_inner[um.end():]
+
+
+def _parse_bundle_tokens(text: str) -> tuple[list[dict], int]:
+    """Returns (tokens, section_start). section_start is the position of the
+    first bundle <h3> — the caller drops every generically-scanned token at
+    or after that point and splices these in instead (-1 / [] if the page
+    has no bundle cards at all)."""
+    h3_matches = list(_BUNDLE_H3_RE.finditer(text))
+    if not h3_matches:
+        return [], -1
+
+    tokens: list[dict] = []
+    for i, h3 in enumerate(h3_matches):
+        name = h3.group(1).strip()
+        window_end = h3_matches[i + 1].start() if i + 1 < len(h3_matches) else len(text)
+        window = text[h3.end() : window_end]
+        offset = h3.end()
+
+        dual_matches = list(_BUNDLE_DUAL_ROW_RE.finditer(window))
+        if dual_matches:
+            for dm in dual_matches:
+                usd_value, usd_prefix, usd_suffix = _split_usd_inner(dm.group("usd_inner"))
+                tokens.append(
+                    {
+                        "start": offset + dm.start("uah"),
+                        "end": offset + dm.end(),
+                        "label": f"{name} · {dm.group('sublabel').strip()}",
+                        "group_key": name,
+                        "col_index": 0,
+                        "uah": dm.group("uah"),
+                        "has_usd": True,
+                        "usd_value": usd_value,
+                        "usd_prefix": usd_prefix,
+                        "usd_suffix": usd_suffix,
+                    }
+                )
+        else:
+            sm = _BUNDLE_SINGLE_PRICE_RE.search(window)
+            if sm:
+                usd_value, usd_prefix, usd_suffix = _split_usd_inner(sm.group("usd_inner"))
+                tokens.append(
+                    {
+                        "start": offset + sm.start("uah"),
+                        "end": offset + sm.end(),
+                        "label": name,
+                        "group_key": name,
+                        "col_index": 0,
+                        "uah": sm.group("uah"),
+                        "has_usd": True,
+                        "usd_value": usd_value,
+                        "usd_prefix": usd_prefix,
+                        "usd_suffix": usd_suffix,
+                    }
+                )
+    return tokens, h3_matches[0].start()
+
+
+def parse_pricing_tokens(text: str) -> list[dict]:
+    """Returns every editable price on the page, in document order, each as
+    {start, end, label, uah, has_usd, usd_value, usd_prefix, usd_suffix}.
+    start/end are exact offsets into `text` for the whole "NNN&nbsp;₴[...]"
+    match — apply_price_tokens() splices replacements at those offsets."""
+    text_nodes: list[tuple[int, str]] = []
+    for m in _TEXT_NODE_RE.finditer(text):
+        content = m.group(1).strip()
+        if not content or "₴" in content or "$" in content:
+            continue
+        if re.fullmatch(r"\d+(?:[.,]\d+)?", content):
+            continue
+        if content.lower() in _LABEL_EXCLUDE:
+            continue
+        text_nodes.append((m.start(1), content))
+
+    bundle_tokens, bundle_section_start = _parse_bundle_tokens(text)
+
+    tokens: list[dict] = []
+    last_label = ""
+    repeat_count = 0
+    ti = 0
+    for m in _PRICE_TOKEN_RE.finditer(text):
+        if bundle_section_start >= 0 and m.start() >= bundle_section_start:
+            # Everything from here on is either a bundle price (replaced by
+            # bundle_tokens below) or footnote prose after the cards — stop
+            # the generic scan so it doesn't duplicate/mislabel either.
+            break
+
+        label = last_label
+        while ti < len(text_nodes) and text_nodes[ti][0] < m.start():
+            label = text_nodes[ti][1]
+            ti += 1
+
+        if label == last_label:
+            repeat_count += 1
+        else:
+            repeat_count = 0
+            last_label = label
+
+        short_label = label[:44]
+        if repeat_count:
+            suffix = (
+                _PRICE_COLUMN_LABELS[repeat_count]
+                if repeat_count < len(_PRICE_COLUMN_LABELS)
+                else f"#{repeat_count + 1}"
+            )
+            display_label = f"{short_label} · {suffix}"
+        else:
+            display_label = short_label or "(без назви)"
+
+        usd_inner = m.group("usd_inner")
+        usd_value, usd_prefix, usd_suffix = _split_usd_inner(usd_inner)
+
+        tokens.append(
+            {
+                "start": m.start(),
+                "end": m.end(),
+                "label": display_label,
+                "group_key": last_label,
+                "col_index": repeat_count,
+                "uah": m.group("uah"),
+                "has_usd": usd_inner is not None,
+                "usd_value": usd_value,
+                "usd_prefix": usd_prefix,
+                "usd_suffix": usd_suffix,
+            }
+        )
+
+    tokens.extend(bundle_tokens)
+    return tokens
+
+
+def group_pricing_tokens(tokens: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Splits tokens into (grouped_rows, flat_tokens):
+    grouped_rows are runs of exactly 4 consecutive tokens sharing the same
+    group_key at col_index 0,1,2,3 — the "1/5/10/15 people" price tables —
+    collapsed into one {"label", "cols": [tok0..tok3]} row each. Everything
+    else (GSM, one-time services, bundle cards) stays as single-column
+    flat_tokens, since it has no such fixed 4-wide structure."""
+    grouped: list[dict] = []
+    flat: list[dict] = []
+    i, n = 0, len(tokens)
+    while i < n:
+        if (
+            i + 3 < n
+            and tokens[i]["col_index"] == 0
+            and all(
+                tokens[i + k]["group_key"] == tokens[i]["group_key"]
+                and tokens[i + k]["col_index"] == k
+                for k in range(1, 4)
+            )
+        ):
+            grouped.append({"label": tokens[i]["group_key"], "cols": tokens[i : i + 4]})
+            i += 4
+        else:
+            flat.append(tokens[i])
+            i += 1
+    return grouped, flat
+
+
+def apply_price_token_edits(text: str, edits: list[dict]) -> str:
+    """Batch version of apply_price_token_edit — each item in `edits` is a
+    token dict merged with its edit fields (discount/new_uah/new_usd_value,
+    plus old_uah/old_usd_value when discount=True). Spliced back-to-front by
+    position so earlier offsets stay valid while later ones get replaced."""
+    for edit in sorted(edits, key=lambda e: e["start"], reverse=True):
+        text = apply_price_token_edit(text, edit, edit)
+    return text
+
+
+def _render_price_html(uah: str, has_usd: bool, usd_prefix: str, usd_value: str, usd_suffix: str) -> str:
+    out = f"{uah}&nbsp;₴"
+    if has_usd:
+        out += f' <span class="price-usd">{usd_prefix}{usd_value}{usd_suffix}</span>'
+    return out
+
+
+def apply_price_token_edit(text: str, token: dict, edit: dict) -> str:
+    """Splices a single token's replacement into `text` at token['start':'end'].
+    edit either sets a plain new price ({"discount": False, "new_uah",
+    "new_usd_value"}) or a discount pair — old price struck through, new
+    price in red right after it ({"discount": True, "old_uah",
+    "old_usd_value", "new_uah", "new_usd_value"})."""
+    has_usd = token["has_usd"]
+    usd_prefix, usd_suffix = token["usd_prefix"], token["usd_suffix"]
+    if edit.get("discount"):
+        old_html = _render_price_html(edit["old_uah"], has_usd, usd_prefix, edit["old_usd_value"], usd_suffix)
+        new_html = _render_price_html(edit["new_uah"], has_usd, usd_prefix, edit["new_usd_value"], usd_suffix)
+        replacement = (
+            f'<del style="text-decoration:line-through;color:#94a3b8;">{old_html}</del> '
+            f'<strong style="color:#DC2626;">{new_html}</strong>'
+        )
+    else:
+        replacement = _render_price_html(edit["new_uah"], has_usd, usd_prefix, edit["new_usd_value"], usd_suffix)
+    return text[: token["start"]] + replacement + text[token["end"] :]
+
+
+# ==================================================================
 # HTML data-i18n / data-i18n-html / data-i18n-attr синхронізація
 # ==================================================================
 
@@ -262,18 +509,20 @@ class WebSiteView:
         self.manager_id = str(self.user_data.get("id") or "")
         self.t = i18n.bind(self.manager_id)
 
-        self.sub_tab = "texts"  # texts | images | files | build | settings
+        self.sub_tab = "texts"  # texts | images | price | files | build | settings
         self._publisher = GitHubPublisher()
 
         self._i18n_keys: list[str] = []
         self._i18n_values: dict[str, dict[str, str]] = {}
         self._text_filter = ""
-        self._text_page = 0
         self._file_cache: dict[str, bytes] = {}
         self._img_listing_cache: list[dict] | None = None
         self._shot_containers_cache: list[dict] | None = None
         self._texts_loading = False
         self._images_loading = False
+        self._price_html_loaded = False
+        self._prices_loading = False
+        self._price_filter = ""
 
         self._raw_selected_file = SITE_ALL_FILES[0]
 
@@ -370,6 +619,7 @@ class WebSiteView:
             [
                 self._nav_btn("texts", "Тексти", ft.Icons.TRANSLATE),
                 self._nav_btn("images", "Зображення", ft.Icons.IMAGE_OUTLINED),
+                self._nav_btn("price", "Прайс", ft.Icons.SELL_OUTLINED),
                 self._nav_btn("files", "Файли сайту", ft.Icons.CODE),
                 self._nav_btn("build", "Білд і публікація", ft.Icons.ROCKET_LAUNCH_OUTLINED),
                 self._nav_btn("settings", "Налаштування", ft.Icons.SETTINGS_OUTLINED),
@@ -402,8 +652,11 @@ class WebSiteView:
         needs_images_prefetch = (
             self.sub_tab == "images" and self._img_listing_cache is None and self._publisher.configured
         )
+        needs_price_prefetch = (
+            self.sub_tab == "price" and not self._price_html_loaded and self._publisher.configured
+        )
 
-        if needs_texts_prefetch or needs_images_prefetch:
+        if needs_texts_prefetch or needs_images_prefetch or needs_price_prefetch:
             controls.append(
                 ft.Row(
                     [ft.ProgressRing(width=20, height=20, stroke_width=2), ft.Text("Завантаження з GitHub…")],
@@ -418,12 +671,23 @@ class WebSiteView:
                 elif needs_images_prefetch and not self._images_loading:
                     self._images_loading = True
                     page.run_task(self._prefetch_images)
+                elif needs_price_prefetch and not self._prices_loading:
+                    self._prices_loading = True
+                    page.run_task(self._prefetch_prices)
+        elif not self._publisher.configured and self.sub_tab != "settings":
+            # Orange banner above already explains why — building texts/images/
+            # files/build here would just hit GitHub and raise (no token), which
+            # used to also show a scary "Сталася помилка" under the banner for
+            # what is really just "not configured yet", not a crash.
+            pass
         else:
             try:
                 if self.sub_tab == "texts":
                     controls.append(self._build_texts_section())
                 elif self.sub_tab == "images":
                     controls.append(self._build_images_section())
+                elif self.sub_tab == "price":
+                    controls.append(self._build_price_section())
                 elif self.sub_tab == "files":
                     controls.append(self._build_files_section())
                 elif self.sub_tab == "build":
@@ -463,6 +727,17 @@ class WebSiteView:
             self._images_loading = False
             self.build()
 
+    async def _prefetch_prices(self):
+        try:
+            await asyncio.to_thread(self._read_site_file, PRICE_HTML_FILE)
+            await asyncio.to_thread(fx_rates.ensure_rates_loaded)
+            self._price_html_loaded = True
+        except Exception:
+            logger.exception("WebSiteView: prefetch prices failed")
+        finally:
+            self._prices_loading = False
+            self.build()
+
     def _nav_btn(self, key: str, label: str, icon):
         active = self.sub_tab == key
 
@@ -486,14 +761,6 @@ class WebSiteView:
             text = self._read_site_file(I18N_JS_REL)
             self._i18n_keys, self._i18n_values = load_i18n_index(text)
 
-        filter_field = ft.TextField(
-            label="Пошук за ключем або текстом",
-            value=self._text_filter,
-            on_change=self._on_text_filter_change,
-            border_radius=10,
-            prefix_icon=ft.Icons.SEARCH,
-        )
-
         needle = (self._text_filter or "").strip().lower()
         if needle:
             keys = [
@@ -505,132 +772,423 @@ class WebSiteView:
         else:
             keys = self._i18n_keys
 
-        page_size = 60
-        total_pages = max(1, (len(keys) + page_size - 1) // page_size)
-        self._text_page = max(0, min(self._text_page, total_pages - 1))
-        start = self._text_page * page_size
-        shown = keys[start : start + page_size]
-        rows = [self._build_text_key_row(k) for k in shown]
+        info = ft.Text(
+            f"Ключів перекладу: {len(self._i18n_keys)}"
+            + (f" (показано {len(keys)} за пошуком)" if needle else ""),
+            size=12,
+            color="grey600",
+        )
 
-        info: list[ft.Control] = [
-            ft.Text(f"Ключів перекладу: {len(self._i18n_keys)}", size=12, color="grey600")
-        ]
+        filter_field = ft.TextField(
+            label="Пошук за ключем або текстом",
+            value=self._text_filter,
+            on_change=self._on_text_filter_change,
+            border_radius=10,
+            prefix_icon=ft.Icons.SEARCH,
+            expand=True,
+        )
 
-        pager: list[ft.Control] = []
-        if total_pages > 1:
-            pager.append(
-                ft.Row(
-                    [
-                        ft.IconButton(
-                            ft.Icons.CHEVRON_LEFT,
-                            on_click=self._prev_text_page,
-                            disabled=self._text_page == 0,
-                        ),
-                        ft.Text(
-                            f"{start + 1}–{min(start + page_size, len(keys))} з {len(keys)}"
-                            f" (сторінка {self._text_page + 1}/{total_pages})",
-                            size=12,
-                        ),
-                        ft.IconButton(
-                            ft.Icons.CHEVRON_RIGHT,
-                            on_click=self._next_text_page,
-                            disabled=self._text_page >= total_pages - 1,
-                        ),
-                    ],
-                    alignment=ft.MainAxisAlignment.CENTER,
-                    spacing=6,
-                )
-            )
+        header_row, rows_scroller, save_button = self._build_texts_table(keys)
 
+        # Search + Save pinned above the scrolling rows (not inside the
+        # scroll) so both stay visible however far down the 284-row list
+        # you've scrolled — same request already applied to Прайс's
+        # column titles, now also covering the filter/save row itself.
         return ft.Column(
-            [*info, filter_field, *pager, ft.Column(rows, spacing=6), *pager],
-            spacing=10,
+            [
+                info,
+                ft.Row([filter_field, save_button], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                header_row,
+                ft.Divider(height=1),
+                rows_scroller,
+            ],
+            spacing=8,
         )
 
     def _on_text_filter_change(self, e):
         self._text_filter = e.control.value or ""
-        self._text_page = 0
         self.build()
 
-    def _prev_text_page(self, e):
-        self._text_page = max(0, self._text_page - 1)
-        self.build()
+    def _build_texts_table(self, keys: list[str]) -> tuple[ft.Row, ft.Container, ft.FilledButton]:
+        # Plain Row/Column grid, not ft.DataTable — DataTable's rows don't
+        # grow to fit multiline content (found via live testing: long
+        # translations kept getting clipped no matter how high max_lines
+        # was set). A Row of fixed-width Containers has no such limit and
+        # grows exactly as tall as its content needs.
+        header_row = ft.Row(
+            [
+                ft.Container(width=180, content=ft.Text("Ключ", size=11, weight="bold")),
+                *[
+                    ft.Container(width=200, content=ft.Text(LANG_LABELS.get(lang, lang), size=11, weight="bold"))
+                    for lang in LANGS
+                ],
+            ],
+            spacing=10,
+        )
 
-    def _next_text_page(self, e):
-        self._text_page += 1
-        self.build()
-
-    def _build_text_key_row(self, key: str):
-        original_values = dict(self._i18n_values.get(key, {}))
-        fields: dict[str, ft.TextField] = {}
-        for lang in LANGS:
-            fields[lang] = ft.TextField(
-                label=LANG_LABELS.get(lang, lang),
-                value=original_values.get(lang, ""),
-                multiline=True,
-                min_lines=1,
-                max_lines=4,
-                dense=True,
-                border_radius=8,
+        row_state: list[tuple[str, dict[str, ft.TextField], dict[str, str]]] = []
+        grid_rows: list[ft.Control] = []
+        for key in keys:
+            original_values = dict(self._i18n_values.get(key, {}))
+            fields: dict[str, ft.TextField] = {}
+            row_cells: list[ft.Control] = [
+                ft.Container(width=180, content=ft.Text(key, size=11, selectable=True, no_wrap=False))
+            ]
+            for lang in LANGS:
+                field = ft.TextField(
+                    value=original_values.get(lang, ""),
+                    width=200,
+                    multiline=True,
+                    min_lines=1,
+                    dense=True,
+                    content_padding=ft.padding.symmetric(horizontal=8, vertical=6),
+                    text_size=12,
+                    border_radius=6,
+                )
+                fields[lang] = field
+                row_cells.append(ft.Container(width=200, content=field))
+            row_state.append((key, fields, original_values))
+            grid_rows.append(
+                ft.Container(
+                    padding=ft.padding.symmetric(vertical=4),
+                    content=ft.Row(row_cells, spacing=10, vertical_alignment=ft.CrossAxisAlignment.START),
+                )
             )
 
-        async def _do_save(_key=key, _fields=fields, _orig=original_values):
-            changed_langs = {
-                lang: (field.value or "")
-                for lang, field in _fields.items()
-                if (field.value or "") != (_orig.get(lang, "") or "")
-            }
-            if not changed_langs:
+        async def _save_all(_e=None):
+            changed: dict[str, dict[str, str]] = {}
+            for key, fields, orig in row_state:
+                row_changed = {
+                    lang: (f.value or "")
+                    for lang, f in fields.items()
+                    if (f.value or "") != (orig.get(lang, "") or "")
+                }
+                if row_changed:
+                    changed[key] = row_changed
+            if not changed:
                 self._snack("Немає змін", "grey")
                 return
 
             def _apply():
                 text = self._read_site_file(I18N_JS_REL)
                 touched_i18n = False
-                for lang, new_val in changed_langs.items():
-                    text, ch = set_i18n_entry(text, lang, _key, new_val)
-                    touched_i18n = touched_i18n or ch
+                uk_changes: dict[str, str] = {}
+                for key, langs in changed.items():
+                    for lang, new_val in langs.items():
+                        text, ch = set_i18n_entry(text, lang, key, new_val)
+                        touched_i18n = touched_i18n or ch
+                        if lang == "uk":
+                            uk_changes[key] = new_val
 
                 items: list[tuple[str, bytes]] = []
                 if touched_i18n:
                     items.append((I18N_JS_REL, text.encode("utf-8")))
-                if "uk" in changed_langs:
+                if uk_changes:
                     for rel in SITE_HTML_FILES:
                         html_text = self._read_site_file(rel)
-                        new_html, ch = sync_uk_key_into_html(html_text, _key, changed_langs["uk"])
-                        if ch:
-                            items.append((rel, new_html.encode("utf-8")))
+                        any_ch = False
+                        for key, new_val in uk_changes.items():
+                            html_text, ch = sync_uk_key_into_html(html_text, key, new_val)
+                            any_ch = any_ch or ch
+                        if any_ch:
+                            items.append((rel, html_text.encode("utf-8")))
                 return items
 
             items = await asyncio.to_thread(_apply)
             if not items:
-                self._snack("Ключ не знайдено у файлі — змін не застосовано", "orange")
+                self._snack("Ключі не знайдено у файлі — змін не застосовано", "orange")
                 return
-            for lang, new_val in changed_langs.items():
-                original_values[lang] = new_val
-                self._i18n_values.setdefault(_key, {})[lang] = new_val
-            await self._save_and_publish(items, f"Web сайт: оновлено текст «{_key}»")
+            for key, langs in changed.items():
+                for lang, new_val in langs.items():
+                    self._i18n_values.setdefault(key, {})[lang] = new_val
+            await self._save_and_publish(items, f"Web сайт: оновлено {len(changed)} текст(ів)", on_done=self.build)
 
-        def _on_click(_e, _s=_do_save):
+        def _on_click(_e):
             page = self._page()
             if page:
-                page.run_task(_s)
+                page.run_task(_save_all)
 
-        return ft.Card(
-            ft.Container(
-                padding=12,
-                content=ft.Column(
-                    [
-                        ft.Text(key, size=12, weight="bold", color="grey800", selectable=True),
-                        *fields.values(),
-                        ft.Row(
-                            [ft.FilledButton("Зберегти", icon=ft.Icons.SAVE, on_click=_on_click)],
-                            alignment=ft.MainAxisAlignment.END,
-                        ),
-                    ],
-                    spacing=6,
+        save_button = ft.FilledButton("Зберегти зміни", icon=ft.Icons.SAVE, on_click=_on_click)
+
+        # Fixed height (not expand=True) is deliberate: this Column already
+        # sits inside content_area, which itself scrolls — a child of a
+        # scrolling container has no bounded height for "expand" to fill,
+        # so only an explicit height gives this box its OWN internal scroll
+        # instead of just growing forever and dragging the header along
+        # with it (defeats the point of pinning the header above it).
+        rows_scroller = ft.Container(
+            height=560,
+            content=ft.Column(grid_rows, spacing=6, scroll=ft.ScrollMode.ALWAYS),
+        )
+
+        return header_row, rows_scroller, save_button
+
+    # -------------------------------------------------------------- 1b. Прайс
+    def _build_price_section(self):
+        text = self._read_site_file(PRICE_HTML_FILE)
+        tokens = [t for t in parse_pricing_tokens(text) if t["has_usd"]]
+        grouped_rows, flat_tokens = group_pricing_tokens(tokens)
+
+        filter_field = ft.TextField(
+            label="Пошук за назвою",
+            value=self._price_filter,
+            on_change=self._on_price_filter_change,
+            border_radius=10,
+            prefix_icon=ft.Icons.SEARCH,
+        )
+
+        needle = (self._price_filter or "").strip().lower()
+        if needle:
+            grouped_rows = [r for r in grouped_rows if needle in r["label"].lower()]
+            flat_tokens = [t for t in flat_tokens if needle in t["label"].lower()]
+
+        content: list[ft.Control] = [
+            ft.Text(
+                f"{len(tokens)} цін на сторінці: {len(grouped_rows)} рядків у таблиці "
+                f"«Вкладки/люди», {len(flat_tokens)} — окремих позицій нижче. "
+                f"Долар рахується сам із курсу НБУ — вводьте лише гривню.",
+                size=12,
+                color="grey600",
+            ),
+            filter_field,
+        ]
+
+        if grouped_rows:
+            content.append(ft.Text("Вкладки / кількість людей", size=13, weight="bold"))
+            content.append(self._build_price_table_grouped(grouped_rows))
+        if flat_tokens:
+            content.append(ft.Text("GSM, одноразові послуги, тарифні пакети", size=13, weight="bold"))
+            content.append(self._build_price_table_flat(flat_tokens))
+        if not grouped_rows and not flat_tokens:
+            content.append(ft.Text("Нічого не знайдено", size=12, color="grey600"))
+
+        return ft.Column(content, spacing=10)
+
+    def _on_price_filter_change(self, e):
+        self._price_filter = e.control.value or ""
+        self.build()
+
+    @staticmethod
+    def _price_money_field(value: str, width: int) -> ft.TextField:
+        return ft.TextField(
+            value=value,
+            width=width,
+            dense=True,
+            content_padding=ft.padding.symmetric(horizontal=6, vertical=6),
+            text_size=12,
+            text_align=ft.TextAlign.CENTER,
+            border_radius=6,
+        )
+
+    @staticmethod
+    def _price_usd_text(uah_value: str) -> str:
+        """USD is never typed by hand — it's always today's NBU-rate
+        conversion of whatever UAH price is currently entered."""
+        try:
+            amount = float((uah_value or "").strip().replace(",", "."))
+        except ValueError:
+            return "—"
+        usd = fx_rates.convert(amount, "UAH", "USD")
+        if usd is None:
+            return "—"
+        usd = round(usd, 1)
+        return str(int(usd)) if usd == int(usd) else f"{usd:g}"
+
+    def _price_field_with_usd(self, initial_uah: str, uah_width: int = 60, usd_width: int = 46) -> tuple[ft.TextField, ft.Text]:
+        """A UAH TextField paired with a live, read-only USD ft.Text next to
+        it — typing a new UAH price recomputes the $ display immediately,
+        no separate $ input to keep in sync by hand."""
+        usd_text = ft.Text(self._price_usd_text(initial_uah), size=12, color="grey700", width=usd_width,
+                            text_align=ft.TextAlign.CENTER)
+
+        def _on_change(e):
+            usd_text.value = self._price_usd_text(e.control.value)
+            with contextlib.suppress(Exception):
+                usd_text.update()
+
+        uah_field = self._price_money_field(initial_uah, uah_width)
+        uah_field.on_change = _on_change
+        return uah_field, usd_text
+
+    def _parse_price_money(self, field: ft.TextField, label: str) -> str | None:
+        raw = (field.value or "").strip().replace(",", ".")
+        try:
+            float(raw)
+        except ValueError:
+            self._snack(f"«{label}»: ціна має бути числом", "red")
+            return None
+        return raw
+
+    async def _publish_price_edits(self, edits: list[dict], summary_label: str):
+        if not edits:
+            self._snack("Немає змін", "grey")
+            return
+
+        def _apply():
+            current_text = self._read_site_file(PRICE_HTML_FILE)
+            return apply_price_token_edits(current_text, edits)
+
+        new_text = await asyncio.to_thread(_apply)
+        items = [(PRICE_HTML_FILE, new_text.encode("utf-8"))]
+        await self._save_and_publish(
+            items, f"Web сайт: оновлено {len(edits)} цін ({summary_label})", on_done=self.build
+        )
+
+    # Grouped table: one row per item, 1/5/10/15-people prices as 4 column
+    # pairs (₴ input + auto $ display), plus one "Знижка" checkbox per row —
+    # checked, it applies to every column in that row: whatever's typed
+    # becomes the new (red) price, the value the row loaded with becomes the
+    # struck-through old price. One checkbox instead of 4 keeps the row from
+    # doubling in width.
+    def _build_price_table_grouped(self, rows: list[dict]) -> ft.Column:
+        columns = [ft.DataColumn(ft.Text("Назва", size=11, weight="bold"))]
+        for col_label in _PRICE_COLUMN_LABELS:
+            columns.append(ft.DataColumn(ft.Text(f"{col_label}, ₴", size=10, weight="bold")))
+            columns.append(ft.DataColumn(ft.Text("$", size=10, weight="bold")))
+        columns.append(ft.DataColumn(ft.Text("Знижка", size=10, weight="bold")))
+
+        row_state: list[tuple[list[tuple[dict, ft.TextField]], ft.Checkbox]] = []
+        data_rows = []
+        for row in rows:
+            cells = [ft.DataCell(ft.Text(row["label"], size=11, no_wrap=False, width=140))]
+            col_fields: list[tuple[dict, ft.TextField]] = []
+            for tok in row["cols"]:
+                uah_f, usd_text = self._price_field_with_usd(tok["uah"])
+                col_fields.append((tok, uah_f))
+                cells.append(ft.DataCell(uah_f))
+                cells.append(ft.DataCell(usd_text))
+            discount_cb = ft.Checkbox(value=False)
+            cells.append(ft.DataCell(discount_cb))
+            row_state.append((col_fields, discount_cb))
+            data_rows.append(ft.DataRow(cells=cells))
+
+        async def _save_all(_e=None):
+            edits: list[dict] = []
+            for col_fields, discount_cb in row_state:
+                is_discount = bool(discount_cb.value)
+                for tok, uah_f in col_fields:
+                    new_uah = self._parse_price_money(uah_f, tok["label"])
+                    if new_uah is None:
+                        return
+                    if new_uah == tok["uah"]:
+                        continue
+                    new_usd = self._price_usd_text(new_uah)
+                    if is_discount:
+                        edits.append(
+                            {
+                                **tok,
+                                "discount": True,
+                                "old_uah": tok["uah"],
+                                "old_usd_value": tok["usd_value"],
+                                "new_uah": new_uah,
+                                "new_usd_value": new_usd,
+                            }
+                        )
+                    else:
+                        edits.append({**tok, "discount": False, "new_uah": new_uah, "new_usd_value": new_usd})
+            await self._publish_price_edits(edits, "таблиця вкладок/людей")
+
+        def _on_click(_e):
+            page = self._page()
+            if page:
+                page.run_task(_save_all)
+
+        return ft.Column(
+            [
+                ft.Row(
+                    [ft.DataTable(columns=columns, rows=data_rows, column_spacing=6,
+                                   data_row_min_height=34, heading_row_height=34)],
+                    scroll=ft.ScrollMode.ALWAYS,
                 ),
+                ft.Row(
+                    [ft.FilledButton("Зберегти зміни в таблиці", icon=ft.Icons.SAVE, on_click=_on_click)],
+                    alignment=ft.MainAxisAlignment.END,
+                ),
+            ],
+            spacing=6,
+        )
+
+    # Flat table: everything without the 4-column shape — one row per price
+    # (₴ input + auto $ display), with an inline discount checkbox + a "new
+    # price" ₴ input (also with its own auto $ display).
+    def _build_price_table_flat(self, tokens: list[dict]) -> ft.Column:
+        columns = [
+            ft.DataColumn(ft.Text("Назва", size=11, weight="bold")),
+            ft.DataColumn(ft.Text("Ціна ₴", size=10, weight="bold")),
+            ft.DataColumn(ft.Text("$", size=10, weight="bold")),
+            ft.DataColumn(ft.Text("Знижка", size=10, weight="bold")),
+            ft.DataColumn(ft.Text("Нова ₴", size=10, weight="bold")),
+            ft.DataColumn(ft.Text("Нова $", size=10, weight="bold")),
+        ]
+
+        row_state: list[tuple[dict, ft.TextField, ft.Checkbox, ft.TextField]] = []
+        data_rows = []
+        for tok in tokens:
+            uah_f, usd_text = self._price_field_with_usd(tok["uah"])
+            discount_cb = ft.Checkbox(value=False)
+            new_uah_f, new_usd_text = self._price_field_with_usd("")
+            row_state.append((tok, uah_f, discount_cb, new_uah_f))
+            data_rows.append(
+                ft.DataRow(
+                    cells=[
+                        ft.DataCell(ft.Text(tok["label"], size=11, width=160)),
+                        ft.DataCell(uah_f),
+                        ft.DataCell(usd_text),
+                        ft.DataCell(discount_cb),
+                        ft.DataCell(new_uah_f),
+                        ft.DataCell(new_usd_text),
+                    ]
+                )
             )
+
+        async def _save_all(_e=None):
+            edits: list[dict] = []
+            for tok, uah_f, discount_cb, new_uah_f in row_state:
+                is_discount = bool(discount_cb.value)
+                cur_uah = self._parse_price_money(uah_f, tok["label"])
+                if cur_uah is None:
+                    return
+                cur_usd = self._price_usd_text(cur_uah)
+
+                if is_discount:
+                    if not (new_uah_f.value or "").strip():
+                        continue
+                    disc_uah = self._parse_price_money(new_uah_f, tok["label"])
+                    if disc_uah is None:
+                        return
+                    disc_usd = self._price_usd_text(disc_uah)
+                    edits.append(
+                        {
+                            **tok,
+                            "discount": True,
+                            "old_uah": cur_uah,
+                            "old_usd_value": cur_usd,
+                            "new_uah": disc_uah,
+                            "new_usd_value": disc_usd,
+                        }
+                    )
+                elif cur_uah != tok["uah"]:
+                    edits.append({**tok, "discount": False, "new_uah": cur_uah, "new_usd_value": cur_usd})
+            await self._publish_price_edits(edits, "решта цін")
+
+        def _on_click(_e):
+            page = self._page()
+            if page:
+                page.run_task(_save_all)
+
+        return ft.Column(
+            [
+                ft.Row(
+                    [ft.DataTable(columns=columns, rows=data_rows, column_spacing=6,
+                                   data_row_min_height=34, heading_row_height=34)],
+                    scroll=ft.ScrollMode.ALWAYS,
+                ),
+                ft.Row(
+                    [ft.FilledButton("Зберегти зміни в таблиці", icon=ft.Icons.SAVE, on_click=_on_click)],
+                    alignment=ft.MainAxisAlignment.END,
+                ),
+            ],
+            spacing=6,
         )
 
     # -------------------------------------------------------------- 2. Зображення
@@ -808,7 +1366,7 @@ class WebSiteView:
         def _close(_e=None):
             page.on_keyboard_event = prev_kb[0]
             with contextlib.suppress(Exception):
-                page.close(dlg_ref[0])
+                page.pop_dialog()
 
         def _on_kb(e):
             if e.key == "Arrow Left":
@@ -940,7 +1498,7 @@ class WebSiteView:
 
             def _confirm(_e2):
                 with contextlib.suppress(Exception):
-                    page.close(dlg_ref[0])
+                    page.pop_dialog()
                 page.run_task(_do_delete)
 
             dlg_ref[0] = ft.AlertDialog(
@@ -950,7 +1508,7 @@ class WebSiteView:
                     f"Слот img/{_filename} стане порожнім — на сайті знову покаже плейсхолдер."
                 ),
                 actions=[
-                    ft.TextButton("Скасувати", on_click=lambda _e3: page.close(dlg_ref[0])),
+                    ft.TextButton("Скасувати", on_click=lambda _e3: page.pop_dialog()),
                     ft.FilledButton(
                         "Видалити", icon=ft.Icons.DELETE, on_click=_confirm, bgcolor="red"
                     ),
@@ -1054,7 +1612,7 @@ class WebSiteView:
 
             def _confirm(_e2):
                 with contextlib.suppress(Exception):
-                    page.close(dlg_ref[0])
+                    page.pop_dialog()
                 page.run_task(_do_delete)
 
             dlg_ref[0] = ft.AlertDialog(
@@ -1062,7 +1620,7 @@ class WebSiteView:
                 title=ft.Text(f"Видалити {_name}?"),
                 content=ft.Text("Цей файл не прив'язаний до жодного слота на сторінках сайту."),
                 actions=[
-                    ft.TextButton("Скасувати", on_click=lambda _e3: page.close(dlg_ref[0])),
+                    ft.TextButton("Скасувати", on_click=lambda _e3: page.pop_dialog()),
                     ft.FilledButton(
                         "Видалити", icon=ft.Icons.DELETE, on_click=_confirm, bgcolor="red"
                     ),
@@ -1248,11 +1806,33 @@ class WebSiteView:
                 status_text.update()
 
             ok, err = await asyncio.to_thread(self._publisher.publish_build, tag, name, assets)
+
+            # Publishing the files alone doesn't make the in-app updater find
+            # them — main.py checks app_update_policy (min_required +
+            # download_url/download_url_android) in the DB, completely
+            # separate from GitHub. Wiring both in one click here is exactly
+            # so this never again drifts out of sync with what got published
+            # (see [[project]]: min_required was bumped to 1.2.8 by hand
+            # while download_url still pointed at a non-existent asset).
+            if ok:
+                owner = getattr(self._publisher, "owner", "") or "vitalik19970527-prog"
+                repo = getattr(self._publisher, "repo", "") or "CatMan-Pro"
+                base = f"https://github.com/{owner}/{repo}/releases/latest/download"
+                policy = {"min_required": entry["version"]}
+                if entry["exe"]:
+                    policy["download_url"] = f"{base}/CatManPro-Setup.exe"
+                if entry["apk"]:
+                    policy["download_url_android"] = f"{base}/CatManPro-android.apk"
+                policy_ok = await asyncio.to_thread(self.db.set_app_update_policy, policy)
+                if not policy_ok:
+                    ok = False
+                    err = "Реліз опубліковано, але не вдалося оновити політику оновлення в БД"
+
             status_text.value = "Готово ✓" if ok else f"Помилка: {err}"
             with contextlib.suppress(Exception):
                 status_text.update()
             self._snack(
-                "Реліз опубліковано на GitHub" if ok else f"Помилка публікації релізу: {err}",
+                "Реліз опубліковано на GitHub, оновлення налаштовано" if ok else f"Помилка публікації релізу: {err}",
                 "green" if ok else "red",
             )
 

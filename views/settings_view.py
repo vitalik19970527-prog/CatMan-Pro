@@ -431,7 +431,7 @@ class SettingsView:
             dlg = ft.AlertDialog(modal=True)
 
             def _close(_e=None):
-                page.close(dlg)
+                page.pop_dialog()
 
             def _save(_e=None):
                 try:
@@ -442,7 +442,7 @@ class SettingsView:
                     if not any(settings_visible.values()):
                         settings_visible["delivery_name"] = True
                     _save_settings_visible_state()
-                    page.close(dlg)
+                    page.pop_dialog()
                     self._build_deferred()
                 except Exception:
                     logger.exception("[settings] _open_settings_columns_dialog save failed")
@@ -520,7 +520,7 @@ class SettingsView:
                     return int(default)
 
             def _close(_e=None):
-                page.close(dlg)
+                page.pop_dialog()
 
             def _save(_e=None):
                 try:
@@ -545,7 +545,7 @@ class SettingsView:
                         _to_int(row_h_f.value, settings_layout["delivery_row_h"]),
                     )
                     _save_settings_layout_state()
-                    page.close(dlg)
+                    page.pop_dialog()
                     self._build_deferred()
                 except Exception:
                     logger.exception("[settings] _open_settings_layout_dialog save failed")
@@ -2533,7 +2533,7 @@ class SettingsView:
 
         # --- ЛОГІКА ЗБЕРЕЖЕННЯ ---
         def close_dlg(e):
-            self.content_area.page.close(success_dlg)
+            self.content_area.page.pop_dialog()
 
         success_dlg = ft.AlertDialog(
             modal=True,
@@ -3250,7 +3250,7 @@ class SettingsView:
                 page.run_task(_run_async)
 
             def _confirmed(_e=None):
-                page.close(confirm_dlg)
+                page.pop_dialog()
                 _run_restore()
 
             warn_lines = [
@@ -3272,7 +3272,7 @@ class SettingsView:
                 actions=[
                     ft.TextButton(
                         self.t("common.cancel", "Скасувати"),
-                        on_click=lambda _e: page.close(confirm_dlg),
+                        on_click=lambda _e: page.pop_dialog(),
                     ),
                     ft.FilledButton(
                         "Відновити",
@@ -3827,7 +3827,7 @@ class SettingsView:
             getattr(dlg, "open", None),
             len(getattr(page, "overlay", []) or []),
         )
-        page.close(dlg)
+        page.pop_dialog()
         logger.info(
             "[modal:settings] close:finish dlg=%s@%s open=%s overlay_after=%s",
             type(dlg).__name__,

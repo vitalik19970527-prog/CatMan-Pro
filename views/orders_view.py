@@ -10730,7 +10730,7 @@ class OrdersView:
                     if _has_file:
 
                         def _confirm(_x=None, _dlg_fn=_fn):
-                            pg.close(dlg)
+                            pg.pop_dialog()
                             pg.run_task(_dlg_fn)
 
                         dlg = ft.AlertDialog(
@@ -10744,7 +10744,7 @@ class OrdersView:
                             actions=[
                                 ft.TextButton(
                                     self.t("common.cancel", "Скасувати"),
-                                    on_click=lambda _x: pg.close(dlg),
+                                    on_click=lambda _x: pg.pop_dialog(),
                                 ),
                                 ft.FilledButton(
                                     self.t("orders.attachment.replace_btn", "Замінити"),
@@ -10762,7 +10762,7 @@ class OrdersView:
                         return
 
                     def _confirm(_x=None, _dlg_fn=_fn):
-                        pg.close(dlg)
+                        pg.pop_dialog()
                         pg.run_task(_dlg_fn)
 
                     dlg = ft.AlertDialog(
@@ -10776,7 +10776,7 @@ class OrdersView:
                         actions=[
                             ft.TextButton(
                                 self.t("common.cancel", "Скасувати"),
-                                on_click=lambda _x: pg.close(dlg),
+                                on_click=lambda _x: pg.pop_dialog(),
                             ),
                             ft.FilledButton(
                                 self.t("common.delete", "Видалити"),

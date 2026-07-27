@@ -329,6 +329,15 @@ class PackagingStockView:
         self._ops_outbox_running = False
         self._ops_sync_loop_started = False
         self._ref_data_pulse_ts: int = 0
+        # Guards _async_initial_load against overlapping runs: the pulse-check
+        # (every 20s from _bg_sync_loop, and again on every resume()) schedules
+        # a full reload whenever it sees newer reference data, but _ref_data_pulse_ts
+        # only gets updated once that reload actually reaches _load_packaging_metadata.
+        # Without this flag, a slow reload still in flight gets re-triggered by the
+        # next pulse check before it finishes, stacking up overlapping full
+        # tree rebuilds — this is what showed up as "Оновлення" never settling
+        # and expand/collapse feeling stuck (found via live testing).
+        self._initial_load_in_progress = False
         self._auto_refresh_started = False
         self._auto_refresh_last_sig = ""
         self._orders_last_known_snapshot_sig = ""
@@ -3161,6 +3170,10 @@ class PackagingStockView:
         import asyncio as _aio
 
         await _aio.sleep(0.01)
+        if self._initial_load_in_progress:
+            logger.info("pack_stock: _async_initial_load SKIPPED (already running)")
+            return
+        self._initial_load_in_progress = True
         try:
             logger.info("pack_stock: _async_initial_load START")
             self._set_pack_sync_status("syncing")
@@ -3254,6 +3267,8 @@ class PackagingStockView:
                     )
                 )
                 self._tree_host.update()
+        finally:
+            self._initial_load_in_progress = False
 
     # ──────────────────── shared orders map ──────────────────────────────────
 
@@ -4392,7 +4407,7 @@ class PackagingStockView:
                 ),
             ),
             actions=[
-                ft.TextButton("Скасувати", on_click=lambda _e: page.close(dialog)),
+                ft.TextButton("Скасувати", on_click=lambda _e: page.pop_dialog()),
                 ft.FilledButton(
                     "Зберегти",
                     on_click=lambda _e: (
@@ -4413,7 +4428,7 @@ class PackagingStockView:
                             str(display_from_dd.value or "").strip(),
                         ),
                         self._save_pack_table_layout_state(),
-                        page.close(dialog),
+                        page.pop_dialog(),
                         self._restart_tab(),
                     ),
                 ),
@@ -7103,7 +7118,7 @@ class PackagingStockView:
         if not page:
             return
         try:
-            page.close(dlg)
+            page.pop_dialog()
         except Exception:
             with contextlib.suppress(Exception):
                 page.close_dialog(dlg)

@@ -738,14 +738,14 @@ def open_sidebar_device_card(db, page, device_id: str, t_fn=None) -> None:
     prev = _sidebar_card_dialog.get(pid)
     if prev is not None:
         with contextlib.suppress(Exception):
-            page.close(prev)
+            page.pop_dialog()
         _sidebar_card_dialog.pop(pid, None)
 
     dlg = ft.AlertDialog(modal=False)
 
     def _close(_=None):
         with contextlib.suppress(Exception):
-            page.close(dlg)
+            page.pop_dialog()
         _sidebar_card_dialog.pop(pid, None)
 
     def _srow(label: str, value, unit: str = ""):
@@ -1640,7 +1640,7 @@ class GsmParserView:
                     height=min(60 + len(history) * 28, 360),
                     content=ft.Column(rows, spacing=4, scroll=ft.ScrollMode.AUTO),
                 ),
-                actions=[ft.TextButton("Закрити", on_click=lambda _: page.close(dlg))],
+                actions=[ft.TextButton("Закрити", on_click=lambda _: page.pop_dialog())],
                 actions_alignment=ft.MainAxisAlignment.END,
             )
             page.show_dialog(dlg)
@@ -2093,7 +2093,7 @@ class GsmParserView:
         with contextlib.suppress(Exception):
             for ov in reversed(list(getattr(page, "overlay", []))):
                 if isinstance(ov, ft.AlertDialog):
-                    page.close(ov)
+                    page.pop_dialog()
                     return
 
     def _compat_global_modal(self, page_ctrl) -> None:
@@ -2178,7 +2178,7 @@ class GsmParserView:
             def _close(_e=None):
                 with contextlib.suppress(Exception):
                     if modal_ref[0]:
-                        page_ctrl.close(modal_ref[0])
+                        page_ctrl.pop_dialog()
 
             modal = ft.AlertDialog(
                 modal=True,
@@ -3483,7 +3483,7 @@ class GsmParserView:
                 ok = await asyncio.to_thread(self.db.save_gsm_regional_variants, device_id, clean)
                 if ok:
                     await asyncio.to_thread(self._refresh_cached_detail, device_id)
-                    page.close(dlg)
+                    page.pop_dialog()
                     self._show_snack(self.t("gsm.variants_saved", "Варіанти збережено"), ft.Colors.GREEN)
                     if refresh_cb is not None:
                         refresh_cb()
@@ -3576,7 +3576,7 @@ class GsmParserView:
                 ),
             ),
             actions=[
-                ft.TextButton("Скасувати", on_click=lambda _: page.close(dlg)),
+                ft.TextButton("Скасувати", on_click=lambda _: page.pop_dialog()),
                 save_btn,
             ],
             actions_alignment=ft.MainAxisAlignment.END,
@@ -3646,7 +3646,7 @@ class GsmParserView:
                 ok = await asyncio.to_thread(self.db.save_gsm_device_comment, device_id, new_text, rich)
                 if ok:
                     await asyncio.to_thread(self._refresh_cached_detail, device_id)
-                    page.close(dlg)
+                    page.pop_dialog()
                     self._show_snack(self.t("gsm.comment_saved", "Коментар збережено"), ft.Colors.GREEN)
                     if refresh_cb is not None:
                         refresh_cb()
@@ -3686,7 +3686,7 @@ class GsmParserView:
                 ),
             ),
             actions=[
-                ft.TextButton("Скасувати", on_click=lambda _: page.close(dlg)),
+                ft.TextButton("Скасувати", on_click=lambda _: page.pop_dialog()),
                 save_btn,
             ],
             actions_alignment=ft.MainAxisAlignment.END,
@@ -3733,7 +3733,7 @@ class GsmParserView:
 
                 if not new_url:
                     await asyncio.to_thread(self._refresh_cached_detail, device_id)
-                    page.close(dlg)
+                    page.pop_dialog()
                     self._show_snack(
                         self.t("gsm.manual_ek_url_cleared", "Ручне посилання прибрано"),
                         ft.Colors.GREEN,
@@ -3753,7 +3753,7 @@ class GsmParserView:
                     fetch_and_apply_manual_ek_url, self.db, device_id, new_url
                 )
                 await asyncio.to_thread(self._refresh_cached_detail, device_id)
-                page.close(dlg)
+                page.pop_dialog()
 
                 if not fetch_ok:
                     self._show_snack(
@@ -3822,7 +3822,7 @@ class GsmParserView:
                 ),
             ),
             actions=[
-                ft.TextButton("Скасувати", on_click=lambda _: page.close(dlg)),
+                ft.TextButton("Скасувати", on_click=lambda _: page.pop_dialog()),
                 save_btn,
             ],
             actions_alignment=ft.MainAxisAlignment.END,
@@ -3835,7 +3835,7 @@ class GsmParserView:
         wrong product — the next parser run will search again from scratch."""
 
         def _do_remove(_):
-            page.close(dlg)
+            page.pop_dialog()
 
             async def _do():
                 ok = await asyncio.to_thread(self.db.delete_gsm_device, ek_id)
@@ -3868,7 +3868,7 @@ class GsmParserView:
                     # stale — close it too, rather than try to patch every field.
                     if self._active_device_dialog is not None:
                         with contextlib.suppress(Exception):
-                            page.close(self._active_device_dialog)
+                            page.pop_dialog()
                         self._active_device_dialog = None
                     self._show_snack(
                         self.t(
@@ -3892,7 +3892,7 @@ class GsmParserView:
                 size=12,
             ),
             actions=[
-                ft.TextButton("Скасувати", on_click=lambda _: page.close(dlg)),
+                ft.TextButton("Скасувати", on_click=lambda _: page.pop_dialog()),
                 ft.FilledButton(
                     "Прибрати",
                     icon=ft.Icons.DELETE_OUTLINE,
@@ -3912,7 +3912,7 @@ class GsmParserView:
         # same device and stack a duplicate on top.
         if self._active_device_dialog is not None:
             with contextlib.suppress(Exception):
-                page.close(self._active_device_dialog)
+                page.pop_dialog()
             self._active_device_dialog = None
 
         # Support both merged (new) and flat (old/linked) dict formats
@@ -3962,7 +3962,7 @@ class GsmParserView:
             def _close_dlg(_=None):
                 page.on_keyboard_event = _prev_kb_single[0]
                 with contextlib.suppress(Exception):
-                    page.close(_dlg_ref[0])
+                    page.pop_dialog()
 
             page.on_keyboard_event = lambda e: (
                 _close_dlg() if e.key == "Escape" else None
@@ -4067,7 +4067,7 @@ class GsmParserView:
             def _close_gal(_=None):
                 page.on_keyboard_event = _prev_kb_gal[0]
                 with contextlib.suppress(Exception):
-                    page.close(_gal_dlg_ref[0])
+                    page.pop_dialog()
 
             def _on_gal_kb(e: ft.KeyboardEvent):
                 if e.key == "Arrow Left":
@@ -4764,7 +4764,7 @@ class GsmParserView:
 
         def _close_this_modal():
             with contextlib.suppress(Exception):
-                page.close(dlg)
+                page.pop_dialog()
             if self._active_device_dialog is dlg:
                 self._active_device_dialog = None
 
@@ -4836,7 +4836,7 @@ class GsmParserView:
             async def _do():
                 try:
                     await asyncio.to_thread(self.db.save_gsm_user_preset, self.manager_id, name, filters)
-                    page.close(dlg)
+                    page.pop_dialog()
                     self._show_snack(self.t("gsm.preset_saved", "Пресет «{name}» збережено").format(name=name), ft.Colors.GREEN)
                     await asyncio.to_thread(self._refresh_presets_dropdown)
                 except Exception:
@@ -4862,7 +4862,7 @@ class GsmParserView:
             ], vertical_alignment=ft.CrossAxisAlignment.CENTER, tight=True),
             content=ft.Container(width=320, content=name_field),
             actions=[
-                ft.TextButton("Скасувати", on_click=lambda _: page.close(dlg)),
+                ft.TextButton("Скасувати", on_click=lambda _: page.pop_dialog()),
                 save_btn,
             ],
             actions_alignment=ft.MainAxisAlignment.END,
@@ -5207,7 +5207,7 @@ class GsmParserView:
         def _close_modal(_e=None):
             with contextlib.suppress(Exception):
                 if modal_ref[0]:
-                    page_ctrl.close(modal_ref[0])
+                    page_ctrl.pop_dialog()
 
         # Photo lists per device, kept in sync as each column loads its photos
         # asynchronously — the full-screen gallery flattens these into one
@@ -5286,7 +5286,7 @@ class GsmParserView:
             def _close_gal(_=None):
                 page_ctrl.on_keyboard_event = _prev_kb_gal[0]
                 with contextlib.suppress(Exception):
-                    page_ctrl.close(_gal_dlg_ref[0])
+                    page_ctrl.pop_dialog()
 
             def _on_gal_kb(e: ft.KeyboardEvent):
                 if e.key == "Arrow Left":
@@ -6367,7 +6367,7 @@ class GsmParserView:
             name = str(merged.get("gsm_name") or merged.get("ek_name") or device_id)
 
             def _do_delete(__):
-                page_ctrl.close(dlg_del)
+                page_ctrl.pop_dialog()
 
                 async def _do():
                     ok = await asyncio.to_thread(self.db.delete_gsm_device, device_id)
@@ -6414,7 +6414,7 @@ class GsmParserView:
                 ),
                 actions=[
                     ft.TextButton(
-                        "Скасувати", on_click=lambda _: page_ctrl.close(dlg_del)
+                        "Скасувати", on_click=lambda _: page_ctrl.pop_dialog()
                     ),
                     ft.FilledButton(
                         self.t("gsm.yes_delete", "Так, видалити"),
@@ -6815,7 +6815,7 @@ class GsmParserView:
                 return
 
             def _do_bulk_delete(__):
-                page_ctrl.close(dlg_bulk_del)
+                page_ctrl.pop_dialog()
 
                 async def _do():
                     ok_count = 0
@@ -6868,7 +6868,7 @@ class GsmParserView:
                 ),
                 actions=[
                     ft.TextButton(
-                        "Скасувати", on_click=lambda _: page_ctrl.close(dlg_bulk_del)
+                        "Скасувати", on_click=lambda _: page_ctrl.pop_dialog()
                     ),
                     ft.FilledButton(
                         "Так, видалити",
@@ -7402,7 +7402,7 @@ class GsmParserView:
 
                 def _close_dlg(_=None):
                     with contextlib.suppress(Exception):
-                        page.close(dlg)
+                        page.pop_dialog()
 
                 def _do_schedule(delay_seconds: float):
                     ok = _parser_start_schedule(page_ctrl, delay_seconds, _mode_state["value"])
@@ -7589,7 +7589,7 @@ class GsmParserView:
                     sel = _get_selected_brands()
                     if not sel:
                         return
-                    page_ctrl.close(confirm_dlg)
+                    page_ctrl.pop_dialog()
 
                     async def _do():
                         is_all = set(sel) == set(all_brands)
@@ -7674,7 +7674,7 @@ class GsmParserView:
                         width=340,
                     ),
                     actions=[
-                        ft.TextButton("Скасувати", on_click=lambda _: page_ctrl.close(confirm_dlg)),
+                        ft.TextButton("Скасувати", on_click=lambda _: page_ctrl.pop_dialog()),
                         confirm_btn,
                     ],
                     actions_alignment=ft.MainAxisAlignment.END,
@@ -7727,7 +7727,7 @@ class GsmParserView:
                     sel = _get_sel()
                     if not sel:
                         return
-                    page_ctrl.close(ek_confirm_dlg)
+                    page_ctrl.pop_dialog()
 
                     async def _do():
                         is_all = set(sel) == set(all_brands)
@@ -7811,7 +7811,7 @@ class GsmParserView:
                         width=340,
                     ),
                     actions=[
-                        ft.TextButton("Скасувати", on_click=lambda _: page_ctrl.close(ek_confirm_dlg)),
+                        ft.TextButton("Скасувати", on_click=lambda _: page_ctrl.pop_dialog()),
                         ek_confirm_btn,
                     ],
                     actions_alignment=ft.MainAxisAlignment.END,
@@ -7868,7 +7868,7 @@ class GsmParserView:
                     sel = _get_sel_hist()
                     if not sel:
                         return
-                    page_ctrl.close(hist_confirm_dlg)
+                    page_ctrl.pop_dialog()
 
                     async def _do():
                         is_all = set(sel) == set(all_brands)
@@ -7957,7 +7957,7 @@ class GsmParserView:
                         width=340,
                     ),
                     actions=[
-                        ft.TextButton("Скасувати", on_click=lambda _: page_ctrl.close(hist_confirm_dlg)),
+                        ft.TextButton("Скасувати", on_click=lambda _: page_ctrl.pop_dialog()),
                         hist_confirm_btn,
                     ],
                     actions_alignment=ft.MainAxisAlignment.END,
@@ -8144,7 +8144,7 @@ class GsmParserView:
                     ),
                     actions=[
                         ft.TextButton(
-                            "Закрити", on_click=lambda _: page_ctrl.close(dlg)
+                            "Закрити", on_click=lambda _: page_ctrl.pop_dialog()
                         ),
                     ],
                     actions_alignment=ft.MainAxisAlignment.END,

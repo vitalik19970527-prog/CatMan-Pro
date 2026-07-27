@@ -767,7 +767,7 @@ def show_bulk_product_template_dialog_user(dashboard: Any, on_after_import=None)
             fn(dlg_obj)
             return
         try:
-            page.close(dlg_obj)
+            page.pop_dialog()
         except Exception:
             pass
 

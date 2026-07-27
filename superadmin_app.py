@@ -104,6 +104,38 @@ def _acquire_single_instance_lock():
         return _NullLock()
 
 
+def _install_flet_session_error_guard() -> None:
+    """Same fix as main.py's — see that copy's docstring for the full
+    rationale. Duplicated here (not imported from main) because SupAdm
+    deliberately avoids importing main.py at all (see module docstring)."""
+    try:
+        from flet.messaging.session import Session
+
+        if getattr(Session, "_catman_error_guard_installed", False):
+            return
+
+        _original_session_error = Session.error
+
+        def _guarded_session_error(self, message: str):
+            first_line = str(message or "").splitlines()[0] if message else ""
+            if "Control must be added to the page first" in first_line:
+                logger.warning(
+                    "[crash-guard] suppressed session-crash for stale control update: %s",
+                    first_line,
+                )
+                return
+            _original_session_error(self, message)
+
+        Session.error = _guarded_session_error
+        Session._catman_error_guard_installed = True
+        logger.info("[crash] flet session error guard installed")
+    except Exception:
+        logger.exception("[crash] failed to install flet session error guard")
+
+
+_install_flet_session_error_guard()
+
+
 def main(page: ft.Page):
     page.title = "CatMan SupAdm"
     page.theme_mode = ft.ThemeMode.LIGHT
@@ -115,6 +147,23 @@ def main(page: ft.Page):
     page.window.height = 560
     page.window.resizable = True
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
+
+    async def _enable_mobile_rotation():
+        try:
+            if not page.platform.is_mobile():
+                return
+            await page.set_allowed_device_orientations(
+                [
+                    ft.DeviceOrientation.PORTRAIT_UP,
+                    ft.DeviceOrientation.PORTRAIT_DOWN,
+                    ft.DeviceOrientation.LANDSCAPE_LEFT,
+                    ft.DeviceOrientation.LANDSCAPE_RIGHT,
+                ]
+            )
+        except Exception:
+            logger.exception("Failed to enable mobile screen rotation")
+
+    page.run_task(_enable_mobile_rotation)
 
     db = DataManager()
 

@@ -297,8 +297,52 @@ def _install_global_crash_hooks() -> None:
     except Exception:
         logger.exception("[crash] failed to install threading.excepthook")
 
+    _install_flet_session_error_guard()
+
     _CRASH_HOOKS_INSTALLED = True
     logger.info("[crash] global crash hooks installed")
+
+
+def _install_flet_session_error_guard() -> None:
+    """Stop one well-known, long-standing timing race (a background/deferred
+    task's control.update() firing after the user already navigated away and
+    Flet removed that control from the page — "Control must be added to the
+    page first", seen across many views in catman.log since May 2026: orders,
+    categories, packaging stock, bulk product template, and the quick-account
+    dropdown on the login screen) from tearing down the whole session.
+
+    flet.messaging.session.Session.dispatch_event reports ANY exception
+    raised by ANY event handler to the client as SESSION_CRASHED via
+    Session.error(), which blanks the entire page behind a fatal "The
+    application encountered an error" banner — even though the app itself
+    is otherwise fine and the same exception is already being caught and
+    logged locally at dozens of call sites. Only this specific, already-
+    understood exception shape is downgraded to a log-and-continue here;
+    everything else still reaches the client normally so real bugs stay
+    visible instead of being silently swallowed."""
+    try:
+        from flet.messaging.session import Session
+
+        if getattr(Session, "_catman_error_guard_installed", False):
+            return
+
+        _original_session_error = Session.error
+
+        def _guarded_session_error(self, message: str):
+            first_line = str(message or "").splitlines()[0] if message else ""
+            if "Control must be added to the page first" in first_line:
+                logger.warning(
+                    "[crash-guard] suppressed session-crash for stale control update: %s",
+                    first_line,
+                )
+                return
+            _original_session_error(self, message)
+
+        Session.error = _guarded_session_error
+        Session._catman_error_guard_installed = True
+        logger.info("[crash] flet session error guard installed")
+    except Exception:
+        logger.exception("[crash] failed to install flet session error guard")
 
 
 def _install_selectable_text_registry() -> None:
@@ -820,12 +864,13 @@ def main(page: ft.Page):
         try:
             if not page.platform.is_mobile():
                 return
-            # Portrait dropped on purpose — the layout doesn't fit in it.
-            # Restricting to only the two landscape orientations also makes
-            # the OS rotate the app into landscape on launch if the device
-            # was held upright, since portrait is no longer an allowed state.
+            # All four orientations allowed — portrait used to be dropped
+            # because the layout didn't fit it, but the mobile-wide 20% size
+            # reduction (fonts/padding/spacing) makes portrait usable too.
             await page.set_allowed_device_orientations(
                 [
+                    ft.DeviceOrientation.PORTRAIT_UP,
+                    ft.DeviceOrientation.PORTRAIT_DOWN,
                     ft.DeviceOrientation.LANDSCAPE_LEFT,
                     ft.DeviceOrientation.LANDSCAPE_RIGHT,
                 ]
@@ -1268,6 +1313,17 @@ def main(page: ft.Page):
                 page.update()
                 return
 
+            if page.platform.is_mobile():
+                # The desktop flow below downloads the file itself and then
+                # subprocess.Popen()'s the Inno Setup installer with silent-
+                # install flags — none of that exists on Android. Handing the
+                # .apk URL to the OS instead lets it download and prompt its
+                # own "Install this app?" dialog, which is the only install
+                # path available on the platform anyway.
+                with suppress(Exception):
+                    page.launch_url(url)
+                return
+
             page.run_task(_download_and_install, url)
 
         download_button.on_click = open_download
@@ -1706,9 +1762,14 @@ def main(page: ft.Page):
                 lambda: DataManager().get_app_update_policy()
             )
             min_required = (policy.get("min_required") or "").strip()
-            download_url = (policy.get("download_url") or "").strip() or (
-                Config.UPDATE_DOWNLOAD_URL or ""
-            ).strip()
+            if page.platform.is_mobile():
+                download_url = (policy.get("download_url_android") or "").strip() or (
+                    policy.get("download_url") or ""
+                ).strip()
+            else:
+                download_url = (policy.get("download_url") or "").strip() or (
+                    Config.UPDATE_DOWNLOAD_URL or ""
+                ).strip()
             if min_required and _version_is_outdated(Config.APP_VERSION, min_required):
                 show_update_required_screen(min_required, download_url)
         except Exception:

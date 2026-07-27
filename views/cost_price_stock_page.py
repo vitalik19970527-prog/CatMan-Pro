@@ -1248,7 +1248,7 @@ class CostPriceStockView:
             title=ft.Text("Таблиця"),
             content=ft.Container(width=460, height=540, content=content_col),
             actions=[
-                ft.TextButton("Скасувати", on_click=lambda _e: page.close(dialog)),
+                ft.TextButton("Скасувати", on_click=lambda _e: page.pop_dialog()),
                 ft.FilledButton(
                     "Зберегти",
                     on_click=lambda _e: self._save_stock_table_dialog(
@@ -1331,7 +1331,7 @@ class CostPriceStockView:
                 "stock_tier_widths": tier_widths_patch,
             }
         )
-        page.close(dialog)
+        page.pop_dialog()
         self._restart_tab()
 
     def _all_stock_tier_ids(self) -> list[str]:

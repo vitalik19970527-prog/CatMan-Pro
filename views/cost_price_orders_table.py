@@ -3827,7 +3827,7 @@ class CostPriceView:
             actions=[
                 ft.FilledButton(
                     self.t("common.help.close", "Зрозуміло"),
-                    on_click=lambda _e: page.close(dlg),
+                    on_click=lambda _e: page.pop_dialog(),
                 ),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
@@ -4783,7 +4783,7 @@ class CostPriceView:
                 content=rows_host,
             ),
             actions=[
-                ft.TextButton("Скасувати", on_click=lambda _e: page.close(dialog)),
+                ft.TextButton("Скасувати", on_click=lambda _e: page.pop_dialog()),
                 ft.FilledButton(
                     "Зберегти",
                     on_click=lambda _e: self._save_orders_base_columns_dialog(
@@ -4822,7 +4822,7 @@ class CostPriceView:
                 "orders_base_column_widths": width_patch,
             }
         )
-        page.close(dialog)
+        page.pop_dialog()
         self._restart_tab()
 
     def _all_orders_tier_ids(self) -> list[str]:
@@ -5347,7 +5347,7 @@ class CostPriceView:
             title=ft.Text("Таблиця"),
             content=ft.Container(width=460, height=540, content=content_col),
             actions=[
-                ft.TextButton("Скасувати", on_click=lambda _e: page.close(dialog)),
+                ft.TextButton("Скасувати", on_click=lambda _e: page.pop_dialog()),
                 ft.FilledButton(
                     "Зберегти",
                     on_click=lambda _e: self._save_orders_table_dialog(
@@ -5442,7 +5442,7 @@ class CostPriceView:
                 "display_from_month": str(getattr(display_from_dd, "value", "") or "").strip(),
             }
         )
-        page.close(dialog)
+        page.pop_dialog()
         self._restart_tab()
 
     def _open_calculator_dialog(self) -> None:
@@ -5934,7 +5934,7 @@ class CostPriceView:
                 ),
             ),
             actions=[
-                ft.TextButton("Закрити", on_click=lambda _e: page.close(dialog)),
+                ft.TextButton("Закрити", on_click=lambda _e: page.pop_dialog()),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )

@@ -309,6 +309,7 @@ finally:
                 "--clean",
                 "--windowed",
                 "--collect-all", "flet",
+                "--collect-all", "flet_desktop",
                 # matplotlib (GSM Parser device-card charts) needs unittest at
                 # runtime in a way that neither dropping "--exclude-module
                 # unittest" NOR a real top-level `import unittest` in
