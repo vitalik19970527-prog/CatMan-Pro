@@ -24,7 +24,7 @@
     local: [79, 249, 499, 719],
     vps:   [719, 3129, 6099, 8319]
   };
-  var HOSTING_FEE = [799, 959, 1599, 2399];
+  var HOSTING_FEE = [999, 1299, 1599, 2399];
   var HOSTING_SETUP = 1199;
   var GSM_PRICE = 3999;
   var GSM_SETUP = 1599;
@@ -32,6 +32,9 @@
 
   function fmtUah(n) {
     return n.toLocaleString("uk-UA") + " ₴";
+  }
+  function roundUpTo9(n) {
+    return Math.ceil((n + 1) / 10) * 10 - 1;
   }
   function fmtUsd(uah) {
     return "$" + Math.round(uah / USD_RATE);
@@ -72,6 +75,9 @@
       total += HOSTING_FEE[tierIndex];
       once += HOSTING_SETUP;
     }
+
+    total = roundUpTo9(total);
+    if (once > 0) once = roundUpTo9(once);
 
     totalEl.textContent = fmtUah(total) + " / " + fmtUsd(total) + " /міс";
 
