@@ -2,32 +2,32 @@
   var TIERS = [1, 5, 10, 15];
   // Mandatory base tabs — always included, can't be unchecked. Part of every total.
   var CORE_PRICES = {
-    home:       [40, 185, 345, 440],
-    products:   [90, 480, 870, 1125],
-    categories: [60, 285, 525, 660],
-    suppliers:  [50, 240, 435, 560],
-    orders:     [255, 1195, 2200, 2810]
+    home:       [29, 149, 279, 349],
+    products:   [69, 379, 699, 899],
+    categories: [49, 229, 419, 529],
+    suppliers:  [39, 189, 349, 449],
+    orders:     [199, 959, 1759, 2249]
   };
   var TAB_PRICES = {
-    payments:  [295, 725, 1345, 1710],
-    cost:      [355, 870, 1600, 2050],
-    packaging: [195, 480, 890, 1110],
-    files:     [155, 380, 705, 905],
-    coststock: [295, 725, 1345, 1710],
-    packstock: [195, 480, 890, 1110],
-    mediaplan: [255, 625, 1160, 1470],
-    schedule:  [295, 725, 1345, 1710],
-    notebook:  [95, 240, 445, 560],
-    calc:      [95, 240, 445, 560]
+    payments:  [239, 579, 1079, 1369],
+    cost:      [279, 699, 1279, 1639],
+    packaging: [159, 379, 709, 889],
+    files:     [119, 299, 559, 719],
+    coststock: [239, 579, 1079, 1369],
+    packstock: [159, 379, 709, 889],
+    mediaplan: [199, 499, 929, 1179],
+    schedule:  [239, 579, 1079, 1369],
+    notebook:  [79, 189, 359, 449],
+    calc:      [79, 189, 359, 449]
   };
   var SEAT_PRICES = {
-    local: [104, 314, 624, 904],
-    vps:   [904, 3914, 7624, 10404]
+    local: [79, 249, 499, 719],
+    vps:   [719, 3129, 6099, 8319]
   };
-  var HOSTING_FEE = [1000, 1200, 2000, 3000];
-  var HOSTING_SETUP = 1499;
-  var GSM_PRICE = 4999;
-  var GSM_SETUP = 1999;
+  var HOSTING_FEE = [799, 959, 1599, 2399];
+  var HOSTING_SETUP = 1199;
+  var GSM_PRICE = 3999;
+  var GSM_SETUP = 1599;
   var USD_RATE = 41.5;
 
   function fmtUah(n) {
