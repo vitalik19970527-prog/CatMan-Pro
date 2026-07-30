@@ -296,6 +296,15 @@ class PackagingStockView:
         ).strip()
         self.t = i18n.bind(str(self.user_data.get("id") or ""))
         self.subordinate_ro = bool(self.user_data.get("subordinate_view_readonly"))
+        if not self.subordinate_ro:
+            try:
+                _eff_rid = self._resolve_region_id()
+                if _eff_rid and not self.db.manager_has_category_access_in_region(
+                    self.manager_id, self.company_id, _eff_rid
+                ):
+                    self.subordinate_ro = True
+            except Exception:
+                pass
         self._general_mode: bool = bool(self.user_data.get("general_mode", False))
         self._general_manager_ids: list[str] = list(
             self.user_data.get("general_manager_ids") or []
@@ -309,6 +318,12 @@ class PackagingStockView:
         # _tree часто отримує висоту 0 — контент є, але не видно.
         self._tree_host = ft.Column(spacing=3)
         self._tables_inner_container = None
+        # content_area is the only scrollable region here (_tree_host has no
+        # scroll of its own, see comment above) but had no on_scroll tracking
+        # — a full _tree_host.controls.clear()+rebuild (_render_tree) could
+        # otherwise leave the page snapped back to the top with nothing to
+        # restore it to.
+        self._content_area_offset: float = 0.0
         self._tables_outer_container = None
         self._loading_box = None
         self._header_loading_indicator = None
@@ -1062,6 +1077,28 @@ class PackagingStockView:
         except RuntimeError:
             # Control is not attached to page yet (or already detached).
             return None
+
+    def _on_content_area_scroll(self, e) -> None:
+        try:
+            self._content_area_offset = float(getattr(e, "pixels", 0) or 0)
+        except Exception:
+            pass
+
+    def _restore_content_area_scroll(self) -> None:
+        offset = max(0.0, float(getattr(self, "_content_area_offset", 0.0) or 0.0))
+        if offset <= 0:
+            return
+        pg = self._page()
+        if not pg or not hasattr(pg, "run_task"):
+            return
+
+        async def _restore():
+            await asyncio.sleep(0.06)
+            with contextlib.suppress(Exception):
+                await self.content_area.scroll_to(offset=offset, duration=0)
+
+        with contextlib.suppress(Exception):
+            pg.run_task(_restore)
 
     def _show_help(self) -> None:
         from views.help_utils import show_modal_help
@@ -3568,7 +3605,14 @@ class PackagingStockView:
                         ep, eg = self._packaging_journal_final_stocks(
                             _opening, _orders_c, _wo_c
                         )
-                        if float(ep or 0) + float(eg or 0) < 5000.0:
+                        _pack_row_low = (
+                            boxes_by_id.get(str(_ctx.get("packaging_id") or "")) or {}
+                        )
+                        _optimal_qty = (
+                            _safe_float(_pack_row_low.get("optimal_qty"), 5000.0)
+                            or 5000.0
+                        )
+                        if float(ep or 0) + float(eg or 0) < _optimal_qty:
                             filtered_ctxs.append(_ctx)
                     elif _qf == "packaging_supplier_debt":
                         _pack_row = (
@@ -3912,6 +3956,7 @@ class PackagingStockView:
             except Exception:
                 with contextlib.suppress(Exception):
                     self.content_area.update()
+        self._restore_content_area_scroll()
 
     def reload(self, refresh_data: bool = True):
         """Оновлення дерева після inline-змін у журналі."""
@@ -4546,6 +4591,7 @@ class PackagingStockView:
         self._load_pack_table_layout_state()
         try:
             self.content_area.scroll = ft.ScrollMode.ADAPTIVE
+            self.content_area.on_scroll = self._on_content_area_scroll
         except Exception:
             pass
 
@@ -4995,9 +5041,8 @@ class PackagingStockView:
                     height=self.CONTEXT_BTN_H,
                     style=_ctx_btn_style,
                     disabled=self.subordinate_ro,
-                    on_click=lambda _e, c=ctx, pr=pack_row: self._open_supply_order_dialog(
-                        c, pr
-                    ),
+                    on_click=lambda _e, c=ctx, pr=pack_row: self._page()
+                    and self._page().run_task(self._open_supply_order_dialog, c, pr),
                 ),
                 ft.OutlinedButton(
                     "Початковий баланс",
@@ -6495,58 +6540,73 @@ class PackagingStockView:
                         ),
                     )
                 else:
-                    st_menu_opts = [
-                        ft.PopupMenuItem(
-                            content=ft.Text(
-                                "Виробництво",
-                                size=self.TXT,
-                                no_wrap=False,
-                                max_lines=3,
-                                overflow=ft.TextOverflow.VISIBLE,
+                    # Rebuilding this PopupMenuButton on every background
+                    # refresh (ref-data/pulse checks, ~every 20s) recreates
+                    # its Flutter overlay and force-closes it if the user
+                    # has it open — reuse the same control across renders
+                    # unless something it actually displays changed.
+                    if not isinstance(
+                        getattr(self, "_pack_status_popup_cache", None), dict
+                    ):
+                        self._pack_status_popup_cache = {}
+                    _st_sig = (st_val, wst, bg_goods)
+                    _st_cached = self._pack_status_popup_cache.get(str(oid))
+                    if _st_cached is not None and _st_cached[0] == _st_sig:
+                        st_outer = _st_cached[1]
+                    else:
+                        st_menu_opts = [
+                            ft.PopupMenuItem(
+                                content=ft.Text(
+                                    "Виробництво",
+                                    size=self.TXT,
+                                    no_wrap=False,
+                                    max_lines=3,
+                                    overflow=ft.TextOverflow.VISIBLE,
+                                ),
+                                on_click=(
+                                    lambda _e, iid=oid: self._on_status_change(
+                                        iid, "production"
+                                    )
+                                ),
                             ),
-                            on_click=(
-                                lambda _e, iid=oid: self._on_status_change(
-                                    iid, "production"
-                                )
+                            ft.PopupMenuItem(
+                                content=ft.Text(
+                                    "Готовий",
+                                    size=self.TXT,
+                                    no_wrap=False,
+                                    max_lines=3,
+                                    overflow=ft.TextOverflow.VISIBLE,
+                                ),
+                                on_click=(
+                                    lambda _e, iid=oid: self._on_status_change(
+                                        iid, "ready_for_shipment"
+                                    )
+                                ),
                             ),
-                        ),
-                        ft.PopupMenuItem(
-                            content=ft.Text(
-                                "Готовий",
-                                size=self.TXT,
-                                no_wrap=False,
-                                max_lines=3,
-                                overflow=ft.TextOverflow.VISIBLE,
+                        ]
+                        st_outer = ft.Container(
+                            width=wst,
+                            height=self.ROW_H,
+                            bgcolor=bg_goods,
+                            border=ft.border.all(1, self.BDR),
+                            padding=0,
+                            clip_behavior=ft.ClipBehavior.HARD_EDGE,
+                            content=ft.PopupMenuButton(
+                                icon=None,
+                                tooltip="Обрати статус",
+                                items=st_menu_opts,
+                                menu_position=ft.PopupMenuPosition.UNDER,
+                                content=ft.Container(
+                                    width=wst,
+                                    height=self.ROW_H,
+                                    bgcolor=bg_goods,
+                                    alignment=ft.Alignment(0, 0),
+                                    padding=ft.padding.symmetric(horizontal=2, vertical=0),
+                                    content=_status_label_core(),
+                                ),
                             ),
-                            on_click=(
-                                lambda _e, iid=oid: self._on_status_change(
-                                    iid, "ready_for_shipment"
-                                )
-                            ),
-                        ),
-                    ]
-                    st_outer = ft.Container(
-                        width=wst,
-                        height=self.ROW_H,
-                        bgcolor=bg_goods,
-                        border=ft.border.all(1, self.BDR),
-                        padding=0,
-                        clip_behavior=ft.ClipBehavior.HARD_EDGE,
-                        content=ft.PopupMenuButton(
-                            icon=None,
-                            tooltip="Обрати статус",
-                            items=st_menu_opts,
-                            menu_position=ft.PopupMenuPosition.UNDER,
-                            content=ft.Container(
-                                width=wst,
-                                height=self.ROW_H,
-                                bgcolor=bg_goods,
-                                alignment=ft.Alignment(0, 0),
-                                padding=ft.padding.symmetric(horizontal=2, vertical=0),
-                                content=_status_label_core(),
-                            ),
-                        ),
-                    )
+                        )
+                        self._pack_status_popup_cache[str(oid)] = (_st_sig, st_outer)
 
             cost_val = row.get("cost_amount")
             if not is_goods and cost_val is None and qty and pack_price:
@@ -7126,10 +7186,19 @@ class PackagingStockView:
             with contextlib.suppress(Exception):
                 page.close_dialog(dlg)
 
-    def _open_supply_order_dialog(self, ctx: dict, pack_row: dict):
+    async def _open_supply_order_dialog(self, ctx: dict, pack_row: dict):
+        """Builds the (DB-heavy) supply-order dialog off the UI thread, then
+        shows it — see ProductsView.show_product_details_dialog for the
+        same fix and why it matters on Android."""
         page = self._page()
         if not page or self.subordinate_ro:
             return
+        dlg = await asyncio.to_thread(self._build_supply_order_dialog, ctx, pack_row)
+        if dlg is not None:
+            page.show_dialog(dlg)
+
+    def _build_supply_order_dialog(self, ctx: dict, pack_row: dict):
+        page = self._page()
         rid = str(ctx.get("region_id") or "").strip() or (
             getattr(self, "_region_id_live", "") or ""
         )
@@ -7581,7 +7650,7 @@ class PackagingStockView:
         date_f.on_click = _open_supply_material_calendar
         calendar_btn.on_click = _open_supply_material_calendar
 
-        page.show_dialog(dlg)
+        return dlg
 
     def _save_supply_dialog(self, dlg, **fields):
         import uuid as _uuid

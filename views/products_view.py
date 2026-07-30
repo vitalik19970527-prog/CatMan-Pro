@@ -27,7 +27,8 @@ def _th_from_view(view) -> dict:
 from config import Config
 import i18n
 from logger import logger
-from views.mobile_layout_helpers import is_mobile
+from views.async_view_build_helper import safe_update_with_retry
+from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
 from views.number_format import format_grouped, safe_float
 from views import product_naming
 
@@ -213,10 +214,55 @@ class ProductsView:
             self._selected_series_filter_ids.clear()
             self.load_products(force_reload=True)
 
+    def _refresh_supplier_lookup_cache(self) -> None:
+        with contextlib.suppress(Exception):
+            region_id = self._effective_region_id()
+            rows = (
+                self.db.get_suppliers(
+                    self.company_id, region_id, manager_id=self.manager_id
+                )
+                or []
+            )
+            self._suppliers_by_id = {
+                s.get("id"): s for s in rows if isinstance(s, dict) and s.get("id")
+            }
+
+    def _refresh_packaging_lookup_cache(self) -> None:
+        with contextlib.suppress(Exception):
+            region_id = self._effective_region_id()
+            rows = (
+                self.db.get_packaging(
+                    self.company_id, region_id, manager_id=self.manager_id
+                )
+                or []
+            )
+            self._packaging_by_id = {
+                p.get("id"): p for p in rows if isinstance(p, dict) and p.get("id")
+            }
+
+    def _refresh_category_lookup_cache(self) -> None:
+        with contextlib.suppress(Exception):
+            region_id = self._effective_region_id()
+            rows = (
+                self.db.get_company_categories(
+                    self.company_id, region_id, manager_id=self.manager_id
+                )
+                or []
+            )
+            self._categories_by_id = {
+                c.get("id"): c for c in rows if isinstance(c, dict) and c.get("id")
+            }
+
     def _apply_saved_product_to_cache(self, product_id: str, payload: dict) -> None:
         """Optimistic in-memory patch after a successful edit: merge the saved
         fields into the cached row and re-attach supplier/packaging/category
-        (from the already-warm lookups) — no DB re-fetch needed."""
+        (from the already-warm lookups) — no DB re-fetch needed.
+
+        Those lookup dicts are only rebuilt on a full load_products(force_reload=True)
+        (first load / tab switch), so a supplier/packaging/category picked during
+        THIS edit that isn't in them yet (e.g. just created moments ago) would
+        otherwise fall back to {} and render as "None" until the next full
+        reload. Do one cheap targeted re-fetch of just that lookup instead."""
         pid = str(product_id or "").strip()
         if not pid:
             return
@@ -225,6 +271,12 @@ class ProductsView:
         sid = str(row.get("supplier_id") or "").strip()
         pkid = str(row.get("packaging_id") or "").strip()
         cid = str(row.get("category_id") or "").strip()
+        if sid and sid not in self._suppliers_by_id:
+            self._refresh_supplier_lookup_cache()
+        if pkid and pkid not in self._packaging_by_id:
+            self._refresh_packaging_lookup_cache()
+        if cid and cid not in self._categories_by_id:
+            self._refresh_category_lookup_cache()
         if sid:
             row["supplier"] = self._suppliers_by_id.get(sid) or {}
         if pkid:
@@ -568,7 +620,7 @@ class ProductsView:
 
     def _dialog_content_height(self, desired=620, min_height=280):
         try:
-            page = self.content_area.page if self.content_area else None
+            page = self._page()
             page_h = getattr(page, "height", None) if page else None
             if not page_h and page:
                 win = getattr(page, "window", None)
@@ -581,7 +633,7 @@ class ProductsView:
 
     def _dialog_content_width(self, desired=820, min_width=600):
         try:
-            page = self.content_area.page if self.content_area else None
+            page = self._page()
             page_w = getattr(page, "width", None) if page else None
             if not page_w and page:
                 win = getattr(page, "window", None)
@@ -1724,7 +1776,7 @@ class ProductsView:
 
         def _series_help(_):
             from views.help_utils import show_modal_help
-            _pg = self.content_area.page if self.content_area else None
+            _pg = self._page()
             show_modal_help(_pg, self.t("products.dlg.complete_series", "Доробити серію в товар"), [
                 self.t("products.series_help.desc", "Конвертує незавершену серію в повноцінний товар каталогу."),
                 self.t("products.series_help.step1", "1. Знайдіть серію у пошуковому полі або виберіть зі списку."),
@@ -1833,7 +1885,7 @@ class ProductsView:
 
     def _show_help(self) -> None:
         from views.help_utils import show_modal_help
-        page = self.content_area.page if self.content_area else None
+        page = self._page()
         if not page:
             return
         t = self.t
@@ -1900,6 +1952,21 @@ class ProductsView:
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
 
+        # Region access and category access are separate grants -- a manager
+        # can see a region without owning any category node in it. Creating
+        # a product always requires a category, so hide the create-family
+        # buttons (leaving read-only browsing/search intact) when there's
+        # nowhere to actually put a new one in the current region.
+        try:
+            _can_create_here = self.db.manager_has_category_access_in_region(
+                self.manager_id, self.company_id, self._effective_region_id()
+            )
+        except Exception:
+            _can_create_here = True
+        # Cached on the instance so _create_product_card() (called once per
+        # visible row) doesn't re-run this DB check for every single product.
+        self._region_create_allowed = _can_create_here
+
         header = ft.Column(
             [
                 ft.Row(
@@ -1926,7 +1993,8 @@ class ProductsView:
                                 text_style=ft.TextStyle(size=11),
                                 padding=ft.padding.symmetric(horizontal=8, vertical=2),
                             ),
-                            on_click=lambda _: self.show_product_dialog(),
+                            on_click=lambda _: self._page()
+                            and self._page().run_task(self.show_product_dialog),
                             visible=not self.read_only_subordinate,
                         ),
                         ft.OutlinedButton(
@@ -1955,7 +2023,7 @@ class ProductsView:
                     spacing=6,
                     wrap=True,
                     run_spacing=4,
-                    visible=not self.read_only_subordinate,
+                    visible=not self.read_only_subordinate and _can_create_here,
                 ),
             ],
             spacing=6,
@@ -1981,10 +2049,22 @@ class ProductsView:
             ),
         )
 
-        self._category_filter_host = ft.Row(spacing=6, wrap=True)
-        self._subcategory_filter_host = ft.Row(spacing=4, wrap=True)
-        self._brand_filter_host = ft.Row(spacing=4, wrap=True)
-        self._series_filter_host = ft.Row(spacing=4, wrap=True)
+        # Category/subcategory/brand/series filter chips: wrap=True (desktop)
+        # let a long chip list quietly push the products table further down
+        # the screen the more filters exist -- on a short phone screen this
+        # was one of the biggest space-eaters. Single scrollable line on
+        # mobile instead, same pattern as the workspace tab bar fix.
+        _prod_is_mob = is_mobile(self.content_area.page)
+        if _prod_is_mob:
+            self._category_filter_host = make_scrollable_chip_row([], spacing=6)
+            self._subcategory_filter_host = make_scrollable_chip_row([], spacing=4)
+            self._brand_filter_host = make_scrollable_chip_row([], spacing=4)
+            self._series_filter_host = make_scrollable_chip_row([], spacing=4)
+        else:
+            self._category_filter_host = ft.Row(spacing=6, wrap=True)
+            self._subcategory_filter_host = ft.Row(spacing=4, wrap=True)
+            self._brand_filter_host = ft.Row(spacing=4, wrap=True)
+            self._series_filter_host = ft.Row(spacing=4, wrap=True)
         self._advanced_filters_toggle_btn = ft.OutlinedButton(
             "Фільтри +",
             height=24,
@@ -2001,7 +2081,7 @@ class ProductsView:
                 self._subcategory_filter_host,
             ],
             spacing=6,
-            wrap=True,
+            wrap=not _prod_is_mob,
             visible=False,
         )
         self._brand_filter_row = ft.Row(
@@ -2010,7 +2090,7 @@ class ProductsView:
                 self._brand_filter_host,
             ],
             spacing=6,
-            wrap=True,
+            wrap=not _prod_is_mob,
             visible=False,
         )
         self._series_filter_row = ft.Row(
@@ -2019,10 +2099,14 @@ class ProductsView:
                 self._series_filter_host,
             ],
             spacing=6,
-            wrap=True,
+            wrap=not _prod_is_mob,
             visible=False,
         )
-        self._sort_order_host = ft.Row(spacing=6, wrap=True)
+        self._sort_order_host = (
+            make_scrollable_chip_row([], spacing=6)
+            if _prod_is_mob
+            else ft.Row(spacing=6, wrap=True)
+        )
         self._refresh_sort_order_controls()
 
         filters_block = ft.Column(
@@ -2843,16 +2927,10 @@ class ProductsView:
                 )
             )
 
-        with contextlib.suppress(Exception):
-            if getattr(self, "_fixed_top", None):
-                self._fixed_top.update()
-        with contextlib.suppress(Exception):
-            self.products_list.update()
-        # Force a full page render so the updated list is always visible immediately.
-        with contextlib.suppress(Exception):
-            pg = getattr(self.content_area, "page", None)
-            if pg:
-                pg.update()
+        _pg = self._page()
+        if getattr(self, "_fixed_top", None):
+            safe_update_with_retry(self._fixed_top, _pg)
+        safe_update_with_retry(self.products_list, _pg)
 
     def _build_archive_section(self, region_id, manager_id):
         """Згорнута секція архівованих товарів з можливістю відновлення."""
@@ -3455,7 +3533,7 @@ class ProductsView:
                     return 0
 
             host_w = _to_int(getattr(self.content_area, "width", 0))
-            page = self.content_area.page if self.content_area else None
+            page = self._page()
             page_w = _to_int(getattr(page, "width", 0)) if page else 0
             if page_w <= 0 and page is not None:
                 win = getattr(page, "window", None)
@@ -3557,7 +3635,7 @@ class ProductsView:
                 self._show_snack(self.t("products.no_photo", "У цього товару немає фото"), "orange")
                 return
 
-            page = self.content_area.page if self.content_area else None
+            page = self._page()
             if not page:
                 return
 
@@ -3790,8 +3868,9 @@ class ProductsView:
                                             ),
                                             text_style=ft.TextStyle(size=11),
                                         ),
-                                        on_click=lambda _: self.show_product_details_dialog(
-                                            product
+                                        on_click=lambda _, _p=product: self._page()
+                                        and self._page().run_task(
+                                            self.show_product_details_dialog, _p
                                         ),
                                     ),
                                     ft.OutlinedButton(
@@ -3820,9 +3899,11 @@ class ProductsView:
                                             ),
                                             text_style=ft.TextStyle(size=11),
                                         ),
-                                        visible=not self.read_only_subordinate,
-                                        on_click=lambda _: self.show_product_dialog(
-                                            product
+                                        visible=not self.read_only_subordinate
+                                        and getattr(self, "_region_create_allowed", True),
+                                        on_click=lambda _, _p=product: self._page()
+                                        and self._page().run_task(
+                                            self.show_product_dialog, _p
                                         ),
                                     ),
                                     ft.IconButton(
@@ -3836,6 +3917,7 @@ class ProductsView:
                                             else self.t("products.archive", "Архівувати")
                                         ),
                                         visible=not self.read_only_subordinate
+                                        and getattr(self, "_region_create_allowed", True)
                                         and bool(product.get("id")),
                                         on_click=(
                                             (lambda _: self.restore_product(product.get("id")))
@@ -3872,7 +3954,7 @@ class ProductsView:
         )
 
     def _close_dlg(self, dlg):
-        page = self.content_area.page if self.content_area else None
+        page = self._page()
         if not page:
             logger.warning("[modal:products] close skipped: page is None")
             return
@@ -3892,7 +3974,20 @@ class ProductsView:
             len(getattr(page, "overlay", []) or []),
         )
 
-    def show_product_details_dialog(self, product, on_switch_to_edit=None, _dlg_ref=None):
+    async def show_product_details_dialog(self, product, on_switch_to_edit=None, _dlg_ref=None):
+        """Builds the (DB-heavy) product card dialog off the UI thread, then
+        shows it. On Android, a handful of sequential blocking DB round
+        trips done inline on the single Flet event loop (companies/regions/
+        node-path/delivery-methods lookups) is what made this and every
+        other modal take up to a minute to open — the network itself was
+        fine, the event loop was just starved. Desktop's low-latency LAN
+        masked this completely."""
+        dlg = await asyncio.to_thread(
+            self._build_product_details_dialog, product, on_switch_to_edit, _dlg_ref
+        )
+        self.content_area.page.show_dialog(dlg)
+
+    def _build_product_details_dialog(self, product, on_switch_to_edit=None, _dlg_ref=None) -> ft.AlertDialog:
         product = product if isinstance(product, dict) else {}
         display_name = product.get(
             "_display_name"
@@ -4351,7 +4446,7 @@ class ProductsView:
         )
         if isinstance(_dlg_ref, list):
             _dlg_ref[0] = dlg
-        self.content_area.page.show_dialog(dlg)
+        return dlg
 
     def _is_admin_or_superadmin(self):
         role = (self.user_data.get("role") or "").strip().lower()
@@ -4371,12 +4466,33 @@ class ProductsView:
         else:
             self._show_snack("Функція недоступна", "orange")
 
-    def show_product_dialog(self, product=None, on_switch_to_view=None):
+    async def show_product_dialog(self, product=None, on_switch_to_view=None):
+        """Async so the lock-acquisition/hydration/companies-list DB round
+        trips below (and the dropdown-cascade population further down, see
+        _on_company_change et al.) run off the UI thread — on Android these
+        used to run inline on Flet's single event loop, which is what made
+        opening this dialog take up to a minute."""
         if self.read_only_subordinate:
             self._show_snack(self.t("packaging.subordinate_readonly", "У вкладці підлеглого доступний лише перегляд"), "orange")
             return
 
         is_edit = isinstance(product, dict) and bool((product or {}).get("id"))
+        try:
+            _has_access = await asyncio.to_thread(
+                self.db.manager_has_category_access_in_region,
+                self.manager_id, self.company_id, self._effective_region_id()
+            )
+        except Exception:
+            _has_access = True
+        if not _has_access:
+            self._show_snack(
+                self.t(
+                    "products.no_category_access",
+                    "Немає доступу до категорій у цьому регіоні — лише перегляд",
+                ),
+                "orange",
+            )
+            return
         product = product or {}
         self.temp_image_path = None
         edit_lock_token = ""
@@ -4390,7 +4506,9 @@ class ProductsView:
             pid = str((product or {}).get("id") or "").strip()
             if pid:
                 try:
-                    fresh = self.db.get_product_by_id(lock_company_id, pid)
+                    fresh = await asyncio.to_thread(
+                        self.db.get_product_by_id, lock_company_id, pid
+                    )
                     if isinstance(fresh, dict):
                         merged = dict(product)
                         merged.update(fresh)  # DB wins
@@ -4399,7 +4517,8 @@ class ProductsView:
                     logger.exception("Failed to hydrate product from DB for edit modal")
 
         if is_edit:
-            lock_res = self.db.acquire_edit_lock(
+            lock_res = await asyncio.to_thread(
+                self.db.acquire_edit_lock,
                 lock_company_id,
                 "products",
                 product.get("id"),
@@ -4420,7 +4539,8 @@ class ProductsView:
                     await asyncio.sleep(90)
                     if lock_released_ref["done"]:
                         return
-                    self.db.heartbeat_edit_lock(
+                    await asyncio.to_thread(
+                        self.db.heartbeat_edit_lock,
                         lock_company_id,
                         "products",
                         product.get("id"),
@@ -4441,15 +4561,33 @@ class ProductsView:
             hb_task = lock_heartbeat_task_ref.get("task")
             if hb_task and not hb_task.done():
                 hb_task.cancel()
-            self.db.release_edit_lock(
-                lock_company_id,
-                "products",
-                product.get("id"),
-                self.manager_id,
-                edit_lock_token,
-            )
+            _pg_release = self._page()
+            if _pg_release and hasattr(_pg_release, "run_task"):
+                async def _release_async():
+                    await asyncio.to_thread(
+                        self.db.release_edit_lock,
+                        lock_company_id,
+                        "products",
+                        product.get("id"),
+                        self.manager_id,
+                        edit_lock_token,
+                    )
+                with contextlib.suppress(Exception):
+                    _pg_release.run_task(_release_async)
+            else:
+                self.db.release_edit_lock(
+                    lock_company_id,
+                    "products",
+                    product.get("id"),
+                    self.manager_id,
+                    edit_lock_token,
+                )
 
-        companies = self.db.get_all_companies() if self.is_superadmin else []
+        companies = (
+            await asyncio.to_thread(self.db.get_all_companies)
+            if self.is_superadmin
+            else []
+        )
         default_company_id = (
             product.get("company_id")
             or (self.company_id if not is_edit else None)
@@ -4462,7 +4600,10 @@ class ProductsView:
         # Build path map from leaf node for pre-filling hierarchy dropdowns on edit
         _edit_path_map = {}
         if is_edit and product.get("catalog_node_id"):
-            for _ni in self.db.get_node_path(product.get("catalog_node_id")):
+            _node_path = await asyncio.to_thread(
+                self.db.get_node_path, product.get("catalog_node_id")
+            )
+            for _ni in _node_path:
                 if isinstance(_ni, dict) and _ni.get("position") and _ni.get("id"):
                     _edit_path_map[int(_ni["position"])] = _ni["id"]
 
@@ -4656,36 +4797,42 @@ class ProductsView:
         def _owner_manager_id():
             return manager_f.value if manager_f.visible else (self.manager_id or "")
 
-        def _allowed_region_ids_for_owner(company_id):
+        async def _allowed_region_ids_for_owner(company_id):
             owner_id = _owner_manager_id()
             if not company_id or not owner_id:
                 return set()
             try:
-                rows = self.db.get_manager_allowed_region_ids(owner_id)
+                rows = await asyncio.to_thread(
+                    self.db.get_manager_allowed_region_ids, owner_id
+                )
                 return {rid for rid in (rows or []) if rid}
             except Exception:
                 return set()
 
-        def _categories_for_context(company_id, region_id):
+        async def _categories_for_context(company_id, region_id):
             owner_id = _owner_manager_id()
             if owner_id:
-                rows = self.db.get_accessible_categories(
-                    company_id, owner_id, region_id
+                rows = await asyncio.to_thread(
+                    self.db.get_accessible_categories, company_id, owner_id, region_id
                 )
             else:
-                rows = self.db.get_company_categories(
+                rows = await asyncio.to_thread(
+                    self.db.get_company_categories,
                     company_id,
                     region_id,
                     manager_id=self.manager_id,
                 )
             return [r for r in (rows or []) if isinstance(r, dict) and r.get("id")]
 
-        def _load_managers(company_id):
+        async def _load_managers(company_id):
             if not manager_f.visible:
                 return
+            _managers_raw = await asyncio.to_thread(
+                self.db.get_company_managers, company_id
+            )
             rows = [
                 m
-                for m in self.db.get_company_managers(company_id)
+                for m in _managers_raw
                 if isinstance(m, dict) and m.get("id")
             ]
             manager_f.options = [
@@ -4705,13 +4852,16 @@ class ProductsView:
             else:
                 manager_f.value = None
 
-        def _load_regions(company_id):
+        async def _load_regions(company_id):
+            _regions_raw = await asyncio.to_thread(
+                self.db.get_company_regions, company_id
+            )
             rows = [
                 r
-                for r in self.db.get_company_regions(company_id)
+                for r in _regions_raw
                 if isinstance(r, dict) and r.get("id")
             ]
-            allowed_region_ids = _allowed_region_ids_for_owner(company_id)
+            allowed_region_ids = await _allowed_region_ids_for_owner(company_id)
             if allowed_region_ids:
                 rows = [r for r in rows if r.get("id") in allowed_region_ids]
             region_f.options = [
@@ -4734,8 +4884,8 @@ class ProductsView:
             else:
                 region_f.value = None
 
-        def _load_categories(company_id, region_id):
-            rows = _categories_for_context(company_id, region_id)
+        async def _load_categories(company_id, region_id):
+            rows = await _categories_for_context(company_id, region_id)
             category_f.options = [
                 ft.dropdown.Option(key=r.get("id"), text=r.get("name")) for r in rows
             ]
@@ -4756,13 +4906,13 @@ class ProductsView:
             else:
                 category_f.value = None
 
-        def _load_suppliers_packaging(company_id, region_id, keep_supplier=True):
+        async def _load_suppliers_packaging(company_id, region_id, keep_supplier=True):
             owner_id = _owner_manager_id()
             prev_supplier = supplier_f.value if keep_supplier else None
             prev_packaging = packaging_f.value
 
-            suppliers = self.db.get_suppliers(
-                company_id, region_id, manager_id=owner_id or None
+            suppliers = await asyncio.to_thread(
+                self.db.get_suppliers, company_id, region_id, manager_id=owner_id or None
             )
             supplier_currency_by_id.clear()
             supplier_currency_by_id.update(
@@ -4813,7 +4963,8 @@ class ProductsView:
                 )
             _refresh_purchase_sum_usd()
 
-            packaging_rows = self.db.get_packaging(
+            packaging_rows = await asyncio.to_thread(
+                self.db.get_packaging,
                 company_id,
                 region_id,
                 manager_id=owner_id or None,
@@ -4845,7 +4996,7 @@ class ProductsView:
             else:
                 packaging_f.value = ""
 
-        def _load_sales_prices(region_id):
+        async def _load_sales_prices(region_id):
             sales_prices_container.controls.clear()
             sales_map = {}
             raw_sales = product.get("sales_prices_json") if is_edit else None
@@ -4872,7 +5023,8 @@ class ProductsView:
                 except Exception:
                     sales_map = {}
 
-            tiers = self.db.get_effective_region_price_tiers_for_manager(
+            tiers = await asyncio.to_thread(
+                self.db.get_effective_region_price_tiers_for_manager,
                 self.company_id,
                 self.manager_id,
                 region_id,
@@ -4926,7 +5078,7 @@ class ProductsView:
                 field["block"].visible and field["select"].value == self.NEW_ITEM_KEY
             )
 
-        def _rows_for_level(level_position, category_id):
+        async def _rows_for_level(level_position, category_id):
             if not category_id:
                 return []
             parent_id = None
@@ -4945,24 +5097,24 @@ class ProductsView:
                     if not parent_id:
                         return []
                     break
-            return self._dedupe_rows_by_id(
-                self.db.get_category_level_nodes(
-                    category_id, int(level_position), parent_node_id=parent_id
-                )
+            _nodes_raw = await asyncio.to_thread(
+                self.db.get_category_level_nodes,
+                category_id, int(level_position), parent_node_id=parent_id
             )
+            return self._dedupe_rows_by_id(_nodes_raw)
 
-        def _extra_rows_for_leaf(category_id, leaf_pos, leaf_parent_id):
+        async def _extra_rows_for_leaf(category_id, leaf_pos, leaf_parent_id):
             """Fetch level_(leaf_pos+1) children under the selected leaf node."""
             if not category_id or not leaf_parent_id:
                 return []
             extra_pos = int(leaf_pos) + 1
             if extra_pos > self.MAX_LEVELS:
                 return []
-            return self._dedupe_rows_by_id(
-                self.db.get_category_level_nodes(
-                    category_id, extra_pos, parent_node_id=leaf_parent_id
-                )
+            _nodes_raw = await asyncio.to_thread(
+                self.db.get_category_level_nodes,
+                category_id, extra_pos, parent_node_id=leaf_parent_id
             )
+            return self._dedupe_rows_by_id(_nodes_raw)
 
         def _refresh_extra_level_options(category_id, leaf_pos, leaf_node_id):
             _extra_level_pos_ref[0] = int(leaf_pos) + 1 if leaf_pos else None
@@ -4974,11 +5126,11 @@ class ProductsView:
             extra_level_block.visible = has_extra and bool(extra_level_toggle.value)
             _sync_extra_new_visibility()
 
-        def _refresh_level_options(enabled_levels):
+        async def _refresh_level_options(enabled_levels):
             for level_row in enabled_levels:
                 pos = int(level_row.get("position"))
                 field = level_fields[pos]
-                rows = _rows_for_level(pos, category_f.value)
+                rows = await _rows_for_level(pos, category_f.value)
                 field["rows"] = rows
                 previous = field["select"].value
                 field["select"].options = [
@@ -5020,7 +5172,7 @@ class ProductsView:
                 with contextlib.suppress(Exception):
                     field["new"].update()
 
-        def _on_level_change(level_position, _):
+        async def _on_level_change(level_position, _):
             _sync_level_new_visibility(level_position)
             cid = category_f.value
             company_id = _get_work_company_id()
@@ -5028,7 +5180,7 @@ class ProductsView:
             selected = next(
                 (
                     c
-                    for c in _categories_for_context(company_id, region_id)
+                    for c in await _categories_for_context(company_id, region_id)
                     if isinstance(c, dict) and c.get("id") == cid
                 ),
                 None,
@@ -5039,7 +5191,7 @@ class ProductsView:
             enabled_levels = [
                 lvl for lvl in cfg.get("levels", []) if lvl.get("enabled")
             ]
-            _refresh_level_options(enabled_levels)
+            await _refresh_level_options(enabled_levels)
             # Refresh extra level options when last configured level changes
             if enabled_levels and int(level_position) == int(
                 enabled_levels[-1].get("position")
@@ -5051,13 +5203,13 @@ class ProductsView:
             with contextlib.suppress(Exception):
                 extra_level_block.update()
 
-        def _rebuild_hierarchy_fields():
+        async def _rebuild_hierarchy_fields():
             hierarchy_container.controls.clear()
             cid = category_f.value
             company_id = _get_work_company_id()
             region_id = region_f.value
             selected = None
-            for c in _categories_for_context(company_id, region_id):
+            for c in await _categories_for_context(company_id, region_id):
                 if isinstance(c, dict) and c.get("id") == cid:
                     selected = c
                     break
@@ -5097,7 +5249,7 @@ class ProductsView:
                 + (" -> Товар" if use_products else " -> Товар=листовий елемент")
             )
 
-            _refresh_level_options(enabled_levels)
+            await _refresh_level_options(enabled_levels)
 
             for level_row in enabled_levels:
                 hierarchy_container.controls.append(
@@ -5146,16 +5298,16 @@ class ProductsView:
 
         init_guard = {"active": True}
 
-        def _on_company_change(_, force: bool = False):
+        async def _on_company_change(_, force: bool = False):
             if init_guard["active"] and not force:
                 return
             cid = _get_work_company_id()
-            _load_managers(cid)
-            _load_regions(cid)
-            _load_categories(cid, region_f.value)
-            _load_suppliers_packaging(cid, region_f.value, keep_supplier=bool(is_edit))
-            _load_sales_prices(region_f.value)
-            _rebuild_hierarchy_fields()
+            await _load_managers(cid)
+            await _load_regions(cid)
+            await _load_categories(cid, region_f.value)
+            await _load_suppliers_packaging(cid, region_f.value, keep_supplier=bool(is_edit))
+            await _load_sales_prices(region_f.value)
+            await _rebuild_hierarchy_fields()
             with contextlib.suppress(Exception):
                 region_f.update()
             with contextlib.suppress(Exception):
@@ -5169,15 +5321,15 @@ class ProductsView:
             with contextlib.suppress(Exception):
                 hierarchy_container.update()
 
-        def _on_manager_change(_):
+        async def _on_manager_change(_):
             if init_guard["active"]:
                 return
             cid = _get_work_company_id()
-            _load_regions(cid)
-            _load_categories(cid, region_f.value)
-            _load_suppliers_packaging(cid, region_f.value, keep_supplier=False)
-            _load_sales_prices(region_f.value)
-            _rebuild_hierarchy_fields()
+            await _load_regions(cid)
+            await _load_categories(cid, region_f.value)
+            await _load_suppliers_packaging(cid, region_f.value, keep_supplier=False)
+            await _load_sales_prices(region_f.value)
+            await _rebuild_hierarchy_fields()
             with contextlib.suppress(Exception):
                 region_f.update()
             with contextlib.suppress(Exception):
@@ -5190,27 +5342,36 @@ class ProductsView:
                 sales_prices_container.update()
             with contextlib.suppress(Exception):
                 hierarchy_container.update()
+
+        def _make_level_change_handler(current_pos):
+            # Flet only awaits a handler when the assigned callable itself is
+            # a coroutine function (inspect.iscoroutinefunction) — a plain
+            # lambda that merely CALLS an async function returns an
+            # unawaited, silently-discarded coroutine. Needs a real `async
+            # def` per position (a lambda can't be async), hence this
+            # factory instead of the lambda-with-default-arg pattern used
+            # for the sync handlers elsewhere in this dialog.
+            async def _handler(e):
+                await _on_level_change(current_pos, e)
+
+            return _handler
 
         for pos in range(1, self.MAX_LEVELS + 1):
             # This Flet build fires Dropdown's "on_select" on a user pick, not
             # "on_change" (matches the mode_dd/ccy_dd pattern elsewhere in the
             # app) — on_change-only never fired for a manual selection here,
             # so the next level's options silently never refreshed.
-            level_fields[pos]["select"].on_select = (
-                lambda e, current=pos: _on_level_change(current, e)
-            )
-            level_fields[pos]["select"].on_change = (
-                lambda e, current=pos: _on_level_change(current, e)
-            )
+            level_fields[pos]["select"].on_select = _make_level_change_handler(pos)
+            level_fields[pos]["select"].on_change = _make_level_change_handler(pos)
 
-        def _on_region_change(_):
+        async def _on_region_change(_):
             if init_guard["active"]:
                 return
             cid = _get_work_company_id()
-            _load_categories(cid, region_f.value)
-            _load_suppliers_packaging(cid, region_f.value, keep_supplier=False)
-            _load_sales_prices(region_f.value)
-            _rebuild_hierarchy_fields()
+            await _load_categories(cid, region_f.value)
+            await _load_suppliers_packaging(cid, region_f.value, keep_supplier=False)
+            await _load_sales_prices(region_f.value)
+            await _rebuild_hierarchy_fields()
             with contextlib.suppress(Exception):
                 category_f.update()
             with contextlib.suppress(Exception):
@@ -5222,18 +5383,18 @@ class ProductsView:
             with contextlib.suppress(Exception):
                 hierarchy_container.update()
 
-        def _on_category_change(_):
+        async def _on_category_change(_):
             if init_guard["active"]:
                 return
-            _rebuild_hierarchy_fields()
+            await _rebuild_hierarchy_fields()
             with contextlib.suppress(Exception):
                 hierarchy_container.update()
 
-        def _on_supplier_change(_):
+        async def _on_supplier_change(_):
             if init_guard["active"]:
                 return
             cid = _get_work_company_id()
-            _load_suppliers_packaging(cid, region_f.value, keep_supplier=True)
+            await _load_suppliers_packaging(cid, region_f.value, keep_supplier=True)
             with contextlib.suppress(Exception):
                 packaging_f.update()
 
@@ -5350,7 +5511,7 @@ class ProductsView:
             category_row = next(
                 (
                     c
-                    for c in _categories_for_context(company_id, region_id)
+                    for c in await _categories_for_context(company_id, region_id)
                     if isinstance(c, dict) and c.get("id") == category_id
                 ),
                 None,
@@ -5601,7 +5762,21 @@ class ProductsView:
         def _switch_back_to_view(_):
             _release_lock_once()
             self._close_dlg(dlg)
-            on_switch_to_view()
+            # Opening the view dialog in the same tick as closing this edit
+            # dialog can outrun Flutter's close transition — the new dialog
+            # silently fails to render and the modal just disappears.
+            _pg2 = self._page()
+            if _pg2 and hasattr(_pg2, "run_task"):
+
+                async def _delayed_switch_back():
+                    await asyncio.sleep(0.2)
+                    with contextlib.suppress(Exception):
+                        await on_switch_to_view()
+
+                with contextlib.suppress(Exception):
+                    _pg2.run_task(_delayed_switch_back)
+            # else: no page reference available — nothing we can safely
+            # schedule the (async) on_switch_to_view callback onto.
 
         _mode_toggle_edit = (
             ft.Row(
@@ -5727,7 +5902,7 @@ class ProductsView:
 
         def _prod_help(_):
             from views.help_utils import show_modal_help
-            _pg = self.content_area.page if self.content_area else None
+            _pg = self._page()
             show_modal_help(_pg, self.t("products.dlg.edit_title", "Товар"), [
                 self.t("products.edit_help.step1", "1. Оберіть компанію, регіон, категорію."),
                 self.t("products.edit_help.step2", "2. Введіть назву товару, оберіть постачальника і тип пакування."),
@@ -5795,7 +5970,7 @@ class ProductsView:
             await asyncio.sleep(0.01)
             try:
                 # Initial fill must not reset saved values in edit mode.
-                _on_company_change(None, force=True)
+                await _on_company_change(None, force=True)
                 init_guard["active"] = False
                 dialog_loading.visible = False
                 dialog_form.visible = True

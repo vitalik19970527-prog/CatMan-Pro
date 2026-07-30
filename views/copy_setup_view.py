@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 
 import flet as ft
@@ -60,8 +61,14 @@ class CopySetupView:
             str(self.company_id or ""), {}
         )
 
+    def _page(self):
+        try:
+            return self.content_area.page if self.content_area else None
+        except RuntimeError:
+            return None
+
     def _show_help(self) -> None:
-        page = self.content_area.page if self.content_area else None
+        page = self._page()
         if not page:
             return
         from views.help_utils import show_modal_help
@@ -75,7 +82,7 @@ class CopySetupView:
         ])
 
     def _show_snack(self, text, color):
-        page = self.content_area.page
+        page = self._page()
         if not page:
             return
         page.snack_bar = ft.SnackBar(
@@ -224,7 +231,7 @@ class CopySetupView:
         _th = _th_from_view(self)
         global _BORDER, _BORDER2
         _BORDER = _BORDER2 = _th["border"]
-        if not self.content_area.page:
+        if not self._page():
             return
 
         self.content_area.controls.clear()
@@ -1095,21 +1102,19 @@ class CopySetupView:
             else:
                 self._show_snack("Не вдалося скопіювати пакування", "red")
 
-        def _open_packaging_edit_modal(_):
+        async def _open_packaging_edit_modal(_):
             if not pack_src_manager_f.value or not pack_dst_manager_f.value:
                 self._show_snack("Оберіть користувача джерела і призначення", "orange")
                 return
             src_id = pack_src_item_f.value
             dst_rid = pack_dst_region_f.value
-            src_rows = [
-                p
-                for p in self.db.get_packaging(
-                    self.company_id,
-                    pack_src_region_f.value,
-                    manager_id=pack_src_manager_f.value or None,
-                )
-                if isinstance(p, dict)
-            ]
+            _src_rows_raw = await asyncio.to_thread(
+                self.db.get_packaging,
+                self.company_id,
+                pack_src_region_f.value,
+                manager_id=pack_src_manager_f.value or None,
+            )
+            src_rows = [p for p in _src_rows_raw if isinstance(p, dict)]
             src = self._find_row(src_rows, src_id)
             if not src or not dst_rid:
                 self._show_snack("Оберіть елемент і регіон призначення", "orange")
@@ -1136,14 +1141,14 @@ class CopySetupView:
                 max_lines=4,
             )
 
+            _target_suppliers_raw = await asyncio.to_thread(
+                self.db.get_suppliers,
+                self.company_id,
+                dst_rid,
+                manager_id=pack_dst_manager_f.value or None,
+            )
             target_suppliers = [
-                s
-                for s in self.db.get_suppliers(
-                    self.company_id,
-                    dst_rid,
-                    manager_id=pack_dst_manager_f.value or None,
-                )
-                if isinstance(s, dict) and s.get("id")
+                s for s in _target_suppliers_raw if isinstance(s, dict) and s.get("id")
             ]
             sup_options = [ft.dropdown.Option(key="", text="(без постачальника)")] + [
                 ft.dropdown.Option(key=s.get("id"), text=s.get("name", "Постачальник"))
@@ -1201,7 +1206,7 @@ class CopySetupView:
 
             def _pack_edit_help(_):
                 from views.help_utils import show_modal_help
-                show_modal_help(self.content_area.page, "Редагування перед копіюванням: Пакування", [
+                show_modal_help(self._page(), "Редагування перед копіюванням: Пакування", [
                     self.t("copy.pack_edit_help.step1", "1. Відредагуйте поля пакування перед копіюванням: назва, розмір, ціна, постачальник, зображення, нотатки."),
                     self.t("copy.pack_edit_help.step2", "2. Натисніть «Копіювати з правками» щоб зберегти змінену копію."),
                 ])
@@ -1231,7 +1236,9 @@ class CopySetupView:
                     ft.FilledButton(self.t("copy.copy_with_edits", "Копіювати з правками"), on_click=_save),
                 ],
             )
-            self.content_area.page.show_dialog(dlg)
+            _pg = self._page()
+            if _pg:
+                _pg.show_dialog(dlg)
 
         # ---------------------------
         # ПОСТАЧАЛЬНИКИ
@@ -1352,21 +1359,19 @@ class CopySetupView:
             else:
                 self._show_snack("Не вдалося скопіювати постачальника", "red")
 
-        def _open_supplier_edit_modal(_):
+        async def _open_supplier_edit_modal(_):
             if not sup_src_manager_f.value or not sup_dst_manager_f.value:
                 self._show_snack("Оберіть користувача джерела і призначення", "orange")
                 return
             src_id = sup_src_item_f.value
             dst_rid = sup_dst_region_f.value
-            src_rows = [
-                s
-                for s in self.db.get_suppliers(
-                    self.company_id,
-                    sup_src_region_f.value,
-                    manager_id=sup_src_manager_f.value or None,
-                )
-                if isinstance(s, dict)
-            ]
+            _src_rows_raw = await asyncio.to_thread(
+                self.db.get_suppliers,
+                self.company_id,
+                sup_src_region_f.value,
+                manager_id=sup_src_manager_f.value or None,
+            )
+            src_rows = [s for s in _src_rows_raw if isinstance(s, dict)]
             src = self._find_row(src_rows, src_id)
             if not src or not dst_rid:
                 self._show_snack("Оберіть елемент і регіон призначення", "orange")
@@ -1442,7 +1447,7 @@ class CopySetupView:
 
             def _sup_edit_help(_):
                 from views.help_utils import show_modal_help
-                show_modal_help(self.content_area.page, "Редагування перед копіюванням: Постачальник", [
+                show_modal_help(self._page(), "Редагування перед копіюванням: Постачальник", [
                     self.t("copy.sup_edit_help.step1", "1. Відредагуйте поля постачальника перед копіюванням: назва, контакт, регіон, валюта, платіжні дані."),
                     self.t("copy.sup_edit_help.step2", "2. Натисніть «Копіювати з правками» щоб зберегти змінену копію."),
                 ])
@@ -1473,7 +1478,9 @@ class CopySetupView:
                     ft.FilledButton(self.t("copy.copy_with_edits", "Копіювати з правками"), on_click=_save),
                 ],
             )
-            self.content_area.page.show_dialog(dlg)
+            _pg = self._page()
+            if _pg:
+                _pg.show_dialog(dlg)
 
         # Початкові значення дропдаунів
         cat_copy_src_region_f.value = regions[0].get("id")
@@ -1663,7 +1670,7 @@ class CopySetupView:
         self.content_area.update()
 
     def _close_dialog(self, dlg):
-        page = self.content_area.page if self.content_area else None
+        page = self._page()
         if not page:
             logger.warning("[modal:copy-setup] close skipped: page is None")
             return

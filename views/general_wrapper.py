@@ -16,6 +16,7 @@ Usage in a view's build():
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 
 import flet as ft
@@ -109,10 +110,28 @@ def build_general_sections(
             if _lf[0]:
                 return
             _lf[0] = True
+            _viewer_mid = str(
+                user_data.get("active_manager_id") or user_data.get("id") or ""
+            ).strip()
+            # A supervisor viewing a subordinate's section is normally
+            # read-only there -- but a category/level can be jointly owned
+            # by both (e.g. the subordinate owns some levels alone and
+            # shares the rest with the supervisor), and for whatever they
+            # actually co-own the supervisor can still create/edit like any
+            # other owner. has_shared_node_ownership() is a company-wide
+            # "do these two share at least one node" check, not scoped to
+            # the specific category being edited -- coarser than ideal, but
+            # matches the real scenario (a supervisor with zero overlap
+            # stays view-only; one with any shared ownership regains edit).
+            _shares_ownership = bool(
+                _viewer_mid
+                and _viewer_mid != _mid
+                and db.has_shared_node_ownership(company_id, _viewer_mid, _mid)
+            )
             mgr_ctx = dict(user_data)
             mgr_ctx["active_manager_id"] = _mid
             mgr_ctx["active_manager_name"] = mgr_names.get(_mid, _mid)
-            mgr_ctx["subordinate_view_readonly"] = True
+            mgr_ctx["subordinate_view_readonly"] = not _shares_ownership
             mgr_ctx["general_mode"] = False
             mgr_ctx["general_manager_ids"] = []
             mgr_ctx["_is_sub_section_view"] = True
@@ -131,7 +150,24 @@ def build_general_sections(
                 )
 
         if is_open:
-            _load_sub()
+            # Restoring a section that was already expanded before this
+            # rebuild (persisted open/collapsed state) -- _load_sub() calls
+            # inst.build(), which touches .update() on controls that aren't
+            # attached to the page yet at this point (this function is still
+            # assembling `sections` locally; content_area.controls = sections
+            # and the page-level render happen after we return). Doing it
+            # eagerly here throws "Control must be added to the page first".
+            # Defer one tick via page.run_task so the section is actually
+            # mounted first, same pattern as run_async_build() elsewhere.
+            _page = getattr(content_area, "page", None)
+            if _page is not None:
+                async def _load_sub_deferred(_lf=_load_sub):
+                    await asyncio.sleep(0.03)
+                    _lf()
+
+                _page.run_task(_load_sub_deferred)
+            else:
+                _load_sub()
 
         def _expand(
             e, _key=state_key, _body=body, _arrow=arrow, _load=_load_sub
@@ -335,8 +371,26 @@ def build_region_sections(
     """
     _t = i18n.bind(str(user_data.get("id") or ""))
     company_id = str(user_data.get("company_id") or "").strip()
-    regions = [
+    all_regions = [
         r for r in (db.get_company_regions(company_id) or []) if isinstance(r, dict)
+    ]
+    # Region access and category access are separate grants -- a manager can
+    # be allowed into a region without owning a single category node there.
+    # This per-region breakdown (used both for the current user's own "all
+    # regions" view and inside a subordinate's expansion in
+    # build_general_sections) should only show regions where there's
+    # actually a category to attribute anything to. Admin/superadmin roles
+    # are intentionally unrestricted (manager_has_category_access_in_region
+    # already returns True for them without a per-region DB check).
+    _mid_for_regions = str(
+        user_data.get("active_manager_id") or user_data.get("id") or ""
+    ).strip()
+    regions = [
+        r
+        for r in all_regions
+        if db.manager_has_category_access_in_region(
+            _mid_for_regions, company_id, str(r.get("id") or "")
+        )
     ]
     extra_kw: dict = dict(view_extra_kwargs or {})
     _th = _gw_get_theme(user_data)
@@ -391,7 +445,24 @@ def build_region_sections(
                 )
 
         if is_open:
-            _load_sub()
+            # Restoring a section that was already expanded before this
+            # rebuild (persisted open/collapsed state) -- _load_sub() calls
+            # inst.build(), which touches .update() on controls that aren't
+            # attached to the page yet at this point (this function is still
+            # assembling `sections` locally; content_area.controls = sections
+            # and the page-level render happen after we return). Doing it
+            # eagerly here throws "Control must be added to the page first".
+            # Defer one tick via page.run_task so the section is actually
+            # mounted first, same pattern as run_async_build() elsewhere.
+            _page = getattr(content_area, "page", None)
+            if _page is not None:
+                async def _load_sub_deferred(_lf=_load_sub):
+                    await asyncio.sleep(0.03)
+                    _lf()
+
+                _page.run_task(_load_sub_deferred)
+            else:
+                _load_sub()
 
         def _expand(
             e, _key=state_key, _body=body, _arrow=arrow, _load=_load_sub

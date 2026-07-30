@@ -5,6 +5,8 @@ import uuid
 
 import flet as ft
 
+from views.async_view_build_helper import safe_update_with_retry
+
 # ---------------------------------------------------------------------------
 # Theme colour shims
 # ---------------------------------------------------------------------------
@@ -90,6 +92,12 @@ class PackagingView:
         self._debounce_tasks = {}
         self._search_query = ""
         self._header_loading_indicator = None
+
+    def _page(self):
+        try:
+            return self.content_area.page if self.content_area else None
+        except RuntimeError:
+            return None
 
     def _can_modify_packaging(self, packaging):
         packaging = packaging if isinstance(packaging, dict) else {}
@@ -367,6 +375,17 @@ class PackagingView:
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
 
+        # Region access and category access are separate grants -- creating
+        # or editing packaging is tied to a category/level, so a manager
+        # with zero category ownership in the current region should only
+        # browse, not add/edit.
+        try:
+            self._region_create_allowed = self.db.manager_has_category_access_in_region(
+                self.manager_id, self.company_id, self._effective_region_id()
+            )
+        except Exception:
+            self._region_create_allowed = True
+
         header = ft.Column(
             [
                 ft.Row(
@@ -393,7 +412,10 @@ class PackagingView:
                                 text_style=ft.TextStyle(size=11),
                                 padding=ft.padding.symmetric(horizontal=8, vertical=2),
                             ),
-                            on_click=lambda _: self.show_packaging_dialog(),
+                            on_click=lambda _: self._page()
+                            and self._page().run_task(self.show_packaging_dialog),
+                            visible=not self.read_only_subordinate
+                            and self._region_create_allowed,
                         ),
                     ],
                     spacing=6,
@@ -550,8 +572,7 @@ class PackagingView:
                 self._build_archive_section(current_region_id, load_manager_id)
             )
 
-        with contextlib.suppress(Exception):
-            self.packaging_list.update()
+        safe_update_with_retry(self.packaging_list, self._page())
 
     def _build_archive_section(self, region_id, manager_id):
         """Згорнута секція архівованого пакування з можливістю відновлення."""
@@ -640,7 +661,7 @@ class PackagingView:
             if not _urls:
                 self._show_snack(self.t("packaging.no_photo", "У цього пакування немає фото"), "orange")
                 return
-            page = self.content_area.page if self.content_area else None
+            page = self._page()
             if not page:
                 return
             _dw = (getattr(page, "window_width", None) or 1200) * 0.72
@@ -780,6 +801,18 @@ class PackagingView:
                                         ],
                                         spacing=8,
                                     ),
+                                    ft.Text(
+                                        self.t(
+                                            "packaging.card.min_optimal",
+                                            "Мін: {min_qty} / Опт: {optimal_qty} шт",
+                                        ).format(
+                                            min_qty=p.get("min_qty") or "-",
+                                            optimal_qty=p.get("optimal_qty") or "-",
+                                        ),
+                                        size=10,
+                                        color="grey600",
+                                        visible=bool(p.get("min_qty") or p.get("optimal_qty")),
+                                    ),
                                     ft.Row(
                                         [
                                             ft.TextButton(
@@ -828,8 +861,9 @@ class PackagingView:
                                                 horizontal=7, vertical=1
                                             ),
                                         ),
-                                        on_click=lambda _: self.show_packaging_details_dialog(
-                                            p
+                                        on_click=lambda _, _p=p: self._page()
+                                        and self._page().run_task(
+                                            self.show_packaging_details_dialog, _p
                                         ),
                                     ),
                                     ft.OutlinedButton(
@@ -842,15 +876,17 @@ class PackagingView:
                                                 horizontal=7, vertical=1
                                             ),
                                         ),
-                                        visible=not self.read_only_subordinate,
+                                        visible=not self.read_only_subordinate
+                                        and getattr(self, "_region_create_allowed", True),
                                         disabled=not can_modify,
                                         tooltip=(
                                             self.t("packaging.tooltip.locked_record", "Запис закріплений за іншим користувачем")
                                             if not can_modify
                                             else None
                                         ),
-                                        on_click=lambda _: self.show_packaging_dialog(
-                                            p
+                                        on_click=lambda _, _p=p: self._page()
+                                        and self._page().run_task(
+                                            self.show_packaging_dialog, _p
                                         ),
                                     ),
                                     ft.IconButton(
@@ -867,7 +903,8 @@ class PackagingView:
                                             if can_modify
                                             else self.t("packaging.tooltip.locked_record", "Запис закріплений за іншим користувачем")
                                         ),
-                                        visible=not self.read_only_subordinate,
+                                        visible=not self.read_only_subordinate
+                                        and getattr(self, "_region_create_allowed", True),
                                         disabled=not can_modify,
                                         on_click=(
                                             (lambda _: self.restore_packaging(p.get("id")))
@@ -887,7 +924,7 @@ class PackagingView:
         )
 
     def _close_dlg(self, dlg):
-        page = self.content_area.page if self.content_area else None
+        page = self._page()
         if not page:
             logger.warning("[modal:packaging] close skipped: page is None")
             return
@@ -907,7 +944,14 @@ class PackagingView:
             len(getattr(page, "overlay", []) or []),
         )
 
-    def show_packaging_details_dialog(self, packaging):
+    async def show_packaging_details_dialog(self, packaging):
+        """Builds the (DB-heavy) packaging card dialog off the UI thread,
+        then shows it — see ProductsView.show_product_details_dialog for
+        the same fix and why it matters on Android."""
+        dlg = await asyncio.to_thread(self._build_packaging_details_dialog, packaging)
+        self.content_area.page.show_dialog(dlg)
+
+    def _build_packaging_details_dialog(self, packaging) -> ft.AlertDialog:
         packaging = packaging if isinstance(packaging, dict) else {}
         company_id = packaging.get("company_id") or self.company_id
         region_name = self._region_name_by_id.get(
@@ -1055,7 +1099,7 @@ class PackagingView:
 
         def _pkg_view_help(_):
             from views.help_utils import show_modal_help
-            _pg = self.content_area.page if self.content_area else None
+            _pg = self._page()
             show_modal_help(_pg, self.t("packaging.view_help.title", "Перегляд пакування"), [
                 self.t("packaging.view_help.step1", "1. Тут відображаються всі дані пакування."),
                 self.t("packaging.view_help.step2", "2. Фото можна переглянути у повному розмірі."),
@@ -1138,20 +1182,45 @@ class PackagingView:
             ),
             actions=[ft.TextButton(self.t("packaging.dlg.close", "Закрити"), on_click=lambda _: self._close_dlg(dlg))],
         )
-        self.content_area.page.show_dialog(dlg)
+        return dlg
 
-    def show_packaging_dialog(self, packaging=None):
+    async def show_packaging_dialog(self, packaging=None):
+        """Builds the (DB-heavy) packaging form off the UI thread, then
+        shows it — see ProductsView.show_product_dialog for the same fix
+        and why it matters on Android. The fast, non-DB permission checks
+        run here on the main thread first (cheap, and _show_snack/
+        page.update() must not be called from the background builder
+        thread)."""
         if self.read_only_subordinate:
             self._show_snack(self.t("packaging.subordinate_readonly", "У вкладці підлеглого доступний лише перегляд"), "orange")
             return
+        if not getattr(self, "_region_create_allowed", True):
+            self._show_snack(
+                self.t(
+                    "products.no_category_access",
+                    "Немає доступу до категорій у цьому регіоні — лише перегляд",
+                ),
+                "orange",
+            )
+            return
 
+        result = await asyncio.to_thread(self._build_packaging_dialog, packaging)
+        if isinstance(result, tuple):
+            _, error_msg = result
+            self._show_snack(error_msg, "orange")
+            return
+        if result is not None:
+            self.content_area.page.show_dialog(result)
+
+    def _build_packaging_dialog(self, packaging=None):
         if (
             isinstance(packaging, dict)
             and packaging.get("id")
             and not self._can_modify_packaging(packaging)
         ):
-            self._show_snack(self.t("packaging.locked_record", "Це пакування закріплене за іншим користувачем"), "orange")
-            return
+            return None, self.t(
+                "packaging.locked_record", "Це пакування закріплене за іншим користувачем"
+            )
 
         is_edit = isinstance(packaging, dict)
         if not is_edit:
@@ -1228,6 +1297,24 @@ class PackagingView:
             border_radius=10,
             keyboard_type=ft.KeyboardType.NUMBER,
         )
+        # Per-packaging stock thresholds (шт) — each packaging can need a very
+        # different "enough" amount (a supplier's small accessory box vs a
+        # large device box), so this replaces the old company-wide hardcoded
+        # 2500/5000 warning levels on the Home dashboard card.
+        min_qty_f = ft.TextField(
+            label=self.t("packaging.field.min_qty", "Мінімум, шт"),
+            value=str(packaging.get("min_qty") or ""),
+            border_radius=10,
+            keyboard_type=ft.KeyboardType.NUMBER,
+            width=235,
+        )
+        optimal_qty_f = ft.TextField(
+            label=self.t("packaging.field.optimal_qty", "Оптимум, шт"),
+            value=str(packaging.get("optimal_qty") or ""),
+            border_radius=10,
+            keyboard_type=ft.KeyboardType.NUMBER,
+            width=235,
+        )
         notes_f = ft.TextField(
             label=self.t("packaging.field.notes", "Нотатки по доробці"),
             value=packaging.get("notes", ""),
@@ -1235,8 +1322,24 @@ class PackagingView:
             multiline=True,
         )
 
-        # Отримуємо список регіонів
-        region_rows = _regions_for(default_company_id)
+        # Отримуємо список регіонів -- лише ті, де є доступ до категорій
+        # (регіон і категорія — окремі гранти; без категорії нема куди
+        # прив'язати нове пакування). У режимі редагування поточний
+        # збережений регіон лишається в списку, навіть якщо доступ до нього
+        # відтоді забрали, щоб не зламати перегляд/збереження існуючого.
+        region_rows_all = _regions_for(default_company_id)
+        _existing_region_id = str((packaging or {}).get("region_id") or "").strip()
+        region_rows = [
+            r
+            for r in region_rows_all
+            if isinstance(r, dict)
+            and (
+                str(r.get("id") or "") == _existing_region_id
+                or self.db.manager_has_category_access_in_region(
+                    self.manager_id, self.company_id, r.get("id")
+                )
+            )
+        ]
         region_options = [
             ft.dropdown.Option(key=r.get("id"), text=r.get("name"))
             for r in region_rows
@@ -1328,6 +1431,8 @@ class PackagingView:
             name_f.value = data_match.get("name", name_f.value)
             size_f.value = data_match.get("size", "")
             price_f.value = data_match.get("price", "")
+            min_qty_f.value = str(data_match.get("min_qty") or "")
+            optimal_qty_f.value = str(data_match.get("optimal_qty") or "")
             notes_f.value = data_match.get("notes", "")
             region_f.value = data_match.get("region_id")
             supplier_f.value = data_match.get("supplier_id")
@@ -1617,6 +1722,8 @@ class PackagingView:
                     "name": name_f.value,
                     "size": size_f.value,
                     "price": price_f.value,
+                    "min_qty": min_qty_f.value,
+                    "optimal_qty": optimal_qty_f.value,
                     "image": _existing_urls[0] or None,
                     "image2": _existing_urls[1] or None,
                     "image3": _existing_urls[2] or None,
@@ -1697,7 +1804,7 @@ class PackagingView:
 
         def _pkg_edit_help(_):
             from views.help_utils import show_modal_help
-            _pg = self.content_area.page if self.content_area else None
+            _pg = self._page()
             show_modal_help(_pg, self.t("packaging.dlg.edit_title", "Пакування"), [
                 self.t("packaging.edit_help.step1", "1. Введіть назву пакування."),
                 self.t("packaging.edit_help.step2", "2. Вкажіть розмір і ціну."),
@@ -1723,6 +1830,7 @@ class PackagingView:
                     quick_fill_btn,
                     size_f,
                     price_f,
+                    ft.Row([min_qty_f, optimal_qty_f], spacing=10),
                     ft.Row([region_f, supplier_f], spacing=10),
                     pkg_user_selection_section,
                     currency_display,
@@ -1769,7 +1877,7 @@ class PackagingView:
                 save_btn,
             ],
         )
-        self.content_area.page.show_dialog(dlg)
+        return dlg
 
     def archive_packaging(self, p_id):
         if self.read_only_subordinate:
@@ -1816,7 +1924,7 @@ class PackagingView:
 
     def _show_help(self) -> None:
         from views.help_utils import show_modal_help
-        page = self.content_area.page if self.content_area else None
+        page = self._page()
         show_modal_help(page, self.t("packaging.help.title", "Пакування"), [
             self.t("packaging.help.desc", "Каталог пакувальних матеріалів: назва, розмір, ціна, постачальник, фото."),
             (self.t("packaging.help.steps_title", "Як користуватись"), None),

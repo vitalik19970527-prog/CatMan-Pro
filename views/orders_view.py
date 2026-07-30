@@ -3823,6 +3823,8 @@ class OrdersView:
                         padding=ft.padding.symmetric(horizontal=5, vertical=1),
                     )
                 )
+        if is_mobile(self._page()):
+            return make_scrollable_chip_row(chips, spacing=3)
         return ft.Row(chips, spacing=3, wrap=True)
 
     def _orders_facets(self) -> dict:
@@ -4016,28 +4018,18 @@ class OrdersView:
         self._update_payment_summary_panel()
         self._schedule_full_rerender()
 
-    def _order_receive_date_iso(
+    def _effective_production_term_days(
         self,
         order: dict,
         products_by_id: dict | None = None,
-        delivery_by_id: dict | None = None,
-    ) -> str:
+    ) -> float | None:
+        """Production term used for both the Оплата/Отримання date estimates
+        AND their highlighting: MAX across the order's line items (a shared
+        shipment waits for the slowest item), falling back to the manager's
+        own default production-term setting ("Своя назва" / unlinked items)
+        when no line item carries a production_term_days value at all."""
         if not isinstance(order, dict):
-            return ""
-        order_date = str(order.get("order_date") or "")[:10]
-        if not order_date:
-            return ""
-
-        date_shipped = str(order.get("date_shipped") or "")[:10]
-        date_wh = str(order.get("date_arrived_warehouse") or "")[:10]
-
-        dur_prod = _safe_float(order.get("duration_production_days"), None)
-        if dur_prod is None:
-            dur_prod = _days_between(order_date, date_shipped)
-        dur_deliv = _safe_float(order.get("duration_transit_days"), None)
-        if dur_deliv is None:
-            dur_deliv = _days_between(date_shipped, date_wh)
-
+            return None
         prod_term_days = None
         items = order.get("items") if isinstance(order.get("items"), list) else []
         for it in items:
@@ -4087,20 +4079,55 @@ class OrdersView:
                             prod_term_days = p_days
             except Exception:
                 pass
-            if prod_term_days is None:
-                prod_term_days = _safe_float(dur_prod, None)
+        return prod_term_days
 
-        deliv_term_days = None
+    def _effective_delivery_term_days(
+        self,
+        order: dict,
+        delivery_by_id: dict | None = None,
+    ) -> float | None:
+        """Delivery term used for both the Отримання date estimate AND its
+        highlighting: the order's own delivery method's configured term."""
+        if not isinstance(order, dict):
+            return None
         did = str(order.get("delivery_type_id") or "").strip()
         drow = (delivery_by_id or {}).get(did)
-        if isinstance(drow, dict):
-            deliv_term_days = _safe_float(
-                drow.get("effective_delivery_term_days"), None
-            )
-            if deliv_term_days is None:
-                deliv_term_days = _safe_float(drow.get("base_delivery_term_days"), None)
-            if deliv_term_days is None:
-                deliv_term_days = _safe_float(drow.get("delivery_term_days"), None)
+        if not isinstance(drow, dict):
+            return None
+        deliv_term_days = _safe_float(drow.get("effective_delivery_term_days"), None)
+        if deliv_term_days is None:
+            deliv_term_days = _safe_float(drow.get("base_delivery_term_days"), None)
+        if deliv_term_days is None:
+            deliv_term_days = _safe_float(drow.get("delivery_term_days"), None)
+        return deliv_term_days
+
+    def _order_receive_date_iso(
+        self,
+        order: dict,
+        products_by_id: dict | None = None,
+        delivery_by_id: dict | None = None,
+    ) -> str:
+        if not isinstance(order, dict):
+            return ""
+        order_date = str(order.get("order_date") or "")[:10]
+        if not order_date:
+            return ""
+
+        date_shipped = str(order.get("date_shipped") or "")[:10]
+        date_wh = str(order.get("date_arrived_warehouse") or "")[:10]
+
+        dur_prod = _safe_float(order.get("duration_production_days"), None)
+        if dur_prod is None:
+            dur_prod = _days_between(order_date, date_shipped)
+        dur_deliv = _safe_float(order.get("duration_transit_days"), None)
+        if dur_deliv is None:
+            dur_deliv = _days_between(date_shipped, date_wh)
+
+        prod_term_days = self._effective_production_term_days(order, products_by_id)
+        if prod_term_days is None:
+            prod_term_days = _safe_float(dur_prod, None)
+
+        deliv_term_days = self._effective_delivery_term_days(order, delivery_by_id)
         if deliv_term_days is None:
             deliv_term_days = _safe_float(dur_deliv, None)
 
@@ -4136,57 +4163,9 @@ class OrdersView:
         if dur_prod is None:
             dur_prod = _days_between(order_date, date_shipped)
 
-        prod_term_days = None
-        items = order.get("items") if isinstance(order.get("items"), list) else []
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            pid = str(it.get("product_id") or "").strip()
-            prod = (products_by_id or {}).get(pid) if pid else None
-            p_days = _safe_float((prod or {}).get("production_term_days"), None)
-            if p_days is None:
-                continue
-            p_days = max(0.0, float(p_days))
-            prod_term_days = (
-                p_days if prod_term_days is None else max(float(prod_term_days), p_days)
-            )
+        prod_term_days = self._effective_production_term_days(order, products_by_id)
         if prod_term_days is None:
-            try:
-                mgr_id = self.user_data.get("id") or ""
-                if mgr_id:
-                    payload = getattr(self, "_mgr_workspace_state_cache", None) or {}
-                    store = (
-                        payload.get("manager_production_term")
-                        if isinstance(payload.get("manager_production_term"), dict)
-                        else {}
-                    )
-                    company_key = (
-                        str(
-                            order.get("company_id") or self.company_id or "no_company"
-                        ).strip()
-                        or "no_company"
-                    )
-                    region_key = (
-                        str(
-                            order.get("region_id")
-                            or self._effective_region_id()
-                            or "all"
-                        ).strip()
-                        or "all"
-                    )
-                    p_row = (
-                        store.get(f"{company_key}:{region_key}")
-                        if isinstance(store, dict)
-                        else None
-                    )
-                    if isinstance(p_row, dict):
-                        p_days = _safe_float(p_row.get("days"), None)
-                        if p_days is not None:
-                            prod_term_days = p_days
-            except Exception:
-                pass
-            if prod_term_days is None:
-                prod_term_days = _safe_float(dur_prod, None)
+            prod_term_days = _safe_float(dur_prod, None)
 
         if prod_term_days is None:
             return ""
@@ -4954,6 +4933,30 @@ class OrdersView:
         with contextlib.suppress(Exception):
             host.update()
 
+    def _compute_filter_bar_signature(self) -> tuple:
+        facets = self._orders_facets()
+        all_orders = self._orders or []
+
+        def _dict_sig(d):
+            return tuple(sorted((str(k), str(v)) for k, v in (d or {}).items()))
+
+        return (
+            self._filter_supplier_id,
+            self._filter_category_id,
+            self._filter_delivery_id,
+            self._filter_product_id,
+            self._filter_receive_month,
+            self._filter_accept_month,
+            self._filter_payment_month,
+            _dict_sig(facets.get("suppliers")),
+            _dict_sig(facets.get("categories")),
+            _dict_sig(facets.get("deliveries")),
+            _dict_sig(facets.get("products")),
+            tuple(self._receive_month_options(all_orders)),
+            tuple(self._accept_month_options(all_orders)),
+            tuple(self._payment_month_options(all_orders)),
+        )
+
     def _build_filter_bar(self) -> ft.Container:
         filter_width = 108
         button_text_size = 8  # compact size
@@ -5229,17 +5232,25 @@ class OrdersView:
             product_dd,
         ]
 
-        return ft.Container(
-            border_radius=6,
-            bgcolor=_ALT,
-            padding=ft.padding.symmetric(horizontal=4, vertical=0),
-            content=ft.Row(
+        if is_mobile(self._page()):
+            filter_bar_content = make_scrollable_chip_row(
+                all_controls,
+                spacing=4,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            )
+        else:
+            filter_bar_content = ft.Row(
                 all_controls,
                 spacing=4,
                 wrap=True,
                 alignment=ft.MainAxisAlignment.START,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            ),
+            )
+        return ft.Container(
+            border_radius=6,
+            bgcolor=_ALT,
+            padding=ft.padding.symmetric(horizontal=4, vertical=0),
+            content=filter_bar_content,
         )
 
     def _refresh_filter_dropdown_options(self):
@@ -5250,7 +5261,23 @@ class OrdersView:
                 has_page = False
             if not has_page:
                 return
-            self._filter_bar_host.controls = [self._build_filter_bar()]
+            # Rebuilding recreates every PopupMenuButton filter dropdown,
+            # destroying its live Flutter overlay and force-closing any menu
+            # the user currently has open — this ran on every background
+            # sync/pulse-triggered full rerender, which looked like filter
+            # lists "collapsing on their own" after a while. Reuse the
+            # existing container unless something it actually displays
+            # (selection, facet/option lists) changed since last build.
+            sig = self._compute_filter_bar_signature()
+            if (
+                getattr(self, "_filter_bar_signature", None) == sig
+                and getattr(self, "_last_filter_bar_container", None) is not None
+            ):
+                return
+            container = self._build_filter_bar()
+            self._filter_bar_signature = sig
+            self._last_filter_bar_container = container
+            self._filter_bar_host.controls = [container]
             with contextlib.suppress(Exception):
                 self._filter_bar_host.update()
             return
@@ -7913,25 +7940,18 @@ class OrdersView:
         draft_order["duration_transit_days"] = dur_deliv
         draft_order["duration_warehouse_days"] = dur_acc
 
-        _prod_term_values = []
-        for _it in draft_items:
-            _it_pid = str((_it or {}).get("product_id") or "").strip()
-            _it_prod = products_by_id.get(_it_pid) or {}
-            _it_term = _safe_float(_it_prod.get("production_term_days"), None)
-            if _it_term is not None:
-                _prod_term_values.append(_it_term)
-        avg_production_term_days = (
-            sum(_prod_term_values) / len(_prod_term_values)
-            if _prod_term_values
-            else None
+        # Same MAX-across-items (+ "Своя назва" workspace-default fallback)
+        # term used for the Оплата/Отримання date estimates — so the
+        # highlighting here always agrees with what those columns show.
+        effective_production_term_days = self._effective_production_term_days(
+            draft_order, products_by_id
         )
         dur_prod_bg = row_bg
-        if dur_prod is not None and avg_production_term_days is not None:
-            # Actual production time longer than the average for these
-            # products (per their product-card "Термін виробництва") → red;
-            # at or under average → green.
+        if dur_prod is not None and effective_production_term_days is not None:
+            # Actual production time longer than the term → red;
+            # at or under the term → green.
             dur_prod_bg = (
-                "#FEE2E2" if dur_prod > avg_production_term_days else "#DCFCE7"
+                "#FEE2E2" if dur_prod > effective_production_term_days else "#DCFCE7"
             )
 
         if order_date and date_1c:
@@ -8044,6 +8064,32 @@ class OrdersView:
             deviation_days = int((ref_dt - receive_dt).days)
             deviation_text = f"{deviation_days} дн."
             deviation_bg = "#DBEAFE" if deviation_days <= 0 else "#FEE2E2"
+
+        # "Терм дос-ки" (dur_deliv) highlighting: actual "На складі" date vs.
+        # the planned one (Дата + Термін виробництва + Термін доставки) — the
+        # same production/delivery terms used for Оплата/Отримання above, so
+        # all four columns agree with each other.
+        effective_delivery_term_days = self._effective_delivery_term_days(
+            draft_order, delivery_by_id
+        )
+        dur_deliv_bg = row_bg
+        if (
+            effective_production_term_days is not None
+            and effective_delivery_term_days is not None
+        ):
+            _wh_dt = _safe_iso_date(date_wh)
+            if _wh_dt is not None:
+                _planned_wh_dt = _safe_iso_date(
+                    _add_days_to_iso(
+                        order_date,
+                        float(effective_production_term_days)
+                        + float(effective_delivery_term_days),
+                    )
+                )
+                if _planned_wh_dt is not None:
+                    dur_deliv_bg = (
+                        "#FEE2E2" if _wh_dt > _planned_wh_dt else "#DCFCE7"
+                    )
 
         def _current_tariff_usd() -> tuple[float | None, str, float | None, str]:
             t = _safe_float(draft_order.get("delivery_price_snapshot"), None)
@@ -9532,7 +9578,10 @@ class OrdersView:
         )
         dur_deliv_cell = (
             _cell(
-                "dur_deliv", f"{dur_deliv} дн." if dur_deliv is not None else "", size=8
+                "dur_deliv",
+                f"{dur_deliv} дн." if dur_deliv is not None else "",
+                size=8,
+                bgcolor=dur_deliv_bg,
             )
             if "dur_deliv" in by_key
             else ft.Container()
@@ -11427,6 +11476,17 @@ class OrdersView:
         if not page:
             self._end_header_busy(busy_token)
             return
+        if not getattr(self, "_region_create_allowed", True):
+            self._show_snack(
+                self.t(
+                    "products.no_category_access",
+                    "Немає доступу до категорій у цьому регіоні — лише перегляд",
+                ),
+                "orange",
+            )
+            self._quick_add_dlg_open = False
+            self._end_header_busy(busy_token)
+            return
 
         pending_new_order_id = str(uuid.uuid4())
         save_state = {"in_progress": False}
@@ -11957,6 +12017,16 @@ class OrdersView:
             return
 
         is_new = existing is None
+        if is_new and not getattr(self, "_region_create_allowed", True):
+            self._show_snack(
+                self.t(
+                    "products.no_category_access",
+                    "Немає доступу до категорій у цьому регіоні — лише перегляд",
+                ),
+                "orange",
+            )
+            self._end_header_busy(busy_token)
+            return
         row = existing if isinstance(existing, dict) else {}
         new_dialog_order_id = str(row.get("id") or str(uuid.uuid4())).strip()
         save_state = {"in_progress": False}
@@ -12506,7 +12576,25 @@ class OrdersView:
             items_col.controls.append(ctrl)
 
         if not is_new:
-            _load_products_for_supplier(str(supplier_dd.value or "").strip())
+            _edit_supplier_id = str(supplier_dd.value or "").strip()
+            _edit_products_cached = any(
+                str((p or {}).get("supplier_id") or "").strip() == _edit_supplier_id
+                for p in (self._products or [])
+            )
+            if _edit_products_cached or (
+                getattr(self, "_no_db_after_ready", False)
+                and getattr(self, "_orders_ui_ready", False)
+            ):
+                _load_products_for_supplier(_edit_supplier_id)
+            else:
+                # Not cached — avoid a blocking self.db.get_products() call
+                # during dialog construction (this is what made editing an
+                # order noticeably slow to open, especially on Android with
+                # its higher DB round-trip latency). The deferred async
+                # refresh below (needs_initial_lookup_fetch) already reloads
+                # products for the current supplier once the dialog is
+                # already visible.
+                needs_initial_lookup_fetch = True
 
         for it in existing_items:
             _add_item_ctrl(it)
@@ -13548,6 +13636,17 @@ class OrdersView:
         ).strip()
         subtitle = f"{reg_lbl} · {mgr}" if mgr else reg_lbl
 
+        # Region access and category access are separate grants -- creating
+        # an order is tied to a supplier under a category/level, so a
+        # manager with zero category ownership in the current region
+        # should only browse, not add.
+        try:
+            self._region_create_allowed = self.db.manager_has_category_access_in_region(
+                self.manager_id, self.company_id, self._effective_region_id()
+            )
+        except Exception:
+            self._region_create_allowed = True
+
         open_order_btn = ft.FilledButton(
             self.t("orders.dlg.add_title", "Додати замовлення"),
             icon=ft.Icons.ADD,
@@ -13556,7 +13655,7 @@ class OrdersView:
                 text_style=ft.TextStyle(size=11),
                 padding=ft.padding.symmetric(horizontal=8, vertical=2),
             ),
-            visible=not self.is_read_only,
+            visible=not self.is_read_only and self._region_create_allowed,
         )
         quick_add_btn = ft.OutlinedButton(
             "Швидко",
@@ -13566,7 +13665,7 @@ class OrdersView:
                 text_style=ft.TextStyle(size=11),
                 padding=ft.padding.symmetric(horizontal=8, vertical=2),
             ),
-            visible=not self.is_read_only,
+            visible=not self.is_read_only and self._region_create_allowed,
         )
         table_btn = ft.OutlinedButton(
             "Таблиця",
@@ -13769,8 +13868,12 @@ class OrdersView:
         self._sticky_header_row = header_row
         self._sticky_counters_bar = counters_bar
 
+        _initial_filter_bar = self._build_filter_bar()
+        with contextlib.suppress(Exception):
+            self._filter_bar_signature = self._compute_filter_bar_signature()
+        self._last_filter_bar_container = _initial_filter_bar
         self._filter_bar_host = ft.Column(
-            [self._build_filter_bar()],
+            [_initial_filter_bar],
             spacing=0,
         )
         self._payment_summary_panel_host = ft.Column([], spacing=0, tight=True)

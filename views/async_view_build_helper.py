@@ -9,6 +9,37 @@ import i18n
 from logger import logger as _abh_logger
 
 
+def safe_update_with_retry(control, page, retry_delay: float = 0.15) -> None:
+    """Call control.update(), retrying once shortly after if it fails.
+
+    Flet's Control.page raises RuntimeError (not just returning None) when
+    the control isn't attached to the page yet -- so `control.update()`
+    inside a bare `with contextlib.suppress(Exception):` (the pattern most
+    load_X()/refresh functions used) can silently do nothing at all when it
+    races a concurrent full-page re-render/re-attach. That leaves freshly
+    saved data sitting correctly in `control.controls` but never actually
+    painted until something else (routinely: a full app restart) forces a
+    fresh render -- exactly the "created it but it doesn't show up" class
+    of report. Retrying once after a short delay covers the transient
+    attach race without needing to touch every call site's own logic.
+    """
+    try:
+        control.update()
+        return
+    except Exception:
+        pass
+    if page is None:
+        return
+
+    async def _retry():
+        await asyncio.sleep(max(0.0, float(retry_delay or 0.0)))
+        with contextlib.suppress(Exception):
+            control.update()
+
+    with contextlib.suppress(Exception):
+        page.run_task(_retry)
+
+
 def create_orders_header_loading_indicator(visible: bool = True) -> ft.Row:
     """Create the same header loading indicator style used in Orders view."""
     return ft.Row(

@@ -95,6 +95,7 @@ class PaymentsView:
         self.region_id = (
             (active_region or "").strip() if isinstance(active_region, str) else ""
         )
+        self._region_create_allowed = True
         self.is_read_only = bool(self.user_data.get("subordinate_view_readonly", False))
         # "Загальні" mode
         self._general_mode: bool = bool(self.user_data.get("general_mode", False))
@@ -111,6 +112,13 @@ class PaymentsView:
         self._shared_orders_map: dict[str, dict] = (
             _som if isinstance(_som, dict) else {}
         )
+
+        # content_area is independently scrollable (ADAPTIVE) but had no
+        # on_scroll tracking anywhere in this view, so a page-level scroll
+        # was silently lost on every rebuild (background ref-data sync,
+        # status/payment/delivery change, ...) — the page visibly snapped
+        # back to the top each time.
+        self._content_area_offset: float = 0.0
 
         # Data
         self._suppliers: list = []
@@ -197,6 +205,17 @@ class PaymentsView:
             if r.get("id") and r.get("name")
         }
 
+        try:
+            _eff_rid_init = self._effective_region_id()
+            if _eff_rid_init:
+                self._region_create_allowed = self.db.manager_has_category_access_in_region(
+                    self.manager_id, self.company_id, _eff_rid_init
+                )
+        except Exception:
+            self._region_create_allowed = True
+        if not self._region_create_allowed:
+            self.is_read_only = True
+
         self._load_table_layout_state()
 
     # ─────────────────────────────── helpers ────────────────────────────────
@@ -244,6 +263,28 @@ class PaymentsView:
             return None
         except Exception:
             return None
+
+    def _on_content_area_scroll(self, e) -> None:
+        try:
+            self._content_area_offset = float(getattr(e, "pixels", 0) or 0)
+        except Exception:
+            pass
+
+    def _restore_content_area_scroll(self) -> None:
+        offset = max(0.0, float(getattr(self, "_content_area_offset", 0.0) or 0.0))
+        if offset <= 0:
+            return
+        pg = self._page()
+        if not pg or not hasattr(pg, "run_task"):
+            return
+
+        async def _restore():
+            await asyncio.sleep(0.06)
+            with contextlib.suppress(Exception):
+                await self.content_area.scroll_to(offset=offset, duration=0)
+
+        with contextlib.suppress(Exception):
+            pg.run_task(_restore)
 
     def _active_manager_id(self) -> str:
         return str(
@@ -2331,27 +2372,36 @@ class PaymentsView:
                     debt_chip = _sum_chip(self.t("payments.stat.orders_sum", "Сума замовлень:"), debt_by_ccy, _ALT, _TEXT)
                     paid_chip = _sum_chip(self.t("payments.stat.paid_sum", "Сплачено:"), paid_by_ccy, _OK_BG, _OK_T)
 
+                    _bal_row_controls = [
+                        ft.Text(
+                            self.t("payments.balance.total", "Загальний баланс"),
+                            size=11,
+                            weight=ft.FontWeight.W_700,
+                            color=_CHIP_T,
+                        ),
+                        *boxes,
+                        hint_box,
+                        ft.Container(width=12),
+                        debt_chip,
+                        paid_chip,
+                    ]
                     bal_row = ft.Container(
                         padding=ft.padding.only(left=2, right=2, top=2, bottom=6),
                         border=ft.border.only(bottom=ft.BorderSide(1, _HDR)),
-                        content=ft.Row(
-                            [
-                                ft.Text(
-                                    self.t("payments.balance.total", "Загальний баланс"),
-                                    size=11,
-                                    weight=ft.FontWeight.W_700,
-                                    color=_CHIP_T,
-                                ),
-                                *boxes,
-                                hint_box,
-                                ft.Container(width=12),
-                                debt_chip,
-                                paid_chip,
-                            ],
-                            spacing=8,
-                            vertical_alignment=ft.CrossAxisAlignment.STRETCH,
-                            wrap=True,
-                            run_spacing=4,
+                        content=(
+                            make_scrollable_chip_row(
+                                _bal_row_controls,
+                                spacing=8,
+                                vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+                            )
+                            if is_mobile(page)
+                            else ft.Row(
+                                _bal_row_controls,
+                                spacing=8,
+                                vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+                                wrap=True,
+                                run_spacing=4,
+                            )
                         ),
                     )
                     stk_controls.append(bal_row)
@@ -3583,34 +3633,43 @@ class PaymentsView:
                 boxes.append(_bal_box_s(f"{_fmt_money(amt)} {_ccy_sym(target_ccy)}"))
             return boxes
 
+        _totals_row_controls = [
+            ft.Text(
+                self.t("payments.balance.total", "Загальний баланс"),
+                size=12,
+                weight=ft.FontWeight.W_700,
+                color=_CHIP_T,
+            ),
+            *_make_bal_boxes(small=False),
+            ft.Container(
+                width=_SCW,
+                padding=_SPD,
+                bgcolor=_tot_bg,
+                border_radius=8,
+                alignment=_SA,
+                content=ft.Text(
+                    _tot_hint,
+                    size=10,
+                    weight=ft.FontWeight.W_700,
+                    color=_tot_fg,
+                    text_align=ft.TextAlign.CENTER,
+                ),
+            ),
+        ]
         totals_row = ft.Container(
-            content=ft.Row(
-                [
-                    ft.Text(
-                        self.t("payments.balance.total", "Загальний баланс"),
-                        size=12,
-                        weight=ft.FontWeight.W_700,
-                        color=_CHIP_T,
-                    ),
-                    *_make_bal_boxes(small=False),
-                    ft.Container(
-                        width=_SCW,
-                        padding=_SPD,
-                        bgcolor=_tot_bg,
-                        border_radius=8,
-                        alignment=_SA,
-                        content=ft.Text(
-                            _tot_hint,
-                            size=10,
-                            weight=ft.FontWeight.W_700,
-                            color=_tot_fg,
-                            text_align=ft.TextAlign.CENTER,
-                        ),
-                    ),
-                ],
-                spacing=8,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                wrap=True,
+            content=(
+                make_scrollable_chip_row(
+                    _totals_row_controls,
+                    spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                )
+                if is_mobile(self._page())
+                else ft.Row(
+                    _totals_row_controls,
+                    spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    wrap=True,
+                )
             ),
             padding=ft.padding.symmetric(horizontal=6, vertical=8),
             border=ft.border.only(bottom=ft.BorderSide(1, _HDR)),
@@ -3818,9 +3877,11 @@ class PaymentsView:
             preserved.append(c)
         with contextlib.suppress(Exception):
             self.content_area.scroll = ft.ScrollMode.ADAPTIVE
+            self.content_area.on_scroll = self._on_content_area_scroll
         self.content_area.controls[:] = preserved + flat_controls
         with contextlib.suppress(Exception):
             self.content_area.update()
+        self._restore_content_area_scroll()
 
     def _build_agg_flat_sections(self) -> list:
         """Build a flat combined table from _agg_orders_cache filtered by _counter_payment_filter."""
@@ -4213,11 +4274,13 @@ class PaymentsView:
         tree_controls = await asyncio.to_thread(self._sync_build_tree)
         with contextlib.suppress(Exception):
             self.content_area.scroll = ft.ScrollMode.ADAPTIVE
+            self.content_area.on_scroll = self._on_content_area_scroll
         self.content_area.controls[:] = tree_controls
         with contextlib.suppress(Exception):
             self.content_area.update()
         with contextlib.suppress(Exception):
             self._update_balance_display()  # also updates sticky totals bar + counters
+        self._restore_content_area_scroll()
 
     async def _async_initial_load(self) -> None:
         page = self._page()
@@ -5294,6 +5357,7 @@ class PaymentsView:
             ],
             spacing=8,
             wrap=True,
+            visible=not self.is_read_only,
         )
 
         # Table layout (compact like "Замовлення")
@@ -5576,7 +5640,35 @@ class PaymentsView:
             text_color: str = _TEXT,
             h: int = ROW_H,
             get_style=None,
+            cache_key: str | None = None,
         ):
+            # Rebuilding this PopupMenuButton on every background refresh
+            # (ref-data/pulse checks) recreates its Flutter overlay and
+            # force-closes it if the user has it open — reuse the same
+            # control across renders unless something it actually displays
+            # (selected value, width, colors, or the option list) changed.
+            if cache_key:
+                if not isinstance(getattr(self, "_pm_popup_cache", None), dict):
+                    self._pm_popup_cache = {}
+                _opt_sig = tuple(
+                    (
+                        str(getattr(opt, "key", "") or ""),
+                        str(getattr(opt, "text", "") or ""),
+                    )
+                    for opt in (options or [])
+                )
+                _pm_sig = (
+                    str(value or ""),
+                    int(w or 0),
+                    str(bgc),
+                    str(text_color),
+                    int(h),
+                    _opt_sig,
+                )
+                _pm_cached = self._pm_popup_cache.get(cache_key)
+                if _pm_cached is not None and _pm_cached[0] == _pm_sig:
+                    return _pm_cached[1]
+
             opt_map = {
                 str(getattr(opt, "key", "") or ""): str(
                     getattr(opt, "text", "") or getattr(opt, "key", "") or ""
@@ -5630,13 +5722,16 @@ class PaymentsView:
                 for opt in (options or [])
             ]
 
-            return ft.PopupMenuButton(
+            control = ft.PopupMenuButton(
                 icon=None,
                 items=menu_items,
                 menu_position=ft.PopupMenuPosition.UNDER,
                 disabled=self.is_read_only,
                 content=cell,
             )
+            if cache_key:
+                self._pm_popup_cache[cache_key] = (_pm_sig, control)
+            return control
 
         header_row = ft.Row(
             [
@@ -6039,6 +6134,7 @@ class PaymentsView:
 
                     self._persist_order_async(o, rebuild_after=True)
 
+                _row_oid = str(o.get("id") or "").strip()
                 st_ctrl = _pm(
                     current_status,
                     _wcol.get("status", 0),
@@ -6051,6 +6147,7 @@ class PaymentsView:
                     ),
                     bgc=bg,
                     h=row_h,
+                    cache_key=f"status:{_row_oid}" if _row_oid else None,
                 )
                 pay_bg, pay_fg = self._payment_colors(current_payment)
                 pay_ctrl = _pm(
@@ -6067,6 +6164,7 @@ class PaymentsView:
                     text_color=pay_fg,
                     h=row_h,
                     get_style=lambda k: self._payment_colors(k),
+                    cache_key=f"payment:{_row_oid}" if _row_oid else None,
                 )
                 del_ctrl = (
                     _pm(
@@ -6082,6 +6180,7 @@ class PaymentsView:
                         bgc=bg,
                         allow_wrap=True,
                         h=row_h,
+                        cache_key=f"delivery:{_row_oid}" if _row_oid else None,
                     )
                     if _delivery_opts()
                     else _text_cell(
@@ -6103,6 +6202,7 @@ class PaymentsView:
                     ),
                     bgc=bg,
                     h=row_h,
+                    cache_key=f"product:{_row_oid}" if _row_oid else None,
                 )
 
                 def _on_field_blur(_e, c=_commit):
@@ -7051,6 +7151,7 @@ class PaymentsView:
                         ],
                         spacing=0,
                         alignment=ft.MainAxisAlignment.CENTER,
+                        visible=not self.is_read_only,
                     )
                     if sid_sett
                     else ft.Text("", size=11)
@@ -7496,6 +7597,8 @@ class PaymentsView:
     def _open_opening_balance_dialog(
         self, supplier_id: str, supplier_name: str, supplier_ccy: str
     ):
+        if self.is_read_only:
+            return
         page = self._page()
         if not page:
             return
@@ -7622,6 +7725,8 @@ class PaymentsView:
         orders_for_supplier: list,
         existing: dict | None = None,
     ):
+        if self.is_read_only:
+            return
         page = self._page()
         if not page:
             return
@@ -8447,6 +8552,7 @@ class PaymentsView:
 
         try:
             self.content_area.scroll = ft.ScrollMode.ADAPTIVE
+            self.content_area.on_scroll = self._on_content_area_scroll
             self.content_area.spacing = 0
             self.content_area.padding = 0
         except Exception:
@@ -8685,24 +8791,33 @@ class PaymentsView:
         )
         self._sticky_totals_bar_suffix_ref = [_sep_ctrl, _debt_chip, _paid_chip]
 
-        _stb_inner_row = ft.Row(
-            controls=[
-                ft.Text(
-                    self.t("payments.balance.total", "Загальний баланс"),
-                    size=11,
-                    weight=ft.FontWeight.W_700,
-                    color=_CHIP_T,
-                ),
-                self._totals_bal_container,
-                self._totals_bal_hint_container,
-                _sep_ctrl,
-                _debt_chip,
-                _paid_chip,
-            ],
-            spacing=8,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            wrap=True,
-            run_spacing=4,
+        _stb_row_controls = [
+            ft.Text(
+                self.t("payments.balance.total", "Загальний баланс"),
+                size=11,
+                weight=ft.FontWeight.W_700,
+                color=_CHIP_T,
+            ),
+            self._totals_bal_container,
+            self._totals_bal_hint_container,
+            _sep_ctrl,
+            _debt_chip,
+            _paid_chip,
+        ]
+        _stb_inner_row = (
+            make_scrollable_chip_row(
+                _stb_row_controls,
+                spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            )
+            if is_mobile(page)
+            else ft.Row(
+                _stb_row_controls,
+                spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                wrap=True,
+                run_spacing=4,
+            )
         )
         self._sticky_totals_bar_row_ref = _stb_inner_row
 
@@ -8734,6 +8849,7 @@ class PaymentsView:
 
         with contextlib.suppress(Exception):
             self.content_area.update()
+        self._restore_content_area_scroll()
 
         # When instantiated as a sub-view by build_region_sections, the dashboard
         # does NOT call _defer_view_initial_load — so we self-schedule the async

@@ -9,6 +9,7 @@ import fx_rates
 import i18n
 from views.async_view_build_helper import (
     create_orders_header_loading_indicator, run_async_build)
+from views.mobile_layout_helpers import is_mobile
 from views.number_format import safe_float
 
 # Sync-pulse scopes covering every table the Home KPI grid reads from.
@@ -274,6 +275,12 @@ class HomeView:
         # and always reads fresh data from DB (set by resume() before each rebuild).
         self._force_fresh_from_db: bool = False
 
+    def _page(self):
+        try:
+            return self.content_area.page if self.content_area else None
+        except RuntimeError:
+            return None
+
     def stop(self):
         """Invalidate any scheduled/in-flight async build for fast tab switching."""
         self._async_build_token = int(getattr(self, "_async_build_token", 0) or 0) + 1
@@ -292,7 +299,7 @@ class HomeView:
         """
         if not self.content_area:
             return
-        pg = getattr(self.content_area, "page", None)
+        pg = self._page()
         if not pg:
             return
 
@@ -1258,6 +1265,7 @@ class HomeView:
 
             probe_manager_id = self.manager_id
             ps, visible_product_ids = self._packaging_probe_for_manager(probe_manager_id)
+            boxes_by_id = ps._packaging_boxes_by_id or {}
 
             yellow = 0
             red = 0
@@ -1294,10 +1302,18 @@ class HomeView:
                 eff_pack, eff_goods = ps._packaging_journal_final_stocks(
                     opening, rows, wo_rows
                 )
-                total_stock_v = float(eff_pack) + float(eff_goods)
-                if total_stock_v < 2500.0:
+                # Compare against finished-goods stock (тов.пост.) only — a pile
+                # of empty boxes (пак.пост.) must not mask an actual shortage of
+                # already-packed product.
+                total_stock_v = float(eff_goods)
+                pack_row = boxes_by_id.get(str(ctx.get("packaging_id") or "").strip()) or {}
+                # Per-packaging thresholds (шт) — fall back to the old
+                # company-wide 2500/5000 defaults when not set on this packaging.
+                min_qty = self._safe_float(pack_row.get("min_qty"), 2500.0) or 2500.0
+                optimal_qty = self._safe_float(pack_row.get("optimal_qty"), 5000.0) or 5000.0
+                if total_stock_v < min_qty:
                     red += 1
-                elif 2500.0 < total_stock_v < 5000.0:
+                elif total_stock_v < optimal_qty:
                     yellow += 1
             return yellow, red
         except Exception:
@@ -1307,6 +1323,7 @@ class HomeView:
         """Return (yellow, red) packaging low-stock counts for a single manager."""
         try:
             ps, visible_product_ids = self._packaging_probe_for_manager(probe_manager_id)
+            boxes_by_id = ps._packaging_boxes_by_id or {}
             yellow, red = 0, 0
             for ctx in ps._packaging_items or []:
                 if not isinstance(ctx, dict):
@@ -1341,10 +1358,14 @@ class HomeView:
                 eff_pack, eff_goods = ps._packaging_journal_final_stocks(
                     opening, rows, wo_rows
                 )
-                total_v = float(eff_pack) + float(eff_goods)
-                if total_v < 2500.0:
+                # Finished-goods stock only — see _count_packaging_low_stock.
+                total_v = float(eff_goods)
+                pack_row = boxes_by_id.get(str(ctx.get("packaging_id") or "").strip()) or {}
+                min_qty = self._safe_float(pack_row.get("min_qty"), 2500.0) or 2500.0
+                optimal_qty = self._safe_float(pack_row.get("optimal_qty"), 5000.0) or 5000.0
+                if total_v < min_qty:
                     red += 1
-                elif 2500.0 < total_v < 5000.0:
+                elif total_v < optimal_qty:
                     yellow += 1
             return yellow, red
         except Exception:
@@ -3128,11 +3149,19 @@ class HomeView:
         """KPI card for media plan schedule end date."""
         days_val = max(0, int(days_until_end or 0))
         num_color = _ERR if days_val <= 4 else _OK
+        # Same mobile-only shrink as _kpi_card — keep it in step with the
+        # other tiles sharing this row so cards don't mismatch in size.
+        _is_mob = is_mobile(self._page())
+        _card_size = 74 if _is_mob else self.KPI_CARD_SIZE
+        _pad = 5 if _is_mob else 8
+        _label_size = 9 if _is_mob else self.KPI_LABEL_SIZE
+        _count_size = 13 if _is_mob else self.KPI_COUNT_SIZE
+        _meta_size = 9 if _is_mob else self.KPI_META_SIZE
         body = ft.Column(
             [
                 ft.Text(
                     "Медіаплан",
-                    size=self.KPI_LABEL_SIZE,
+                    size=_label_size,
                     weight="bold",
                     text_align=ft.TextAlign.CENTER,
                     no_wrap=False,
@@ -3140,14 +3169,14 @@ class HomeView:
                 ),
                 ft.Text(
                     str(days_val),
-                    size=self.KPI_COUNT_SIZE,
+                    size=_count_size,
                     weight="bold",
                     color=num_color,
                     text_align=ft.TextAlign.CENTER,
                 ),
                 ft.Text(
                     "дн. до кінця",
-                    size=self.KPI_META_SIZE,
+                    size=_meta_size,
                     color="grey700",
                     text_align=ft.TextAlign.CENTER,
                     no_wrap=False,
@@ -3159,12 +3188,12 @@ class HomeView:
         )
 
         return ft.Container(
-            width=self.KPI_CARD_SIZE,
-            height=self.KPI_CARD_SIZE,
+            width=_card_size,
+            height=_card_size,
             border=ft.border.all(1, _BORDER),
             border_radius=10,
             bgcolor=_PANEL,
-            padding=8,
+            padding=_pad,
             ink=True,
             on_click=on_click,
             content=body,
@@ -3923,7 +3952,7 @@ class HomeView:
             t("home.help.c_series", "Серій не дороблених — незавершені серії, ще не перенесені в картку товару."),
             t("home.help.c_margin", "Категорій без цільової рент. — категорії без заданого % цільової рентабельності."),
             t("home.help.c_supplier_debt", "Постачальників товару — кількість з невирівняним балансом (🔴 ми винні, 🟡 постачальник винен)."),
-            t("home.help.c_pack_stock", "Залишок Пакування — позиції з критично малим залишком (🟡 < 5 000 шт, 🔴 < 2 500 шт)."),
+            t("home.help.c_pack_stock", "Залишок Пакування — позиції з малим залишком відносно свого мінімуму/оптимуму, заданих у картці пакування (🟡 нижче оптимуму, 🔴 нижче мінімуму)."),
             t("home.help.c_pack_debt", "Постачальників пакування — постачальники пакування з невирівняним балансом."),
             t("home.help.c_suppliers_empty", "Постачальників без даних — постачальники з незаповненими обов'язковими полями."),
             t("home.help.c_media", "Медіа-план — записи, що давно не оновлювались (🟡 14–30 дн, 🔴 30+ дн)."),
@@ -5630,20 +5659,30 @@ class HomeView:
             count_color = _OK if value > 0 else _MUTED
         else:
             count_color = _ERR if value > 0 else _OK
+        # On a narrow phone the desktop 100x100 card size only fits 3 per
+        # row, stacking a page full of KPI tiles into a very tall column.
+        # Shrinking the tile (and its text) on mobile only lets more of them
+        # share a row without touching desktop sizing at all.
+        _is_mob = is_mobile(self._page())
+        _card_size = 74 if _is_mob else self.KPI_CARD_SIZE
+        _pad = 5 if _is_mob else 8
+        _label_size = 9 if _is_mob else self.KPI_LABEL_SIZE
+        _count_size = 13 if _is_mob else self.KPI_COUNT_SIZE
+        _meta_size = 9 if _is_mob else self.KPI_META_SIZE
         return ft.Container(
-            width=self.KPI_CARD_SIZE,
-            height=self.KPI_CARD_SIZE,
+            width=_card_size,
+            height=_card_size,
             border=ft.border.all(1, _BORDER),
             border_radius=10,
             bgcolor=_PANEL,
-            padding=8,
+            padding=_pad,
             ink=True,
             on_click=on_click,
             content=ft.Column(
                 [
                     ft.Text(
                         title,
-                        size=self.KPI_LABEL_SIZE,
+                        size=_label_size,
                         weight="bold",
                         color=_INK,
                         text_align=ft.TextAlign.CENTER,
@@ -5652,14 +5691,14 @@ class HomeView:
                     ),
                     ft.Text(
                         str(count),
-                        size=self.KPI_COUNT_SIZE,
+                        size=_count_size,
                         weight="bold",
                         color=count_color,
                         text_align=ft.TextAlign.CENTER,
                     ),
                     ft.Text(
                         meta,
-                        size=self.KPI_META_SIZE,
+                        size=_meta_size,
                         color=_MUTED,
                         text_align=ft.TextAlign.CENTER,
                         no_wrap=False,
@@ -5672,9 +5711,10 @@ class HomeView:
         )
 
     def _kpi_group_divider(self):
+        _card_size = 74 if is_mobile(self._page()) else self.KPI_CARD_SIZE
         return ft.Container(
             width=2,
-            height=max(72, int(self.KPI_CARD_SIZE) - 16),
+            height=max(54, int(_card_size) - 16),
             bgcolor=_SKY_BG,
             border_radius=999,
             margin=ft.margin.symmetric(horizontal=2, vertical=8),
@@ -5865,20 +5905,26 @@ class HomeView:
     ):
         yellow_color = _OK if int(yellow_count or 0) == 0 else _WARN2
         red_color = _OK if int(red_count or 0) == 0 else _ERR
+        _is_mob = is_mobile(self._page())
+        _card_size = 74 if _is_mob else self.KPI_CARD_SIZE
+        _pad = 5 if _is_mob else 8
+        _label_size = 9 if _is_mob else self.KPI_LABEL_SIZE
+        _count_size = 13 if _is_mob else self.KPI_COUNT_SIZE
+        _meta_size = 9 if _is_mob else self.KPI_META_SIZE
         return ft.Container(
-            width=self.KPI_CARD_SIZE,
-            height=self.KPI_CARD_SIZE,
+            width=_card_size,
+            height=_card_size,
             border=ft.border.all(1, _BORDER),
             border_radius=10,
             bgcolor=_PANEL,
-            padding=8,
+            padding=_pad,
             ink=True,
             on_click=on_click,
             content=ft.Column(
                 [
                     ft.Text(
                         title,
-                        size=self.KPI_LABEL_SIZE,
+                        size=_label_size,
                         weight="bold",
                         text_align=ft.TextAlign.CENTER,
                         no_wrap=False,
@@ -5888,19 +5934,19 @@ class HomeView:
                         [
                             ft.Text(
                                 str(int(yellow_count or 0)),
-                                size=self.KPI_COUNT_SIZE,
+                                size=_count_size,
                                 weight="bold",
                                 color=yellow_color,
                             ),
                             ft.Text(
                                 "/",
-                                size=self.KPI_COUNT_SIZE,
+                                size=_count_size,
                                 weight="bold",
                                 color=_MUTED2,
                             ),
                             ft.Text(
                                 str(int(red_count or 0)),
-                                size=self.KPI_COUNT_SIZE,
+                                size=_count_size,
                                 weight="bold",
                                 color=red_color,
                             ),
@@ -5910,7 +5956,7 @@ class HomeView:
                     ),
                     ft.Text(
                         meta,
-                        size=self.KPI_META_SIZE,
+                        size=_meta_size,
                         color="grey700",
                         text_align=ft.TextAlign.CENTER,
                         no_wrap=False,
@@ -6089,7 +6135,7 @@ class HomeView:
         from views.mobile_layout_helpers import (is_mobile,
                                                  make_scrollable_chip_row)
 
-        if is_mobile(self.content_area.page):
+        if is_mobile(self._page()):
             # A wrap=True row of one checkbox per subordinate can grow to
             # several lines on a narrow phone screen, pushing the KPI grid
             # far down. Keep it a single horizontally-scrollable line instead.
@@ -6168,7 +6214,7 @@ class HomeView:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _build_sync(self):
-        if not self.content_area or not getattr(self.content_area, "page", None):
+        if not self.content_area or not self._page():
             return
 
         self._header_loading_indicator = create_orders_header_loading_indicator(
@@ -6528,7 +6574,7 @@ class HomeView:
                             "Залишок Пакування шт.",
                             packaging_low_yellow_count,
                             packaging_low_red_count,
-                            "<5к/<2.5к",
+                            "<Опт/<Мін",
                             _open_packaging_low_stock,
                         )
                     ]
@@ -6829,7 +6875,7 @@ class HomeView:
         _ERR_DK = _th["warn"]
         _WARN2 = _th["warn"]
         _SOFT = _th["soft"]
-        if not self.content_area or not getattr(self.content_area, "page", None):
+        if not self.content_area or not self._page():
             return
 
         def _guarded_build_sync():
@@ -6889,7 +6935,7 @@ class HomeView:
 
         run_async_build(
             self,
-            page=self.content_area.page,
+            page=self._page(),
             build_sync=_guarded_build_sync,
             # silent=True (background live-sync refresh): skip the stub that
             # clears content_area to a spinner — _guarded_build_sync still

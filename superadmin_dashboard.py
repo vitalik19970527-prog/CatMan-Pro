@@ -4808,17 +4808,26 @@ class SuperAdminDashboard:
             value=update_policy.get("min_required", ""),
         )
         update_url_f = ft.TextField(
-            label="Посилання на оновлення (.exe або .apk)",
-            hint_text="https://github.com/<owner>/<repo>/releases/latest/download/CatManPro-windows.exe",
+            label="Посилання на оновлення Windows (.exe)",
+            hint_text="https://github.com/<owner>/<repo>/releases/latest/download/CatManPro-Setup.exe",
             border_radius=10,
             value=update_policy.get("download_url", "")
             or (Config.UPDATE_DOWNLOAD_URL or ""),
         )
+        update_url_android_f = ft.TextField(
+            label="Посилання на оновлення Android (.apk)",
+            hint_text="https://github.com/<owner>/<repo>/releases/latest/download/CatManPro-android.apk",
+            border_radius=10,
+            value=update_policy.get("download_url_android", ""),
+        )
 
         def save_updates(_):
             ok = self.db.set_app_update_policy(
-                (min_version_f.value or "").strip(),
-                (update_url_f.value or "").strip(),
+                {
+                    "min_required": (min_version_f.value or "").strip(),
+                    "download_url": (update_url_f.value or "").strip(),
+                    "download_url_android": (update_url_android_f.value or "").strip(),
+                }
             )
             if ok:
                 self._show_saved_dialog("Політику оновлення застосунку збережено.")
@@ -4841,6 +4850,7 @@ class SuperAdminDashboard:
                                 ),
                                 min_version_f,
                                 update_url_f,
+                                update_url_android_f,
                                 ft.FilledButton(
                                     "Зберегти політику оновлення",
                                     icon=ft.Icons.SAVE,

@@ -11,6 +11,7 @@ from datetime import datetime
 import flet as ft
 
 import i18n
+from views.async_view_build_helper import safe_update_with_retry
 from views.mobile_layout_helpers import is_mobile
 
 _MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
@@ -151,7 +152,10 @@ class FilesView:
     # ------------------------------------------------------------------ #
 
     def _page(self):
-        pg = getattr(self.content_area, "page", None)
+        try:
+            pg = self.content_area.page if self.content_area else None
+        except RuntimeError:
+            pg = None
         if pg is not None:
             self._page_ref = pg
         return self._page_ref or pg
@@ -503,8 +507,7 @@ class FilesView:
         else:
             col.controls.extend(self._build_tree_items(roots, depth=0))
 
-        with contextlib.suppress(Exception):
-            col.update()
+        safe_update_with_retry(col, self._page())
 
     def _build_tree_items(self, folders: list[dict], depth: int) -> list[ft.Control]:
         items = []
@@ -957,8 +960,7 @@ class FilesView:
         col.controls.clear()
 
         if not self._sel_folder_id:
-            with contextlib.suppress(Exception):
-                col.update()
+            safe_update_with_retry(col, self._page())
             return
 
         if not self._files:
@@ -1029,8 +1031,7 @@ class FilesView:
             for f in self._sorted_files():
                 col.controls.append(self._build_file_row(f))
 
-        with contextlib.suppress(Exception):
-            col.update()
+        safe_update_with_retry(col, self._page())
 
     def _actions_width(self) -> int:
         # Open + Save = 2 buttons; + Rename + Move + Delete for own user

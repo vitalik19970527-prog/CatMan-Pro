@@ -276,6 +276,45 @@ def build_stock_filter_bar(view) -> ft.Container:
     )
 
 
+def _compute_stock_filter_signature(view) -> tuple:
+    return (
+        view._stock_filter_query,
+        view._stock_filter_supplier,
+        view._stock_filter_category,
+        tuple(
+            sorted(
+                (str(s.get("id")), str(s.get("name") or ""))
+                for s in (view._suppliers or [])
+                if isinstance(s, dict) and s.get("id")
+            )
+        ),
+        tuple(
+            sorted(
+                (str(c.get("id")), str(c.get("name") or ""))
+                for c in (view._categories or [])
+                if isinstance(c, dict) and c.get("id")
+            )
+        ),
+    )
+
+
+def _get_or_build_stock_filter_bar(view) -> ft.Container:
+    """Rebuilding the filter bar recreates its PopupMenuButton controls,
+    which destroys their live Flutter overlay and force-closes any filter
+    menu the user currently has open — this used to run on every
+    background reference-data refresh and even on every keystroke in the
+    search box, since _render() rebuilds the whole page. Reuse the
+    existing control unless something it actually displays (search text,
+    selection, or the supplier/category option lists) changed."""
+    sig = _compute_stock_filter_signature(view)
+    existing = getattr(view, "_sticky_filter_bar_ref", None)
+    if existing is not None and getattr(view, "_stock_filter_bar_signature", None) == sig:
+        return existing
+    control = build_stock_filter_bar(view)
+    view._stock_filter_bar_signature = sig
+    return control
+
+
 def set_stock_query(view, value: str) -> None:
     view._stock_filter_query = str(value or "")
     view._render()
@@ -293,7 +332,6 @@ def build_stock_table(
     view,
     rows: list,
     stock_ccy: str = "USD",
-    orders_unit_cost_ccy: str = "USD",
     new_price_ccy: str = "USD",
     include_header_row: bool = True,
 ) -> dict:
@@ -324,7 +362,6 @@ def build_stock_table(
     ]
 
     stock_ccy = str(stock_ccy or "USD").upper().strip() or "USD"
-    orders_unit_cost_ccy = str(orders_unit_cost_ccy or "USD").upper().strip() or "USD"
     new_price_ccy = str(new_price_ccy or "USD").upper().strip() or "USD"
     # Accumulate across multiple build_stock_table() calls within one _render()
     # (main table + the archive section's own mini-table) instead of clobbering
@@ -377,9 +414,19 @@ def build_stock_table(
             view.t("stock.col.unit_cost_stock", "С/В склад {ccy}").format(ccy=view._currency_symbol(stock_ccy)),
             70,
         ),
+        "orders_qty": (
+            "orders_qty",
+            view.t("stock.col.orders_qty", "К-сть замовл."),
+            80,
+        ),
+        "orders_amount": (
+            "orders_amount",
+            view.t("stock.col.orders_amount", "Вартість замовл. {ccy}").format(ccy=view._currency_symbol(stock_ccy)),
+            100,
+        ),
         "orders_unit_cost": (
             "orders_unit_cost",
-            view.t("stock.col.orders_unit_cost", "С/В замовл. {ccy}").format(ccy=view._currency_symbol(orders_unit_cost_ccy)),
+            view.t("stock.col.orders_unit_cost", "С/В замовл. {ccy}").format(ccy=view._currency_symbol(stock_ccy)),
             80,
         ),
         "unit_cost_blended": (
@@ -746,13 +793,55 @@ def build_stock_table(
         )
         base_cells_by_key["unit_cost_stock"] = _ucs_cell
 
-        # orders_unit_cost — зберігаємо ref для in-place оновлення при зміні С/В Замовлення
+        # orders_qty — кількість у замовленнях (Готові/в дорозі/на складі,
+        # ще не прийняті і не на виробництві), для зваженого С/В $.
+        _oq_w = width_by_key.get("orders_qty", 0)
+        _oq_txt = ft.Text(
+            view._fmt_money(_safe_float(row.get("orders_qty"), None)),
+            size=text_size,
+            text_align=text_align,
+            color=_TEXT,
+            no_wrap=(not wrap),
+            max_lines=(None if wrap else 1),
+            overflow=ft.TextOverflow.VISIBLE if wrap else ft.TextOverflow.ELLIPSIS,
+        )
+        _oq_cell = ft.Container(
+            width=_oq_w,
+            height=row_height,
+            bgcolor=bg,
+            border=ft.border.all(1, _BORDER),
+            alignment=cell_align,
+            content=_oq_txt,
+            visible=bool(int(_oq_w or 0) > 0),
+        )
+        base_cells_by_key["orders_qty"] = _oq_cell
+
+        # orders_amount — вартість тих самих замовлень, у валюті складу.
+        _oa_w = width_by_key.get("orders_amount", 0)
+        _oa_txt = ft.Text(
+            view._fmt_money(_safe_float(row.get("orders_amount_ccy"), None), stock_ccy),
+            size=text_size,
+            text_align=text_align,
+            color=_TEXT,
+            no_wrap=(not wrap),
+            max_lines=(None if wrap else 1),
+            overflow=ft.TextOverflow.VISIBLE if wrap else ft.TextOverflow.ELLIPSIS,
+        )
+        _oa_cell = ft.Container(
+            width=_oa_w,
+            height=row_height,
+            bgcolor=bg,
+            border=ft.border.all(1, _BORDER),
+            alignment=cell_align,
+            content=_oa_txt,
+            visible=bool(int(_oa_w or 0) > 0),
+        )
+        base_cells_by_key["orders_amount"] = _oa_cell
+
+        # orders_unit_cost — середня С/В по тих самих замовленнях (Вартість/Кількість).
         _ouc_w = width_by_key.get("orders_unit_cost", 0)
-        _ouc_bg = _SOFT_P if not row.get("has_active_orders", True) else bg
         _ouc_txt = ft.Text(
-            view._fmt_money(
-                _safe_float(row.get("orders_unit_cost"), None), orders_unit_cost_ccy
-            ),
+            view._fmt_money(_safe_float(row.get("orders_unit_cost"), None), stock_ccy),
             size=text_size,
             text_align=text_align,
             color=_TEXT,
@@ -763,7 +852,7 @@ def build_stock_table(
         _ouc_cell = ft.Container(
             width=_ouc_w,
             height=row_height,
-            bgcolor=_ouc_bg,
+            bgcolor=bg,
             border=ft.border.all(1, _BORDER),
             alignment=cell_align,
             content=_ouc_txt,
@@ -785,7 +874,7 @@ def build_stock_table(
         _ucb_cell = ft.Container(
             width=_ucb_w,
             height=row_height,
-            bgcolor=bg,
+            bgcolor=_CHIP_BG,
             border=ft.border.all(1, _BORDER),
             alignment=cell_align,
             content=_ucb_txt,
@@ -804,8 +893,6 @@ def build_stock_table(
                 "amount_cell": amount_cell,
                 "amount_tf": amount_tf,
                 "row_bg": bg,
-                "orders_unit_cost_txt": _ouc_txt,
-                "orders_unit_cost_ccy": orders_unit_cost_ccy,
             }
 
         for key, _label, _w in base_columns:

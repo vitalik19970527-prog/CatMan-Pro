@@ -39,6 +39,7 @@ from gsm_parser_runner import (FIELD_CATALOG, LAST_PARSE_LOG_PATH,
                                run_gsm_parser)
 from logger import logger
 from views.gsm_parser_view import GsmParserView
+from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
 
 # ---------------------------------------------------------------------------
 # GSM Parser Telegram report — message editor constants
@@ -132,8 +133,14 @@ class ExtensionsView:
         self._log_tab_visible = False
         self._gsm_perms_company_id = None
 
+    def _page(self):
+        try:
+            return self.content_area.page if self.content_area else None
+        except RuntimeError:
+            return None
+
     def _show_help(self) -> None:
-        page = self.content_area.page if self.content_area else None
+        page = self._page()
         if not page:
             return
         from views.help_utils import show_modal_help
@@ -147,7 +154,7 @@ class ExtensionsView:
         ])
 
     def _show_snack(self, text, color):
-        page = self.content_area.page if self.content_area else None
+        page = self._page()
         if not page:
             return
         page.snack_bar = ft.SnackBar(
@@ -159,7 +166,7 @@ class ExtensionsView:
         page.update()
 
     def _show_saved_dialog(self, message: str = "Збережено"):
-        page = self.content_area.page if self.content_area else None
+        page = self._page()
         if not page:
             return
         dlg = ft.AlertDialog(
@@ -548,7 +555,7 @@ class ExtensionsView:
                 with contextlib.suppress(Exception):
                     self._gsm_outer_col.update()
 
-                page = self.content_area.page if self.content_area else None
+                page = self._page()
                 if page and tab_key not in self._gsm_tab_built:
                     page.run_task(self._load_gsm_tab_async, tab_key)
                 elif tab_key == "logs" and hasattr(self, "_log_refresh_fn"):
@@ -648,7 +655,7 @@ class ExtensionsView:
             self._gsm_outer_col.update()
 
         if key == "logs" and hasattr(self, "_log_refresh_fn"):
-            page = self.content_area.page if self.content_area else None
+            page = self._page()
             if page:
                 page.run_task(self._log_auto_refresh_task)
 
@@ -668,7 +675,7 @@ class ExtensionsView:
             if self._log_refresh_fn:
                 self._log_refresh_fn()
             try:
-                page = self.content_area.page if self.content_area else None
+                page = self._page()
             except Exception:
                 # content_area was detached from the page (e.g. account
                 # switch/tab navigation) — nothing left to refresh, stop.
@@ -1199,7 +1206,7 @@ class ExtensionsView:
                             page.update()
 
                 try:
-                    if self.content_area and self.content_area.page:
+                    if self._page():
                         self.build()
                 except Exception:
                     pass
@@ -1231,13 +1238,13 @@ class ExtensionsView:
                     state["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     _ov_show_done(ok, state["finished_at"])
                     try:
-                        if self.content_area and self.content_area.page:
+                        if self._page():
                             self.build()
                     except Exception:
                         pass
 
             def _handler(_):
-                page = self.content_area.page if self.content_area else None
+                page = self._page()
                 # Global double-launch guard
                 if page and getattr(page, "_parser_is_running", False):
                     self._show_snack("⚠️ Парсинг вже запущено! Дочекайтесь завершення.", ft.Colors.ORANGE_700)
@@ -1425,7 +1432,7 @@ class ExtensionsView:
                     pass
 
             crontab_text = "\n".join(crontab_lines) if crontab_lines else "# No times"
-            _page = self.content_area.page if self.content_area else None
+            _page = self._page()
 
             def _crontab_help(_):
                 from views.help_utils import show_modal_help
@@ -2708,7 +2715,14 @@ class ExtensionsView:
                         field_checks[f_key] = cb
                         check_ctrls.append(cb)
                     refs["field_checks"] = field_checks
-                    body = ft.Row(check_ctrls, wrap=True, spacing=4, run_spacing=0)
+                    if is_mobile(self._page()):
+                        body = make_scrollable_chip_row(
+                            check_ctrls, spacing=4, run_spacing=0
+                        )
+                    else:
+                        body = ft.Row(
+                            check_ctrls, wrap=True, spacing=4, run_spacing=0
+                        )
                     badge = ft.Container(
                         content=ft.Text(self.t("extensions.msg_editor.badge_card", "Картка пристрою"), size=10, color=ft.Colors.WHITE),
                         bgcolor=ft.Colors.TEAL_700, padding=ft.padding.symmetric(horizontal=8, vertical=3),
@@ -2858,7 +2872,7 @@ class ExtensionsView:
         app restart. Stops itself the moment the user navigates away."""
         if self._log_auto_refresh_running:
             return
-        page = self.content_area.page if self.content_area else None
+        page = self._page()
         if not page:
             return
         self._log_auto_refresh_running = True
@@ -3031,14 +3045,18 @@ class ExtensionsView:
                 ),
                 self._gsm_loading_bar_ref,
                 self._gsm_loading_status_ref,
-                ft.Row(tab_buttons, wrap=True, spacing=10, run_spacing=10),
+                (
+                    make_scrollable_chip_row(tab_buttons, spacing=10, run_spacing=10)
+                    if is_mobile(self._page())
+                    else ft.Row(tab_buttons, wrap=True, spacing=10, run_spacing=10)
+                ),
                 *self._gsm_tab_panels.values(),
             ],
             spacing=14,
             expand=True,
         )
 
-        page = self.content_area.page if self.content_area else None
+        page = self._page()
         if page:
             page.run_task(self._load_gsm_tab_async, self.gsm_detail_tab)
 
@@ -3128,7 +3146,7 @@ class ExtensionsView:
         else:
             self.content_area.controls.extend(self._build_admin_controls())
         try:
-            if self.content_area.page:
+            if self._page():
                 self.content_area.update()
         except Exception:
             pass

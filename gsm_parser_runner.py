@@ -566,6 +566,7 @@ def _upsert_device(
                 new_status = str(incoming_specs.get("status") or "")
                 is_now_on_sale = _status_is_on_sale(new_status, on_sale_status_prefixes)
                 ever_on_sale = bool(existing_specs.get("ek_ever_on_sale"))
+                _shops_appeared_suppress_reason = None
                 if is_now_on_sale and old_status.strip().lower() != new_status.strip().lower():
                     changes = max(changes, 1)
                 if is_now_on_sale:
@@ -583,6 +584,9 @@ def _upsert_device(
                             months = _ekat_months_since(date_added)
                             if months is not None and months > max_age_months:
                                 shops_appeared = False
+                                _shops_appeared_suppress_reason = (
+                                    f"listing too old: {months} months > {max_age_months}"
+                                )
                         if shops_appeared:
                             logger.info(
                                 "shops_appeared TRIGGER device_id=%s model=%s"
@@ -607,6 +611,32 @@ def _upsert_device(
                                 "",
                                 new_status,
                             )
+                    else:
+                        _shops_appeared_suppress_reason = "ek_ever_on_sale already true"
+                elif old_status.strip().lower() != new_status.strip().lower():
+                    _shops_appeared_suppress_reason = (
+                        f"status not recognized as on-sale (prefixes={on_sale_status_prefixes!r})"
+                    )
+                if _shops_appeared_suppress_reason and (
+                    old_status.strip().lower() != new_status.strip().lower()
+                    or bool(incoming_specs.get("shops_count"))
+                    != bool(existing_specs.get("shops_count"))
+                ):
+                    # Only every device whose status/shops_count actually
+                    # moved this run — cheap enough to always log, and turns
+                    # the next "TG fired but sidebar panel didn't show it"
+                    # report into an exact, traceable reason instead of
+                    # another dead end requiring a live DB investigation.
+                    logger.info(
+                        "shops_appeared SUPPRESSED device_id=%s model=%s reason=%s"
+                        " old_status=%r new_status=%r ever_on_sale=%s",
+                        device_id,
+                        str(existing.get("model_name") or payload.get("model_name") or ""),
+                        _shops_appeared_suppress_reason,
+                        old_status,
+                        new_status,
+                        ever_on_sale,
+                    )
 
             # Merge onto existing_specs instead of replacing wholesale — this
             # row's specs blob is shared across concerns: a GSM Arena rescrape
@@ -1674,12 +1704,22 @@ async def gsm_local_tg_flush_loop(db, is_permitted) -> None:
     `is_permitted` is a zero-arg callable re-checked every tick — pass one
     that returns True only for a superadmin session or a manager granted the
     "Запуск парсингу" GSM permission, so this loop doesn't send reports on
-    behalf of a session that couldn't launch the parser itself."""
+    behalf of a session that couldn't launch the parser itself.
+
+    Both `is_permitted()` and `_flush_due_telegram_notifications` do
+    synchronous DB calls (psycopg, blocking network I/O) — previously called
+    directly here on the main asyncio event loop thread. If the shared
+    connection ever needs a fresh TCP handshake/retry (idle timeout, VPN
+    blip, laptop sleep/resume), that blocks the ENTIRE app's event loop —
+    every click, every chart hover, every dialog close — for however long
+    the OS takes to notice the connection is stuck, observed as 1.5-2 minute
+    app-wide freezes every 3 minutes. Both now run via asyncio.to_thread so a
+    slow/stuck DB round trip only stalls this background tick, never the UI."""
     await asyncio.sleep(30)
     while True:
         try:
-            if is_permitted():
-                _flush_due_telegram_notifications(db, None)
+            if await asyncio.to_thread(is_permitted):
+                await asyncio.to_thread(_flush_due_telegram_notifications, db, None)
         except Exception:
             pass
         await asyncio.sleep(180)

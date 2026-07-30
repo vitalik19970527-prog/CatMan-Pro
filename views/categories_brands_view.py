@@ -126,6 +126,12 @@ class CategoriesBrandsView:
             len(self.regions_data),
         )
 
+    def _page(self):
+        try:
+            return self.content_area.page if self.content_area else None
+        except RuntimeError:
+            return None
+
     def _dialog_content_height(self, desired=560, min_height=260):
         try:
             page = self.content_area.page if self.content_area else None
@@ -492,7 +498,8 @@ class CategoriesBrandsView:
                         text_style=ft.TextStyle(size=11),
                         padding=ft.padding.symmetric(horizontal=8, vertical=2),
                     ),
-                    on_click=lambda _: self.show_category_dialog(),
+                    on_click=lambda _: self._get_page_safe()
+                    and self._get_page_safe().run_task(self.show_category_dialog),
                 )
             )
 
@@ -726,7 +733,8 @@ class CategoriesBrandsView:
                                     ft.OutlinedButton(
                                         self.t("categories.create_btn", "Створити категорію"),
                                         icon=ft.Icons.ADD,
-                                        on_click=lambda _: self.show_category_dialog(),
+                                        on_click=lambda _: self._get_page_safe()
+                                        and self._get_page_safe().run_task(self.show_category_dialog),
                                         visible=(
                                             not self.superadmin_explicit_mode
                                             and self.can_manage_categories
@@ -1101,6 +1109,35 @@ class CategoriesBrandsView:
         else:
             self._show_snack("Не вдалося відновити рівень", "red")
 
+    def _confirm_force_delete_level_node(self, node_id, reason_msg):
+        def force_confirm(e):
+            ok, msg = self.db.delete_level_node(node_id, force=True)
+            self._close_dlg(force_dlg)
+            if ok:
+                self._expanded_node_ids.discard(node_id)
+                self._save_expanded_state()
+                self.load_categories()
+            self._show_snack(msg, "green" if ok else "red")
+
+        force_dlg = ft.AlertDialog(
+            title=ft.Text("Видалити разом з товарами?"),
+            content=ft.Text(
+                f"{reason_msg}\n\nЯкщо продовжити — товари, замовлення, розклад і "
+                "все пов'язане з ними в цьому рівні буде видалено НАЗАВЖДИ разом "
+                "з ним. Це неможливо скасувати."
+            ),
+            actions=[
+                ft.TextButton(
+                    self.t("common.cancel", "Скасувати"),
+                    on_click=lambda _: self._close_dlg(force_dlg),
+                ),
+                ft.TextButton(
+                    "Видалити все", on_click=force_confirm, style=ft.ButtonStyle(color="red")
+                ),
+            ],
+        )
+        self._show_dialog_safe(force_dlg)
+
     def _delete_level_node_and_refresh(self, node_id):
         if self.read_only_subordinate or not self.can_manage_categories:
             self._show_snack(
@@ -1111,6 +1148,9 @@ class CategoriesBrandsView:
         def confirm_delete(e):
             ok, msg = self.db.delete_level_node(node_id)
             self._close_dlg(confirm_dlg)
+            if not ok and "товар" in msg:
+                self._confirm_force_delete_level_node(node_id, msg)
+                return
             if ok:
                 self._expanded_node_ids.discard(node_id)
                 self._save_expanded_state()
@@ -1531,7 +1571,7 @@ class CategoriesBrandsView:
         )
         _cat_mode_text = ft.Text(mode_hint, size=11, color="grey700")
         _cat_order_text = ft.Text(order_hint, size=11, color="grey700")
-        if is_mobile(self.content_area.page if self.content_area else None):
+        if is_mobile(self._page()):
             # These 3 lines live in an expand=True Container squeezed by up
             # to 5 sibling buttons in a non-wrapping Row below — on a narrow
             # phone that can collapse to near-zero width and Flutter falls
@@ -1566,7 +1606,8 @@ class CategoriesBrandsView:
                 ft.TextButton(
                     "Редагувати",
                     icon=ft.Icons.EDIT,
-                    on_click=lambda _: self.show_category_dialog(category),
+                    on_click=lambda _, _c=category: self._get_page_safe()
+                    and self._get_page_safe().run_task(self.show_category_dialog, _c),
                     visible=not is_archived and not self.read_only_subordinate,
                 ),
                 ft.IconButton(
@@ -1839,7 +1880,13 @@ class CategoriesBrandsView:
         )
         self._show_dialog_safe(dlg)
 
-    def show_category_dialog(self, category=None):
+    async def show_category_dialog(self, category=None):
+        """Async so the edit-lock/target-margin/catalog-config DB round
+        trips below, and the rest of the dialog build further down, run off
+        the UI thread — see ProductsView.show_product_dialog for the same
+        fix and why it matters on Android. The fast, non-DB checks stay on
+        the main thread first (cheap, and _show_snack/page.update() must
+        not be called from the background builder thread)."""
         if self.read_only_subordinate:
             self._show_snack(self.t("packaging.subordinate_readonly", "У вкладці підлеглого доступний лише перегляд"), "orange")
             return
@@ -1859,7 +1906,8 @@ class CategoriesBrandsView:
         lock_released_ref = {"done": False}
         lock_heartbeat_task_ref = {"task": None}
         if is_edit:
-            lock_res = self.db.acquire_edit_lock(
+            lock_res = await asyncio.to_thread(
+                self.db.acquire_edit_lock,
                 target_company_id,
                 "categories",
                 category.get("id"),
@@ -1881,7 +1929,8 @@ class CategoriesBrandsView:
                     await asyncio.sleep(90)
                     if lock_released_ref["done"]:
                         return
-                    self.db.heartbeat_edit_lock(
+                    await asyncio.to_thread(
+                        self.db.heartbeat_edit_lock,
                         target_company_id,
                         "categories",
                         category.get("id"),
@@ -1902,14 +1951,39 @@ class CategoriesBrandsView:
             hb_task = lock_heartbeat_task_ref.get("task")
             if hb_task and not hb_task.done():
                 hb_task.cancel()
-            self.db.release_edit_lock(
-                target_company_id,
-                "categories",
-                category.get("id"),
-                self.manager_id,
-                edit_lock_token,
-            )
+            _pg_release = self._get_page_safe()
+            if _pg_release and hasattr(_pg_release, "run_task"):
+                async def _release_async():
+                    await asyncio.to_thread(
+                        self.db.release_edit_lock,
+                        target_company_id,
+                        "categories",
+                        category.get("id"),
+                        self.manager_id,
+                        edit_lock_token,
+                    )
+                with contextlib.suppress(Exception):
+                    _pg_release.run_task(_release_async)
+            else:
+                self.db.release_edit_lock(
+                    target_company_id,
+                    "categories",
+                    category.get("id"),
+                    self.manager_id,
+                    edit_lock_token,
+                )
 
+        dlg = await asyncio.to_thread(
+            self._build_category_dialog,
+            category,
+            is_edit,
+            target_company_id,
+            _release_lock_once,
+        )
+        if dlg is not None:
+            self._show_dialog_safe(dlg)
+
+    def _build_category_dialog(self, category, is_edit, target_company_id, _release_lock_once):
         can_rename_category = bool(self.can_manage_categories)
         name_f = ft.TextField(
             label=self.t("categories.field.category_name", "Назва категорії"),
@@ -2175,7 +2249,7 @@ class CategoriesBrandsView:
                 ft.ElevatedButton(self.t("common.save", "Зберегти"), on_click=save_click),
             ],
         )
-        self._show_dialog_safe(dlg)
+        return dlg
 
     def archive_category(self, category_id):
         if self.read_only_subordinate:
@@ -2225,6 +2299,35 @@ class CategoriesBrandsView:
         else:
             self._show_snack("Помилка відновлення категорії", "red")
 
+    def _confirm_force_delete_category(self, category_id, reason_msg):
+        def force_confirm(e):
+            ok, msg = self.db.delete_category(self.company_id, category_id, force=True)
+            self._close_dlg(force_dlg)
+            if ok:
+                self._expanded_category_ids.discard(category_id)
+                self._save_expanded_state()
+                self.load_categories()
+            self._show_snack(msg, "green" if ok else "red")
+
+        force_dlg = ft.AlertDialog(
+            title=ft.Text("Видалити разом з товарами?"),
+            content=ft.Text(
+                f"{reason_msg}\n\nЯкщо продовжити — товари, замовлення, розклад і "
+                "все пов'язане з ними в цій категорії буде видалено НАЗАВЖДИ "
+                "разом з нею. Це неможливо скасувати."
+            ),
+            actions=[
+                ft.TextButton(
+                    self.t("common.cancel", "Скасувати"),
+                    on_click=lambda _: self._close_dlg(force_dlg),
+                ),
+                ft.TextButton(
+                    "Видалити все", on_click=force_confirm, style=ft.ButtonStyle(color="red")
+                ),
+            ],
+        )
+        self._show_dialog_safe(force_dlg)
+
     def delete_category(self, category_id):
         if self.read_only_subordinate:
             self._show_snack(self.t("packaging.subordinate_readonly", "У вкладці підлеглого доступний лише перегляд"), "orange")
@@ -2238,6 +2341,9 @@ class CategoriesBrandsView:
         def confirm_delete(e):
             ok, msg = self.db.delete_category(self.company_id, category_id)
             self._close_dlg(confirm_dlg)
+            if not ok and "товар" in msg:
+                self._confirm_force_delete_category(category_id, msg)
+                return
             if ok:
                 self._expanded_category_ids.discard(category_id)
                 self._save_expanded_state()
@@ -2264,12 +2370,26 @@ class CategoriesBrandsView:
         )
         self._show_dialog_safe(confirm_dlg)
 
-    def show_brand_dialog(
+    async def show_brand_dialog(
         self, category_id, subcategory_id=None, series_id=None, brand=None
     ):
+        """Builds the (DB-heavy) brand dialog off the UI thread, then shows
+        it — see ProductsView.show_product_details_dialog for the same fix
+        and why it matters on Android. The fast, non-DB check stays on the
+        main thread first (_show_snack/page.update() must not be called
+        from the background builder thread)."""
         if self.read_only_subordinate:
             self._show_snack(self.t("packaging.subordinate_readonly", "У вкладці підлеглого доступний лише перегляд"), "orange")
             return
+        dlg = await asyncio.to_thread(
+            self._build_brand_dialog, category_id, subcategory_id, series_id, brand
+        )
+        if dlg is not None:
+            self._show_dialog_safe(dlg)
+
+    def _build_brand_dialog(
+        self, category_id, subcategory_id=None, series_id=None, brand=None
+    ):
 
         is_edit = isinstance(brand, dict)
         brand = brand or {}
@@ -2448,7 +2568,7 @@ class CategoriesBrandsView:
                 ft.FilledButton(self.t("common.save", "Зберегти"), on_click=save_click),
             ],
         )
-        self._show_dialog_safe(dlg)
+        return dlg
 
     def archive_subcategory(self, subcategory_id):
         if self.read_only_subordinate:

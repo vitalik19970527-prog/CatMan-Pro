@@ -14,6 +14,7 @@ import i18n
 from views import product_naming
 from views.async_view_build_helper import \
     create_orders_header_loading_indicator
+from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
 from views.number_format import row_text_matches
 
 _log = logging.getLogger("media_plan")
@@ -269,6 +270,12 @@ class MediaPlanView:
         self._h_offset: float = 0.0
         self._v_scroll_col = None
         self._h_scroll_row = None
+        # content_area itself is also independently scrollable (ADAPTIVE) but
+        # had no on_scroll tracking at all, so a page-level scroll (as
+        # opposed to the inner table body's own scroll) was silently lost on
+        # every _rebuild() — the page visibly snapped back to the top after
+        # any action that rebuilds (adding a date, background ref-data sync).
+        self._content_area_offset: float = 0.0
         # Per-entry ownership (for shared-access edit gating).
         self._owned_entry_ids: set[str] = set()
         self._initial_loaded: bool = False
@@ -291,6 +298,7 @@ class MediaPlanView:
         # Widget refs for in-place cell updates (avoid full rebuild on date change).
         self._month_cell_chips_col_refs: dict = {}
         self._left_row_days_chip_refs: dict = {}
+        self._date_chips_row_refs: dict = {}
 
     def _all_media_column_defs(self) -> list[tuple[str, str, str]]:
         return [
@@ -370,9 +378,21 @@ class MediaPlanView:
             .replace("/", "_")
             .replace("\\", "_")
         )
+        # v2: upsert_media_plan_entry never bumped the "media_plan" sync pulse
+        # (only delete did), so every v1 cache file's pulse_ts got stuck at
+        # whatever it was the first time it was ever written (often 0, from
+        # before any entries existed) and never looked stale again — real
+        # edits kept saving fine to the DB, but this file-cache silently kept
+        # serving that frozen-in-time snapshot on every later tab open,
+        # making months of real data disappear from view and, worse, causing
+        # already-existing rows to be (mis)treated as brand new on every
+        # session (duplicate DB entries — see _row_cell_key_base/_add_date).
+        # New filename so every pre-existing (poisoned) cache file is simply
+        # never found again -> forces one clean re-fetch from the DB for
+        # every user, without needing to touch each machine's cache by hand.
         return os.path.join(
             self._app_data_dir(),
-            f"media_plan_entries_{safe_cid}_{safe_mgr}_{safe_reg}.json",
+            f"media_plan_entries_v2_{safe_cid}_{safe_mgr}_{safe_reg}.json",
         )
 
     def _entries_scope_pulse(self) -> int:
@@ -2133,7 +2153,12 @@ class MediaPlanView:
             (i, ft.Checkbox(label=lbl, value=(i in self._allowed_post_weekdays)))
             for i, lbl in enumerate(_UA_DAYS)
         ]
-        days_row = ft.Row([cb for _, cb in _day_checks], spacing=4, wrap=True)
+        if is_mobile(pg):
+            days_row = make_scrollable_chip_row(
+                [cb for _, cb in _day_checks], spacing=4
+            )
+        else:
+            days_row = ft.Row([cb for _, cb in _day_checks], spacing=4, wrap=True)
 
         def _save_columns(_=None):
             if not selected:
@@ -2415,6 +2440,12 @@ class MediaPlanView:
 
     # ── Scroll tracking helpers ───────────────────────────────────────────────
 
+    def _on_content_area_scroll(self, e) -> None:
+        try:
+            self._content_area_offset = float(getattr(e, "pixels", 0) or 0)
+        except Exception:
+            pass
+
     def _on_v_scroll(self, e) -> None:
         try:
             self._v_offset = float(getattr(e, "pixels", 0) or 0)
@@ -2447,7 +2478,8 @@ class MediaPlanView:
     def _restore_scroll_after_rebuild(self) -> None:
         """Schedule async scroll restoration after the next page.update()."""
         sv, sh = self._v_offset, self._h_offset
-        if sv <= 0 and sh <= 0:
+        sc = float(getattr(self, "_content_area_offset", 0.0) or 0.0)
+        if sv <= 0 and sh <= 0 and sc <= 0:
             return
         pg = self._pg()
         if not pg or not hasattr(pg, "run_task"):
@@ -2456,6 +2488,11 @@ class MediaPlanView:
 
         async def _restore():
             await asyncio.sleep(0.06)
+            try:
+                if sc > 0:
+                    await self.content_area.scroll_to(offset=sc, duration=0)
+            except Exception:
+                pass
             try:
                 if body_col is not None and sv > 0:
                     await body_col.scroll_to(offset=sv, duration=0)
@@ -2562,6 +2599,14 @@ class MediaPlanView:
         if self._initial_loaded and not force:
             return
         self._region_id = self._resolve_region_id()
+        if self._region_id and not self.is_read_only:
+            try:
+                if not self.db.manager_has_category_access_in_region(
+                    self.manager_id, self.company_id, self._region_id
+                ):
+                    self.is_read_only = True
+            except Exception:
+                pass
         raw_products = (
             self.db.get_products(
                 self.company_id,
@@ -4052,7 +4097,45 @@ class MediaPlanView:
             ),
         )
 
-    def _date_chips(self, row: dict):
+    def _fast_refresh_date_chips(self, row: dict) -> None:
+        """In-place update of the «Дати» column chip row after a date is
+        added or removed — mirrors _fast_refresh_month_cell so this column
+        doesn't force a full-table rebuild (visible scroll-to-top flash) for
+        every single date edit."""
+        key_base = self._row_cell_key_base(row)
+        ref = self._date_chips_row_refs.get(key_base)
+        if ref is None:
+            self._schedule_rebuild()
+            return
+        ref.controls = self._build_date_chips_list(row)
+        try:
+            ref.update()
+        except Exception:
+            self._schedule_rebuild()
+            return
+
+        # Also refresh the «days since last post» chip in the left panel,
+        # same as _fast_refresh_month_cell.
+        days_ref = self._left_row_days_chip_refs.get(key_base)
+        if days_ref is not None:
+            dates = row.get("post_dates") or []
+            days_val = _days_ago(self._latest_date(dates))
+            stale_bucket = self._stale_bucket(days_val, dates)
+            if stale_bucket == "red":
+                d_bg, d_fg = _R_BG, _R_FG
+            elif stale_bucket == "yellow":
+                d_bg, d_fg = _Y_BG, _Y_FG
+            else:
+                d_bg, d_fg = _G_BG, _G_FG
+            days_lbl = f"{days_val} д." if days_val is not None else "-"
+            days_ref.bgcolor = d_bg
+            if isinstance(days_ref.content, ft.Text):
+                days_ref.content.value = days_lbl
+                days_ref.content.color = d_fg
+            with contextlib.suppress(Exception):
+                days_ref.update()
+
+    def _build_date_chips_list(self, row: dict) -> list:
         chips = []
         close_gap, latest_iso = self._latest_gap_less_than_14(
             row.get("post_dates") or []
@@ -4062,17 +4145,8 @@ class MediaPlanView:
             def _mk_remove(d=ds, r=row):
                 def _remove(e):
                     r["post_dates"] = [x for x in (r.get("post_dates") or []) if x != d]
-                    pg_d = self._pg()
                     self._save_row_async(r, reload_on_error=False)
-                    if pg_d and hasattr(pg_d, "run_task"):
-
-                        async def _do_rebuild():
-                            await asyncio.sleep(0.02)
-                            await asyncio.to_thread(self._rebuild, False)
-
-                        pg_d.run_task(_do_rebuild)
-                    else:
-                        self._rebuild(reload=False)
+                    self._fast_refresh_date_chips(r)
 
                 return _remove
 
@@ -4127,19 +4201,11 @@ class MediaPlanView:
                     existing.append(ds)
                     existing.sort(reverse=True)
                     r["post_dates"] = existing
-                # Close picker immediately, then schedule save + rebuild async.
+                # Close picker immediately, then save + fast in-place refresh.
                 with contextlib.suppress(Exception):
                     pg.close_dialog()
                 self._save_row_async(r, reload_on_error=False)
-                if pg and hasattr(pg, "run_task"):
-
-                    async def _do_rebuild():
-                        await asyncio.sleep(0.02)
-                        await asyncio.to_thread(self._rebuild, False)
-
-                    pg.run_task(_do_rebuild)
-                else:
-                    self._rebuild(reload=False)
+                self._fast_refresh_date_chips(r)
 
             def _picker_dismiss_add(_=None):
                 with contextlib.suppress(Exception):
@@ -4168,13 +4234,20 @@ class MediaPlanView:
             )
         )
 
-        return ft.Row(
-            chips,
+        return chips
+
+    def _date_chips(self, row: dict):
+        row_ctrl = ft.Row(
+            self._build_date_chips_list(row),
             spacing=0,
             wrap=False,
             scroll=ft.ScrollMode.ALWAYS,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
+        key_base = self._row_cell_key_base(row)
+        if key_base:
+            self._date_chips_row_refs[key_base] = row_ctrl
+        return row_ctrl
 
     def _build_sync(self):
         self._load_workspace_state()
@@ -5208,9 +5281,9 @@ class MediaPlanView:
                     no_wrap=True,
                 ),
             )
-            _eid_days = str(row.get("entry_id") or "").strip()
-            if _eid_days:
-                self._left_row_days_chip_refs[_eid_days] = _days_inner
+            _key_base_days = self._row_cell_key_base(row)
+            if _key_base_days:
+                self._left_row_days_chip_refs[_key_base_days] = _days_inner
             controls.append(
                 ft.Container(
                     width=days_w,
@@ -5364,6 +5437,21 @@ class MediaPlanView:
             ),
         )
 
+    def _row_cell_key_base(self, row: dict) -> str:
+        """Stable identity for a row's cached cell/chip widget refs.
+
+        entry_id is None for a not-yet-saved (virtual) row and only becomes a
+        real UUID after the FIRST date is saved — using entry_id as the cache
+        key meant every virtual row's ref was registered under an empty-string
+        key at render time, then looked up under its brand-new UUID right
+        after that first save, always missing and falling back to a full
+        table rebuild (visible scroll-to-top). product_ids stays the same
+        before and after that first save, so keying on it instead keeps the
+        cached ref valid across the whole row lifecycle.
+        """
+        pids = sorted(str(x) for x in (row.get("product_ids") or []) if x)
+        return ",".join(pids) or str(row.get("entry_id") or "").strip()
+
     def _build_month_chips(self, row: dict, month: date) -> list:
         """Build date chip widgets for one month cell. Used by both initial build and in-place refresh."""
         dates_in_month = self._dates_for_month(row.get("post_dates") or [], month)
@@ -5486,9 +5574,11 @@ class MediaPlanView:
         chips = self._build_month_chips(row, month)
         chips_col = ft.Column(chips, spacing=2, scroll=ft.ScrollMode.ADAPTIVE)
 
-        eid = str(row.get("entry_id") or "").strip()
-        if eid:
-            self._month_cell_chips_col_refs[f"{eid}:{_month_key(month)}"] = chips_col
+        _key_base = self._row_cell_key_base(row)
+        if _key_base:
+            self._month_cell_chips_col_refs[f"{_key_base}:{_month_key(month)}"] = (
+                chips_col
+            )
 
         bg = _ROW_INACTIVE if is_inactive else ("#F8FAFC" if is_past else "#FFFFFF")
         return ft.Container(
@@ -5502,8 +5592,10 @@ class MediaPlanView:
 
     def _fast_refresh_month_cell(self, row: dict, month: date) -> None:
         """In-place update of one month cell after a date is added or removed."""
-        eid = str(row.get("entry_id") or "").strip()
-        chips_col = self._month_cell_chips_col_refs.get(f"{eid}:{_month_key(month)}")
+        _key_base = self._row_cell_key_base(row)
+        chips_col = self._month_cell_chips_col_refs.get(
+            f"{_key_base}:{_month_key(month)}"
+        )
         if chips_col is None:
             self._schedule_rebuild()
             return
@@ -5526,7 +5618,7 @@ class MediaPlanView:
                 _container.update()
 
         # Also update the «days since last post» chip in the left panel.
-        days_ref = self._left_row_days_chip_refs.get(eid)
+        days_ref = self._left_row_days_chip_refs.get(_key_base)
         if days_ref is not None:
             dates = row.get("post_dates") or []
             days_val = _days_ago(self._latest_date(dates))
@@ -6256,6 +6348,7 @@ class MediaPlanView:
         self.content_area.controls.clear()
         with contextlib.suppress(Exception):
             self.content_area.scroll = ft.ScrollMode.ADAPTIVE
+            self.content_area.on_scroll = self._on_content_area_scroll
         self.content_area.controls.append(main_col)
         self.content_area.update()
 

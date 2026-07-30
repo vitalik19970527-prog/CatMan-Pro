@@ -307,6 +307,7 @@ _CACHE_LOAD_TS: datetime | None = None
 _CHART_RENDER_LOCK = threading.Lock()
 _CHART_RENDER_CACHE: dict[str, dict] = {}
 
+
 # Which size-group tab was last active in the compat-editing UI, per
 # (device_id, accessory_type) — purely a UI-memory convenience so the tab
 # doesn't jump back to the first size group every time a row is added/deleted.
@@ -1291,6 +1292,17 @@ class GsmParserView:
         try:
             devices, _, loading = _get_cache()
             if loading:
+                # Someone else's sync (e.g. the initial _background_load) is
+                # already running — wait for it instead of bailing out
+                # immediately, so a caller that gates a loading state on this
+                # coroutine (see _reveal_and_sync) doesn't reveal the table
+                # while that other sync is still actively changing it.
+                for _ in range(600):  # up to ~2 minutes
+                    await asyncio.sleep(0.2)
+                    _, _, loading = _get_cache()
+                    if not loading:
+                        break
+                self._refresh_table()
                 return
             if devices is None:
                 await self._background_load(page)
@@ -1872,7 +1884,16 @@ class GsmParserView:
             # over its trigger (so it kept covering the chart) and only shows
             # after its own hover delay — a fully custom panel is instant and
             # lives outside the plotted area.
-            fig.canvas.draw()
+            #
+            # savefig() already performs a full draw internally — a separate
+            # fig.canvas.draw() beforehand rendered the whole figure a SECOND
+            # time for nothing (measured: each pass costs ~50-90ms, so this
+            # was silently doubling every chart's render time). get_window_extent()
+            # / transData stay valid and pixel-identical whether read right
+            # after canvas.draw() or right after savefig() — verified byte-for-
+            # byte — so savefig() runs first and IS the one draw pass.
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png")
             FIG_W_PX = FIG_W_IN * CHART_DPI
             FIG_H_PX = FIG_H_IN * CHART_DPI
             DISPLAY_W = 560
@@ -1946,8 +1967,6 @@ class GsmParserView:
                         )
                     )
 
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png")
             plt.close(fig)
             buf.seek(0)
             b64 = base64.b64encode(buf.read()).decode()
@@ -2037,6 +2056,8 @@ class GsmParserView:
             ),
         )
 
+        _last_hover_day = {"value": data["last_date_str"]}
+
         def _update_all(day_str, lo, hi, sv):
             # Shared by hotspots on BOTH charts — hovering either the price
             # chart or the shops chart updates all three panel values for
@@ -2045,12 +2066,35 @@ class GsmParserView:
             def _h(e):
                 if not e.data:
                     return
+                # (Flet's page-wide auto-update-after-every-event is now
+                # disabled once, globally, in main.py — a per-handler
+                # ft.context.disable_auto_update() call here did NOT
+                # reliably stick, confirmed via a live py-spy dump still
+                # showing __auto_update() run right after this handler.)
+                # Flet's on_hover keeps firing while the mouse sits inside the
+                # SAME hotspot (not just once on entry) — without this guard
+                # every one of those repeats re-ran panel.update()'s full
+                # control-tree diff (measured multiple seconds each on a
+                # loaded page via py-spy), even though the panel's own values
+                # hadn't changed at all. Skip the update entirely when we're
+                # still on the date we already showed.
+                if _last_hover_day["value"] == day_str:
+                    return
+                _last_hover_day["value"] = day_str
                 hover_date.value = day_str
                 hover_min.value = _fmt_price(lo)
                 hover_max.value = _fmt_price(hi)
                 hover_shops.value = str(int(sv)) if sv is not None else "—"
-                with contextlib.suppress(Exception):
-                    panel.update()
+                # panel.update() diffs panel's WHOLE subtree (Container >
+                # Column > Text/Divider/Row[Container,Column[Text,Text]] x3)
+                # on every call — measured multiple seconds each via py-spy
+                # live process dumps, deep in Flet's own object_patch
+                # comparison, not our code. Updating just the 4 Text leaves
+                # that actually changed is a far smaller diff each (no
+                # children of their own) and is all that's visually needed.
+                for _t in (hover_date, hover_min, hover_max, hover_shops):
+                    with contextlib.suppress(Exception):
+                        _t.update()
 
             return _h
 
@@ -4672,6 +4716,34 @@ class GsmParserView:
             threading.Thread(target=_work, daemon=True).start()
 
         def _build_lazy_tab(key):
+            if key == "chart":
+                # Only safe to run synchronously (no background thread) when
+                # this device's detail (hist730 etc.) is ALREADY warm in
+                # _DETAIL_CACHE from the bulk sync — then it's pure in-memory
+                # lookups + a ~70-100ms matplotlib render, short enough to
+                # just block briefly instead of paying thread-handoff/GIL-
+                # contention overhead. If it's cold (never bulk-synced, or a
+                # device added since), _get_or_fetch_device_detail would do
+                # its OWN blocking DB round trip right here on the main
+                # thread instead — exactly the freeze this was meant to
+                # avoid — so fall back to the background-thread path below,
+                # same as the compat/comment/photo sections already do.
+                if _get_device_detail(device_id) is not None:
+                    try:
+                        content = ft.Column(
+                            [self._build_adaptive_charts(device_id, _compat_dev)],
+                            scroll=ft.ScrollMode.AUTO,
+                        )
+                        tab_map[key] = content
+                        if tab_state["active"] == key:
+                            body_container.content = content
+                            with contextlib.suppress(Exception):
+                                body_container.update()
+                    except Exception as exc:
+                        logger.error("[GSM] lazy tab %s failed: %s", key, exc)
+                    return
+                # else: cold cache — fall through to the threaded path below.
+
             body_container.content = _loading_tab()
             with contextlib.suppress(Exception):
                 body_container.update()
@@ -4683,15 +4755,14 @@ class GsmParserView:
                             [self._build_adaptive_charts(device_id, _compat_dev)],
                             scroll=ft.ScrollMode.AUTO,
                         )
+                        tab_map[key] = content
+                        if tab_state["active"] == key:
+                            body_container.content = content
+                            with contextlib.suppress(Exception):
+                                body_container.update()
                     elif key in ("compat_case", "compat_glass"):
                         _refresh_compat_tab(key)
-                        return
-                    else:
-                        return
-                    tab_map[key] = content
-                    body_container.content = content
-                    with contextlib.suppress(Exception):
-                        body_container.update()
+                    return
                 except Exception as exc:
                     logger.error("[GSM] lazy tab %s failed: %s", key, exc)
 
@@ -8255,28 +8326,98 @@ class GsmParserView:
         # ---- Reveal panel (deferred load placeholder) ----
         _reveal_refs = {}
 
-        def _reveal_click(_):
-            _reveal_refs["panel"].visible = False
-            _reveal_refs["table"].visible = True
-            if self._loading_bar_ref is not None:
-                self._loading_bar_ref.visible = True
+        _reveal_choose_col = ft.Column(
+            [
+                ft.Icon(ft.Icons.TABLE_VIEW, size=52, color=ft.Colors.BLUE_GREY_200),
+                ft.Text(
+                    "Оберіть потрібні фільтри та натисніть кнопку нижче",
+                    size=13,
+                    color=_MUTED,
+                    text_align=ft.TextAlign.CENTER,
+                ),
+                ft.FilledButton(
+                    "Показати результати",
+                    icon=ft.Icons.PLAY_CIRCLE_OUTLINED,
+                    on_click=lambda e: _reveal_click(e),
+                    style=ft.ButtonStyle(
+                        bgcolor=_OK_DK,
+                        padding=ft.padding.symmetric(horizontal=24, vertical=12),
+                        text_style=ft.TextStyle(size=13),
+                    ),
+                ),
+            ],
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=16,
+        )
+        _reveal_loading_col = ft.Column(
+            [
+                ft.ProgressRing(width=32, height=32, color=_OK_DK),
+                ft.Text("Завантаження...", size=13, color=_MUTED),
+            ],
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            alignment=ft.MainAxisAlignment.CENTER,
+            spacing=16,
+            visible=False,
+        )
+
+        async def _reveal_and_sync(page_ctrl_arg):
+            # Keep the loading state up until the sync is FULLY done (not
+            # just kicked off in the background) — showing the table right
+            # away and syncing silently after it let the rest of the app
+            # (chart hover, dialog close, everything sharing the same UI
+            # thread) feel sluggish for as long as that background sync kept
+            # running, even though the table itself already looked ready.
+            # One clear wait up front beats a table that LOOKS interactive
+            # but secretly still competes with the sync for the same thread.
+            try:
+                await self._reveal_sync(page_ctrl_arg)
+                # _reveal_sync's _refresh_table() call queues row-building
+                # for any already-expanded brand as a separate fire-and-
+                # forget task (self._fill_expanded_brands_async, via
+                # page_ctrl.run_task) instead of awaiting it — that's the
+                # right call for a plain tab-refresh (never block on it), but
+                # here it meant the spinner vanished and the table looked
+                # "done" while those rows were still visibly popping in one
+                # chunk at a time right after. Wait for that queue to fully
+                # drain too before this reveal counts as finished.
+                #
+                # _refresh_table() only SCHEDULES that fill task via
+                # page_ctrl.run_task — it hasn't actually started (and so
+                # hasn't set _brand_fill_running/populated the queue yet)
+                # until this coroutine yields at least once. Sleep(0) first
+                # so the check below sees its real state, not a stale
+                # "nothing queued yet" snapshot from before it got to run.
+                await asyncio.sleep(0)
+                for _ in range(600):  # up to ~2 minutes
+                    if not self._brand_fill_running and not self._brand_fill_queue:
+                        break
+                    await asyncio.sleep(0.2)
+            except Exception as exc:
+                logger.error("[GSM] _reveal_and_sync FAILED: %s", exc, exc_info=True)
+            finally:
+                _reveal_loading_col.visible = False
+                _reveal_refs["panel"].visible = False
+                _reveal_refs["table"].visible = True
+                if self._loading_bar_ref is not None:
+                    self._loading_bar_ref.visible = False
+                    with contextlib.suppress(Exception):
+                        self._loading_bar_ref.update()
                 with contextlib.suppress(Exception):
-                    self._loading_bar_ref.update()
+                    _reveal_refs["panel"].update()
+                with contextlib.suppress(Exception):
+                    _reveal_refs["table"].update()
+
+        def _reveal_click(_):
+            _reveal_choose_col.visible = False
+            _reveal_loading_col.visible = True
             with contextlib.suppress(Exception):
                 _reveal_refs["panel"].update()
-            with contextlib.suppress(Exception):
-                _reveal_refs["table"].update()
             # The table body was built once at construction time as a flat,
-            # ungrouped row list (see _build_results_content) — superadmin
-            # sees the grouped-by-brand view because the table is visible
-            # immediately and a cache reload usually fires _refresh_table()
-            # before they look. A regular user's table stays hidden behind
-            # this reveal panel, so if the cache was already warm (no reload
-            # needed) they'd otherwise be stuck on that initial flat render
-            # forever. Force one grouped rebuild the moment it's revealed.
-            self._refresh_table()
+            # ungrouped row list (see _build_results_content); the grouped
+            # rebuild happens once _reveal_and_sync's sync finishes, right
+            # before the loading state is swapped out for the real table.
             if page_ctrl:
-                page_ctrl.run_task(self._reveal_sync, page_ctrl)
+                page_ctrl.run_task(_reveal_and_sync, page_ctrl)
 
         reveal_panel = ft.Container(
             visible=_should_reveal,
@@ -8284,29 +8425,9 @@ class GsmParserView:
             alignment=ft.Alignment(0, 0),
             padding=ft.padding.symmetric(vertical=60),
             content=ft.Column(
-                [
-                    ft.Icon(
-                        ft.Icons.TABLE_VIEW, size=52, color=ft.Colors.BLUE_GREY_200
-                    ),
-                    ft.Text(
-                        "Оберіть потрібні фільтри та натисніть кнопку нижче",
-                        size=13,
-                        color=_MUTED,
-                        text_align=ft.TextAlign.CENTER,
-                    ),
-                    ft.FilledButton(
-                        "Показати результати",
-                        icon=ft.Icons.PLAY_CIRCLE_OUTLINED,
-                        on_click=_reveal_click,
-                        style=ft.ButtonStyle(
-                            bgcolor=_OK_DK,
-                            padding=ft.padding.symmetric(horizontal=24, vertical=12),
-                            text_style=ft.TextStyle(size=13),
-                        ),
-                    ),
-                ],
+                [_reveal_choose_col, _reveal_loading_col],
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                spacing=16,
+                alignment=ft.MainAxisAlignment.CENTER,
             ),
         )
 

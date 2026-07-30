@@ -682,6 +682,7 @@ def import_products_from_xlsx(
         return sid, None
 
     _category_levels_cfg_cache: dict[str, dict] = {}
+    _node_owner_granted_cache: set[tuple[str, str, str]] = set()
 
     def _ensure_category_levels_config(cat_row: dict | None) -> dict:
         """Ensure category has enough enabled levels for template columns.
@@ -1087,6 +1088,7 @@ def import_products_from_xlsx(
             except Exception:
                 base_last_pos = 0
 
+        path_node_ids: list[str] = []
         for lvl_idx, lvl_val in enumerate(level_values[: last_non_empty + 1]):
             if not lvl_val:
                 continue
@@ -1109,11 +1111,28 @@ def import_products_from_xlsx(
                 break
             parent_node_id = node_id
             leaf_node_id = node_id
+            path_node_ids.append(node_id)
 
         if not leaf_node_id:
             _row_cb(row_excel_idx, "Не вдалося побудувати ієрархію, рядок пропущено")
             warns.append(f"Рядок {row_excel_idx}: не вдалося побудувати ієрархію")
             continue
+
+        # find_or_create_level_node() only creates/finds the level_nodes row —
+        # unlike the manual "Створити Підкатегорія" UI dialog, it never grants
+        # the manager ownership of the node. Without an owner row, category-
+        # manager accounts (non-bypass roles) have their category tree filtered
+        # to their owned scope and see nothing at all, even though the nodes
+        # and products both exist — mirror the UI dialog's add_node_owner call
+        # here so imported hierarchy is actually visible to the manager it
+        # belongs to.
+        for node_id in path_node_ids:
+            owner_cache_key = (cid, mid, node_id)
+            if owner_cache_key in _node_owner_granted_cache:
+                continue
+            _node_owner_granted_cache.add(owner_cache_key)
+            with contextlib.suppress(Exception):
+                db.add_node_owner(mid, cid, node_id)
 
         supplier_name = _cell_val(supplier_col)
         purchase_price = _to_float_or_none(_cell_val(purchase_price_col))

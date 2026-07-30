@@ -14,6 +14,7 @@ from logger import logger
 from views import product_naming
 from views.async_view_build_helper import \
     create_orders_header_loading_indicator
+from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
 from views.number_format import format_grouped, row_text_matches, safe_float
 from views.orders_view import _wrap_text_for_width
 
@@ -287,6 +288,11 @@ class OrderScheduleView:
         self._h_offset: float = 0.0
         self._v_scroll_col = None
         self._h_scroll_row = None
+        # content_area itself is also independently scrollable (ADAPTIVE) but
+        # had no on_scroll tracking at all, so a page-level scroll was
+        # silently lost on every rebuild (background ref-data sync, adding a
+        # date, etc.) — the page visibly snapped back to the top.
+        self._content_area_offset: float = 0.0
         # Per-group ownership for shared-access edit gating.
         self._owned_group_ids: set[str] = set()
         # Drag & drop: holds source task/row/month while a card is being dragged.
@@ -1708,7 +1714,12 @@ class OrderScheduleView:
             visible=_b_needs,
         )
 
-        # Fixed header row (always visible, scrolls horizontally with body via shared h-scroll).
+        # Header stays out of the scrolling Row entirely and is repositioned via
+        # left=-offset in lockstep with the body's own on_scroll event — the
+        # same proven pattern as the main schedule table's sticky header
+        # (self._on_h_scroll / _right_header_stack_child). Nesting header+body
+        # as one shared scrollable (the previous approach) visually desynced
+        # them once scroll_to() was used (the header/columns "з'їжджають").
         header_ctrl = ft.Container(
             bgcolor=_HDR,
             content=ft.Row(
@@ -1717,14 +1728,43 @@ class OrderScheduleView:
                 spacing=0,
                 tight=True,
             ),
+            left=0,
+            top=0,
         )
-        # inner_col: header (fixed) + divider + body_col (v-scroll).
-        # Placed as the single child of the h-scroll Row, so h-scrolling moves both together.
+        header_viewport = ft.Container(
+            height=HH,
+            clip_behavior=ft.ClipBehavior.HARD_EDGE,
+            content=ft.Stack([header_ctrl]),
+        )
+
+        def _on_budget_h_scroll(e):
+            try:
+                offset = float(getattr(e, "pixels", 0) or 0)
+            except Exception:
+                return
+            header_ctrl.left = -offset
+            with contextlib.suppress(Exception):
+                header_ctrl.update()
+
+        body_h_scroll_row = ft.Row(
+            [body_col],
+            spacing=0,
+            scroll=ft.ScrollMode.HIDDEN,
+            on_scroll=_on_budget_h_scroll,
+            vertical_alignment=ft.CrossAxisAlignment.START,
+            ref=_b_hscroll_ref,
+        )
+        body_viewport = ft.Container(
+            height=430 - HH,
+            clip_behavior=ft.ClipBehavior.HARD_EDGE,
+            content=body_h_scroll_row,
+        )
+        # inner_col: header (fixed viewport) + divider + body (own h+v scroll).
         inner_col = ft.Column(
             [
-                header_ctrl,
+                header_viewport,
                 ft.Divider(height=1, thickness=1, color=_BORDER),
-                body_col,
+                body_viewport,
             ],
             spacing=0,
             expand=True,
@@ -1756,17 +1796,7 @@ class OrderScheduleView:
                     ft.Divider(height=4, color=_BORDER),
                     ft.Stack(
                         [
-                            ft.Container(
-                                height=430,
-                                clip_behavior=ft.ClipBehavior.HARD_EDGE,
-                                content=ft.Row(
-                                    ref=_b_hscroll_ref,
-                                    controls=[inner_col],
-                                    scroll=ft.ScrollMode.HIDDEN,
-                                    vertical_alignment=ft.CrossAxisAlignment.START,
-                                    expand=True,
-                                ),
-                            ),
+                            inner_col,
                             _b_left,
                             _b_right,
                         ]
@@ -2078,6 +2108,12 @@ class OrderScheduleView:
 
     # ── Scroll tracking helpers ───────────────────────────────────────────────
 
+    def _on_content_area_scroll(self, e) -> None:
+        try:
+            self._content_area_offset = float(getattr(e, "pixels", 0) or 0)
+        except Exception:
+            pass
+
     def _on_v_scroll(self, e) -> None:
         try:
             self._v_offset = float(getattr(e, "pixels", 0) or 0)
@@ -2292,7 +2328,8 @@ class OrderScheduleView:
     def _restore_scroll_after_rebuild(self) -> None:
         """Schedule async scroll restoration after the next page.update()."""
         sv, sh = self._v_offset, self._h_offset
-        if sv <= 0 and sh <= 0:
+        sc = float(getattr(self, "_content_area_offset", 0.0) or 0.0)
+        if sv <= 0 and sh <= 0 and sc <= 0:
             return
         pg = self._pg()
         if not pg or not hasattr(pg, "run_task"):
@@ -2301,6 +2338,11 @@ class OrderScheduleView:
 
         async def _restore():
             await asyncio.sleep(0.06)
+            try:
+                if sc > 0:
+                    await self.content_area.scroll_to(offset=sc, duration=0)
+            except Exception:
+                pass
             try:
                 if body_col is not None and sv > 0:
                     await body_col.scroll_to(offset=sv, duration=0)
@@ -2340,6 +2382,14 @@ class OrderScheduleView:
 
     def _load(self):
         self._region_id = self._resolve_region_id()
+        if self._region_id and not self.read_only:
+            try:
+                if not self.db.manager_has_category_access_in_region(
+                    self.manager_id, self.company_id, self._region_id
+                ):
+                    self.read_only = True
+            except Exception:
+                pass
         _raw_products = (
             self.db.get_products(
                 self.company_id,
@@ -4999,8 +5049,29 @@ class OrderScheduleView:
         if self.read_only or not self._is_group_owned(row):
             self._snack(self.t("schedule.snack.readonly_mode", "У режимі перегляду редагування недоступне"), _WARN_FG)
             return
+        # Opening several cards back-to-back (each open closes the previous
+        # one) can outrun Flutter's dialog close/open transition and render
+        # a blank/gray dialog surface. Ignore re-entrant opens while one is
+        # already up, and give a just-closed dialog a brief moment to
+        # actually finish its close animation before opening the next.
+        import time as _time
+
+        if getattr(self, "_task_dialog_open", False):
+            return
+        _cooldown_left = 0.25 - (
+            _time.monotonic() - getattr(self, "_last_dialog_close_ts", 0.0)
+        )
         page = self._pg()
         if not page:
+            return
+        if _cooldown_left > 0:
+            if hasattr(page, "run_task"):
+                async def _delayed_open(_r=row, _m=month_anchor, _t=task, _d=_cooldown_left):
+                    await asyncio.sleep(_d)
+                    self._open_task_dialog(_r, _m, _t)
+
+                with contextlib.suppress(Exception):
+                    page.run_task(_delayed_open)
             return
         gid = str(row.get("group_id") or "").strip()
         if not gid:
@@ -5269,6 +5340,8 @@ class OrderScheduleView:
             page.update()
 
         def _close(_=None):
+            self._task_dialog_open = False
+            self._last_dialog_close_ts = _time.monotonic()
             with contextlib.suppress(Exception):
                 page.pop_dialog()
 
@@ -5384,6 +5457,7 @@ class OrderScheduleView:
         _recalc_labels()
         dialog = ft.AlertDialog(
             modal=True,
+            on_dismiss=_close,
             title=ft.Text(self.t("schedule.dlg.order_plan", "План замовлення"), weight="bold"),
             content=ft.Container(
                 width=860,
@@ -5527,6 +5601,7 @@ class OrderScheduleView:
         )
         from_btn.on_click = lambda _: _open_date_picker("from")
         to_btn.on_click = lambda _: _open_date_picker("to")
+        self._task_dialog_open = True
         page.show_dialog(dialog)
 
     def _status_colors(self, status: str) -> tuple[str, str]:
@@ -6443,11 +6518,17 @@ class OrderScheduleView:
                                     ],
                                     spacing=4,
                                 ),
-                                ft.Row(
-                                    chips,
-                                    spacing=4,
-                                    run_spacing=4,
-                                    wrap=True,
+                                (
+                                    make_scrollable_chip_row(
+                                        chips, spacing=4, run_spacing=4
+                                    )
+                                    if is_mobile(self._pg())
+                                    else ft.Row(
+                                        chips,
+                                        spacing=4,
+                                        run_spacing=4,
+                                        wrap=True,
+                                    )
                                 ),
                             ],
                             spacing=4,
@@ -7324,6 +7405,7 @@ class OrderScheduleView:
         self.content_area.controls.clear()
         with contextlib.suppress(Exception):
             self.content_area.scroll = ft.ScrollMode.ADAPTIVE
+            self.content_area.on_scroll = self._on_content_area_scroll
         self.content_area.controls.append(layout)
         self.content_area.update()
 

@@ -14,9 +14,11 @@ from views import product_naming
 from views.async_view_build_helper import \
     create_orders_header_loading_indicator
 from views.cost_price_stock_table import (build_stock_counters,
-                                          build_stock_filter_bar,
                                           build_stock_table,
-                                          build_stock_totals, set_stock_query)
+                                          build_stock_totals,
+                                          _get_or_build_stock_filter_bar,
+                                          set_stock_query)
+from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
 from views.number_format import format_grouped, row_text_matches, safe_float
 
 # ---------------------------------------------------------------------------
@@ -121,9 +123,6 @@ def build_stock_currency_bar(view) -> ft.Container:
     _PANEL = _th["panel"]; _HDR = _th["hdr"]; _CHIP_T = _th["chip_text"]; _ALT = _ALT2 = _th["alt"]
     defaults = view._column_defaults()
     stock_ccy = str(defaults.get("stock_ccy") or "USD").upper().strip() or "USD"
-    orders_unit_cost_ccy = (
-        str(defaults.get("orders_unit_cost_ccy") or "USD").upper().strip() or "USD"
-    )
     stock_new_price_ccy = (
         str(defaults.get("stock_new_price_ccy") or "USD").upper().strip() or "USD"
     )
@@ -148,20 +147,16 @@ def build_stock_currency_bar(view) -> ft.Container:
             lambda value: view._set_stock_new_price_currency(value),
             width=138,
         ),
-        _popup_filter(
-            view,
-            "С/В замовлення, валюта",
-            orders_unit_cost_ccy,
-            currency_opts,
-            lambda value: view._set_orders_unit_cost_currency(value),
-            width=156,
-        ),
     ]
+    if is_mobile(getattr(view.content_area, "page", None)):
+        bar_content = make_scrollable_chip_row(controls, spacing=8)
+    else:
+        bar_content = ft.Row(controls, spacing=8, wrap=True)
     return ft.Container(
         bgcolor=_ALT,
         border_radius=6,
         padding=ft.padding.symmetric(horizontal=4, vertical=4),
-        content=ft.Row(controls, spacing=8, wrap=True),
+        content=bar_content,
     )
 
 
@@ -215,6 +210,11 @@ class CostPriceStockView:
         self._packaging_by_id = {}
         self._orders_unit_cost_usd_by_product = {}
         self._orders_unit_cost_ccy_by_product = {}
+        # Totals (not per-unit averages) behind the blended С/В $ weighted-average
+        # formula: qty/amount summed across orders that are Готові/в дорозі/на
+        # складі (i.e. not yet "прийнятий" into stock, and not "виробництво").
+        self._orders_qty_by_product: dict = {}
+        self._orders_amount_by_product: dict = {}
         self._active_order_product_ids: set = set()
         self._stock_inputs_by_product = {}
 
@@ -888,9 +888,6 @@ class CostPriceStockView:
     def _all_stock_base_column_defs(self) -> list[dict]:
         defaults = self._column_defaults()
         stock_ccy = str(defaults.get("stock_ccy") or "USD").upper().strip() or "USD"
-        orders_unit_cost_ccy = (
-            str(defaults.get("orders_unit_cost_ccy") or "USD").upper().strip() or "USD"
-        )
         stock_new_price_ccy = (
             str(defaults.get("stock_new_price_ccy") or "USD").upper().strip() or "USD"
         )
@@ -922,8 +919,18 @@ class CostPriceStockView:
                 "width": _width("unit_cost_stock", 70),
             },
             {
+                "key": "orders_qty",
+                "label": self.t("cost_stock.col.orders_qty", "К-сть замовлення"),
+                "width": _width("orders_qty", 80),
+            },
+            {
+                "key": "orders_amount",
+                "label": f"{self.t('cost_stock.col.orders_amount', 'Вартість замовлення')} {self._currency_symbol(stock_ccy)}",
+                "width": _width("orders_amount", 100),
+            },
+            {
                 "key": "orders_unit_cost",
-                "label": f"{self.t('cost_stock.col.orders_unit_cost', 'С/В замовлення')} {self._currency_symbol(orders_unit_cost_ccy)}",
+                "label": f"{self.t('cost_stock.col.orders_unit_cost', 'С/В замовлення')} {self._currency_symbol(stock_ccy)}",
                 "width": _width("orders_unit_cost", 80),
             },
             {
@@ -1700,6 +1707,8 @@ class CostPriceStockView:
 
         out = {}
         out_ccy = {}
+        qty_out = {}
+        amount_out = {}
         for product_id, total_qty in accum_qty.items():
             if total_qty <= 0:
                 continue
@@ -1707,8 +1716,12 @@ class CostPriceStockView:
                 total_qty
             )
             out_ccy[product_id] = pivot_ccy_by_product.get(product_id, "USD")
+            qty_out[product_id] = float(total_qty)
+            amount_out[product_id] = float(accum_total_cost_pivot.get(product_id, 0.0))
         self._orders_unit_cost_usd_by_product = out
         self._orders_unit_cost_ccy_by_product = out_ccy
+        self._orders_qty_by_product = qty_out
+        self._orders_amount_by_product = amount_out
         self._active_order_product_ids = active_product_ids
 
     def _set_loading_text(self, text: str) -> None:
@@ -1728,6 +1741,14 @@ class CostPriceStockView:
 
     def _load(self):
         self._region_id = self._resolve_region_id()
+        if self._region_id and not self.is_read_only:
+            try:
+                if not self.db.manager_has_category_access_in_region(
+                    self.manager_id, self.company_id, self._region_id
+                ):
+                    self.is_read_only = True
+            except Exception:
+                pass
         self._load_workspace_state()
         self._load_workspace_outbox()
         self._load_ops_outbox()
@@ -1839,9 +1860,6 @@ class CostPriceStockView:
         _products = self._products if products is None else products
         defaults = self._column_defaults()
         stock_ccy = str(defaults.get("stock_ccy") or "USD").upper().strip() or "USD"
-        orders_unit_cost_ccy = (
-            str(defaults.get("orders_unit_cost_ccy") or "USD").upper().strip() or "USD"
-        )
         default_new_ccy = (
             str(defaults.get("stock_new_price_ccy") or "USD").upper().strip() or "USD"
         )
@@ -1903,27 +1921,36 @@ class CostPriceStockView:
             if qty is not None and qty > 0 and amount_stock_ccy is not None:
                 unit_cost_stock = float(amount_stock_ccy) / float(qty)
 
-            order_unit_cost_usd = _safe_float(
-                self._orders_unit_cost_usd_by_product.get(product_id), None
+            orders_qty = _safe_float(self._orders_qty_by_product.get(product_id), 0.0) or 0.0
+            orders_amount_pivot = _safe_float(
+                self._orders_amount_by_product.get(product_id), None
             )
-            order_unit_cost_source_ccy = self._orders_unit_cost_ccy_by_product.get(
+            orders_amount_source_ccy = self._orders_unit_cost_ccy_by_product.get(
                 product_id, "USD"
             )
-            orders_unit_cost = self._convert_currency(
-                order_unit_cost_usd, order_unit_cost_source_ccy, orders_unit_cost_ccy
+            orders_amount_ccy = (
+                self._convert_currency(
+                    orders_amount_pivot, orders_amount_source_ccy, stock_ccy
+                )
+                if orders_amount_pivot is not None
+                else None
             )
-            order_unit_cost_stock = self._convert_currency(
-                orders_unit_cost, orders_unit_cost_ccy, stock_ccy
+            orders_unit_cost = (
+                float(orders_amount_ccy) / float(orders_qty)
+                if orders_qty and orders_qty > 0 and orders_amount_ccy is not None
+                else None
             )
 
-            cost_candidates = [
-                c
-                for c in [unit_cost_stock, order_unit_cost_stock]
-                if c is not None and c >= 0
-            ]
-            unit_cost_blended = None
-            if cost_candidates:
-                unit_cost_blended = sum(cost_candidates) / float(len(cost_candidates))
+            # Weighted average: (Вартість склад + Вартість замовлення) /
+            # (К-сть склад + Кількість замовлення) — quantity-weighted, not a
+            # flat 50/50 average of two independent unit costs.
+            _blended_qty = (float(qty) if qty is not None else 0.0) + float(orders_qty)
+            _blended_amount = (
+                float(amount_stock_ccy) if amount_stock_ccy is not None else 0.0
+            ) + (float(orders_amount_ccy) if orders_amount_ccy is not None else 0.0)
+            unit_cost_blended = (
+                _blended_amount / _blended_qty if _blended_qty > 0 else None
+            )
 
             tier_pairs = []
             for tier in self._price_tiers:
@@ -1950,8 +1977,8 @@ class CostPriceStockView:
                     }
                 )
 
-            new_price = _safe_float(item_state.get("new_price"), None)
-            new_ccy = (
+            new_price_raw = _safe_float(item_state.get("new_price"), None)
+            new_price_stored_ccy = (
                 str(
                     item_state.get("stock_new_ccy")
                     or item_state.get("new_ccy")
@@ -1961,6 +1988,18 @@ class CostPriceStockView:
                 .strip()
                 or default_new_ccy
             )
+            # Always display/compute in the CURRENT global "Нова ціна, валюта"
+            # setting — converting from whatever currency this product's price
+            # happened to be saved in (like amount_stock_ccy above), instead of
+            # silently keeping the stale per-item currency once one is saved.
+            new_price = (
+                self._convert_currency(
+                    new_price_raw, new_price_stored_ccy, default_new_ccy
+                )
+                if new_price_raw is not None
+                else None
+            )
+            new_ccy = default_new_ccy
             new_margin = None
             if (
                 new_price is not None
@@ -1990,8 +2029,9 @@ class CostPriceStockView:
                     "amount_stock_ccy": amount_stock_ccy,
                     "stock_ccy": stock_ccy,
                     "unit_cost_stock": unit_cost_stock,
+                    "orders_qty": orders_qty,
+                    "orders_amount_ccy": orders_amount_ccy,
                     "orders_unit_cost": orders_unit_cost,
-                    "orders_unit_cost_ccy": orders_unit_cost_ccy,
                     "unit_cost_blended": unit_cost_blended,
                     "tier_pairs": tier_pairs,
                     "new_price": new_price,
@@ -2125,10 +2165,6 @@ class CostPriceStockView:
             else:
                 defaults = self._column_defaults()
                 stock_ccy = str(defaults.get("stock_ccy") or "USD").upper().strip() or "USD"
-                orders_unit_cost_ccy = (
-                    str(defaults.get("orders_unit_cost_ccy") or "USD").upper().strip()
-                    or "USD"
-                )
                 stock_new_price_ccy = (
                     str(defaults.get("stock_new_price_ccy") or "USD").upper().strip()
                     or "USD"
@@ -2137,7 +2173,6 @@ class CostPriceStockView:
                     self,
                     archived_rows,
                     stock_ccy,
-                    orders_unit_cost_ccy,
                     stock_new_price_ccy,
                     include_header_row=True,
                 )
@@ -2312,16 +2347,6 @@ class CostPriceStockView:
             with contextlib.suppress(Exception):
                 amount_tf.update()
 
-        # Оновлюємо orders_unit_cost (С/В Замовлення) — потрібно при cross-tab sync
-        ouc_txt = refs.get("orders_unit_cost_txt")
-        if ouc_txt is not None:
-            ouc_ccy = str(refs.get("orders_unit_cost_ccy") or "USD")
-            ouc_txt.value = self._fmt_money(
-                _safe_float(row.get("orders_unit_cost"), None), ouc_ccy
-            )
-            with contextlib.suppress(Exception):
-                ouc_txt.update()
-
     def _update_new_margin_inplace(self, product_id: str) -> None:
         refs = getattr(self, "_new_price_margin_refs", {}).get(
             str(product_id or "").strip()
@@ -2331,8 +2356,20 @@ class CostPriceStockView:
         row_state = (
             self._stock_inputs_by_product.get(self._warehouse_key(product_id)) or {}
         )
-        new_price = _safe_float(row_state.get("new_price"), None)
-        new_ccy = str(row_state.get("new_ccy") or refs.get("new_ccy") or "USD").upper()
+        new_price_raw = _safe_float(row_state.get("new_price"), None)
+        new_ccy = str(
+            refs.get("new_ccy")
+            or self._column_defaults().get("stock_new_price_ccy")
+            or "USD"
+        ).upper()
+        new_price_stored_ccy = str(
+            row_state.get("stock_new_ccy") or row_state.get("new_ccy") or new_ccy
+        ).upper()
+        new_price = (
+            self._convert_currency(new_price_raw, new_price_stored_ccy, new_ccy)
+            if new_price_raw is not None
+            else None
+        )
         unit_cost_blended = refs.get("unit_cost_blended")
         stock_ccy = str(refs.get("stock_ccy") or "USD").upper()
         category_id = str(refs.get("category_id") or "")
@@ -2385,9 +2422,6 @@ class CostPriceStockView:
             return
         defaults = self._column_defaults()
         stock_ccy = str(defaults.get("stock_ccy") or "USD").upper().strip() or "USD"
-        orders_unit_cost_ccy = (
-            str(defaults.get("orders_unit_cost_ccy") or "USD").upper().strip() or "USD"
-        )
         default_new_ccy = (
             str(defaults.get("stock_new_price_ccy") or "USD").upper().strip() or "USD"
         )
@@ -2404,28 +2438,26 @@ class CostPriceStockView:
         if qty is not None and qty > 0 and amount_stock_ccy is not None:
             unit_cost_stock = float(amount_stock_ccy) / float(qty)
 
-        order_unit_cost_usd = _safe_float(
-            self._orders_unit_cost_usd_by_product.get(pid), None
+        orders_qty = _safe_float(self._orders_qty_by_product.get(pid), 0.0) or 0.0
+        orders_amount_pivot = _safe_float(self._orders_amount_by_product.get(pid), None)
+        orders_amount_source_ccy = self._orders_unit_cost_ccy_by_product.get(pid, "USD")
+        orders_amount_ccy = (
+            self._convert_currency(orders_amount_pivot, orders_amount_source_ccy, stock_ccy)
+            if orders_amount_pivot is not None
+            else None
         )
-        order_unit_cost_source_ccy = self._orders_unit_cost_ccy_by_product.get(
-            pid, "USD"
-        )
-        orders_unit_cost = self._convert_currency(
-            order_unit_cost_usd, order_unit_cost_source_ccy, orders_unit_cost_ccy
-        )
-        order_unit_cost_stock = self._convert_currency(
-            orders_unit_cost, orders_unit_cost_ccy, stock_ccy
+        orders_unit_cost = (
+            float(orders_amount_ccy) / float(orders_qty)
+            if orders_qty and orders_qty > 0 and orders_amount_ccy is not None
+            else None
         )
 
-        cost_candidates = [
-            c
-            for c in [unit_cost_stock, order_unit_cost_stock]
-            if c is not None and c >= 0
-        ]
+        _blended_qty = (float(qty) if qty is not None else 0.0) + float(orders_qty)
+        _blended_amount = (
+            float(amount_stock_ccy) if amount_stock_ccy is not None else 0.0
+        ) + (float(orders_amount_ccy) if orders_amount_ccy is not None else 0.0)
         unit_cost_blended = (
-            sum(cost_candidates) / float(len(cost_candidates))
-            if cost_candidates
-            else None
+            _blended_amount / _blended_qty if _blended_qty > 0 else None
         )
 
         tier_pairs = []
@@ -2453,8 +2485,8 @@ class CostPriceStockView:
                 }
             )
 
-        new_price = _safe_float(item_state.get("new_price"), None)
-        new_ccy = (
+        new_price_raw = _safe_float(item_state.get("new_price"), None)
+        new_price_stored_ccy = (
             str(
                 item_state.get("stock_new_ccy")
                 or item_state.get("new_ccy")
@@ -2464,6 +2496,12 @@ class CostPriceStockView:
             .strip()
             or default_new_ccy
         )
+        new_price = (
+            self._convert_currency(new_price_raw, new_price_stored_ccy, default_new_ccy)
+            if new_price_raw is not None
+            else None
+        )
+        new_ccy = default_new_ccy
         new_margin = None
         if new_price is not None and new_price > 0 and unit_cost_blended is not None:
             unit_cost_new = self._convert_currency(
@@ -2483,8 +2521,9 @@ class CostPriceStockView:
             "amount_stock_ccy": amount_stock_ccy,
             "stock_ccy": stock_ccy,
             "unit_cost_stock": unit_cost_stock,
+            "orders_qty": orders_qty,
+            "orders_amount_ccy": orders_amount_ccy,
             "orders_unit_cost": orders_unit_cost,
-            "orders_unit_cost_ccy": orders_unit_cost_ccy,
             "unit_cost_blended": unit_cost_blended,
             "tier_pairs": tier_pairs,
             "new_price": new_price,
@@ -2599,17 +2638,6 @@ class CostPriceStockView:
         self._build_warehouse_rows()
         self._persist_and_render(self.t("cost_stock.currency_updated", "Валюту складу оновлено"))
 
-    def _set_orders_unit_cost_currency(self, value: str):
-        selected = str(value or "USD").upper().strip() or "USD"
-        bucket = self._state_bucket()
-        defaults = self._column_defaults()
-        if defaults.get("orders_unit_cost_ccy") == selected:
-            return
-        defaults["orders_unit_cost_ccy"] = selected
-        bucket["column_defaults"] = defaults
-        self._save_workspace_state()
-        self._build_warehouse_rows()
-        self._persist_and_render(self.t("cost_stock.order_cost_currency_updated", "Валюту С/В замовлень оновлено"))
 
     def apply_text_search(self, query: str) -> None:
         """Ctrl+F row filter: hide rows whose Товар/К-сть/Вартість/ціни don't match `query`."""
@@ -3052,9 +3080,6 @@ class CostPriceStockView:
         rows = self._stock_filtered()
         defaults = self._column_defaults()
         stock_ccy = str(defaults.get("stock_ccy") or "USD").upper().strip() or "USD"
-        orders_unit_cost_ccy = (
-            str(defaults.get("orders_unit_cost_ccy") or "USD").upper().strip() or "USD"
-        )
         stock_new_price_ccy = (
             str(defaults.get("stock_new_price_ccy") or "USD").upper().strip() or "USD"
         )
@@ -3069,7 +3094,6 @@ class CostPriceStockView:
             self,
             rows,
             stock_ccy,
-            orders_unit_cost_ccy,
             stock_new_price_ccy,
             include_header_row=(_sticky is None),
         )
@@ -3078,7 +3102,7 @@ class CostPriceStockView:
 
         currency_bar = build_stock_currency_bar(self)
         counters = build_stock_counters(self, rows)
-        filter_bar = build_stock_filter_bar(self)
+        filter_bar = _get_or_build_stock_filter_bar(self)
         totals_row = build_stock_totals(self, rows)
 
         self.content_area.controls.clear()
@@ -3149,6 +3173,11 @@ class CostPriceStockView:
 
         try:
             self.content_area.scroll = ft.ScrollMode.ADAPTIVE
+            # _remember_content_scroll existed but was never actually wired
+            # up, so _content_scroll_offset stayed frozen at 0 and
+            # _restore_content_scroll() below was a permanent no-op — the
+            # page visibly snapped back to the top on every rebuild.
+            self.content_area.on_scroll = self._remember_content_scroll
         except Exception:
             pass
         self.content_area.controls.append(_v_body)

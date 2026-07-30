@@ -23,6 +23,7 @@ from views.number_format import (
 )
 from views.orders_view import _wrap_text_for_width
 from views import product_naming
+from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
 
 # ---------------------------------------------------------------------------
 # Theme colour shims — module defaults, shadowed by live theme at render time
@@ -203,6 +204,13 @@ def build_orders_counters(view, rows: list) -> ft.Row:
             "#5B21B6",
         ),
     ]
+    # wrap=True quietly breaks this status-counter chip row onto 2-3 lines
+    # the moment horizontal space runs out on a phone, stealing vertical
+    # space from the orders table below -- same fix already applied to the
+    # sibling stock/packaging counter rows. Single scrollable line on
+    # mobile only; desktop keeps wrap=True.
+    if is_mobile(getattr(view.content_area, "page", None)):
+        return make_scrollable_chip_row(controls, spacing=6)
     return ft.Row(controls, spacing=6, wrap=True)
 
 
@@ -323,11 +331,19 @@ def build_orders_currency_bar(view) -> ft.Container:
             width=156,
         ),
     ]
+    # Same wrap=True->scrollable-line fix as the counters chip row above:
+    # these 3 currency PopupMenuButtons wrapping onto their own lines was
+    # one of the biggest vertical-space eaters on a phone screen.
+    _currency_row = (
+        make_scrollable_chip_row(controls, spacing=8)
+        if is_mobile(getattr(view.content_area, "page", None))
+        else ft.Row(controls, spacing=8, wrap=True)
+    )
     return ft.Container(
         bgcolor=_ALT_2,
         border_radius=6,
         padding=ft.padding.symmetric(horizontal=4, vertical=4),
-        content=ft.Row(controls, spacing=8, wrap=True),
+        content=_currency_row,
     )
 
 
@@ -488,6 +504,62 @@ def build_orders_filter_bar(view) -> ft.Container:
         padding=ft.padding.symmetric(horizontal=4, vertical=4),
         content=ft.Row(controls, spacing=4, wrap=False),
     )
+
+
+def _compute_orders_filter_signature(view) -> tuple:
+    return (
+        view._orders_filter_status,
+        view._orders_filter_supplier,
+        view._orders_filter_category,
+        view._orders_filter_product,
+        view._orders_filter_payment,
+        len(view._orders_selected or set()),
+        tuple(
+            sorted(
+                {
+                    str(row.get("supplier_id") or "").strip()
+                    for row in view._orders_rows
+                    if row.get("supplier_id")
+                }
+            )
+        ),
+        tuple(
+            sorted(
+                {
+                    str(row.get("category_id") or "").strip()
+                    for row in view._orders_rows
+                    if row.get("category_id")
+                }
+            )
+        ),
+        tuple(
+            sorted(
+                {
+                    str((row.get("item") or {}).get("product_id") or "").strip()
+                    for row in view._orders_rows
+                    if (row.get("item") or {}).get("product_id")
+                }
+            )
+        ),
+    )
+
+
+def _get_or_build_orders_filter_bar(view) -> ft.Container:
+    """Rebuilding the filter bar recreates its PopupMenuButton controls,
+    which destroys their live Flutter overlay and force-closes any filter
+    menu the user currently has open — the "filter list collapses on its
+    own after a while" symptom, since this used to run on every background
+    reference-data refresh (every ~20s) and shared-map sync, not just on
+    real filter changes. Reuse the existing control (so Flet doesn't touch
+    the popup widgets at all) unless something it actually displays —
+    selection, option lists, or the merge-selection count — changed."""
+    sig = _compute_orders_filter_signature(view)
+    existing = getattr(view, "_sticky_filter_bar_ref", None)
+    if existing is not None and getattr(view, "_orders_filter_bar_signature", None) == sig:
+        return existing
+    control = build_orders_filter_bar(view)
+    view._orders_filter_bar_signature = sig
+    return control
 
 
 def set_orders_filter(view, key: str, value: str) -> None:
@@ -697,6 +769,13 @@ def build_orders_table(view, rows: list) -> dict:
     scroll_width = sum(widths[frozen_count:])
     row_height = 34
     tf_text_size = 8
+    # This is the single source of truth every cell builder below (_cell_text,
+    # _cell_edit, _mk_product_cell_cpo, ...) reads its default height/font
+    # size from via closures -- shave it down a bit on mobile so more rows
+    # fit the short phone screen, without touching desktop at all.
+    if is_mobile(getattr(view.content_area, "page", None)):
+        row_height = max(1, int(row_height * 0.85))
+        tf_text_size = max(6, tf_text_size - 1)
     tf_vpad = max(0, int((row_height - (tf_text_size + 6)) / 2))
 
     def _need_lines_for_text(txt: str, w: int | None) -> int:
@@ -6236,6 +6315,14 @@ class CostPriceView:
 
     def _load(self):
         self._region_id = self._resolve_region_id()
+        if self._region_id and not self.is_read_only:
+            try:
+                if not self.db.manager_has_category_access_in_region(
+                    self.manager_id, self.company_id, self._region_id
+                ):
+                    self.is_read_only = True
+            except Exception:
+                pass
         self._load_workspace_state()
         # Restore UI state saved by _restart_tab (stored in a separate key, not column_defaults)
         _ui = self._state_bucket().get("ui_restore")
@@ -8398,7 +8485,7 @@ class CostPriceView:
         # ── Sticky header: currency bar + counters + filter bar + column header ──
         currency_bar_control = build_global_currency_bar(self)
         counters_control = build_orders_counters(self, rows)
-        filter_bar_control = build_orders_filter_bar(self)
+        filter_bar_control = _get_or_build_orders_filter_bar(self)
         table_header_widget = self._build_table_header_widget(table_content)
         self._sticky_currency_bar_ref = currency_bar_control
         self._sticky_counters_ref = counters_control
@@ -8625,6 +8712,15 @@ class CostPriceView:
                         rerender=False,
                         success_text=None,
                     )
+                    # Order-level cp_logistics_fact_total only feeds the
+                    # order's own aggregate cells below — for a multi-item
+                    # order (order = several products) the per-item log_fact
+                    # cells are a SEPARATE set of controls that this
+                    # function never touched, so they kept showing stale/
+                    # missing values after a merge distribution. Cascade the
+                    # clear down to each item row too.
+                    with contextlib.suppress(Exception):
+                        self._apply_cv_inplace(oid)
                 # Clear cell: empty value + red fill
                 ct = sub_refs.get(oid)
                 if ct is not None:
@@ -8712,6 +8808,15 @@ class CostPriceView:
                     rerender=False,
                     success_text=None,
                 )
+                # This order's own cp_logistics_fact_total is now set, but
+                # for a multi-item order (order = several products) that
+                # total still needs to be split across each item's own
+                # log_fact/C-В cells — a separate set of controls this
+                # function doesn't otherwise touch. Without this, the sub-
+                # rows for a multi-product order in the merge kept showing
+                # blank/stale "Лог факт" after distribution.
+                with contextlib.suppress(Exception):
+                    self._apply_cv_inplace(oid)
             # Instant log_fact cell update: value + correct background
             ct = sub_refs.get(oid)
             if ct is not None:
@@ -9772,7 +9877,7 @@ class CostPriceView:
             table_content = build_orders_table(self, rows)
         table_container = self._wrap_orders_table_with_scroll(table_content)
         counters_control = build_orders_counters(self, rows)
-        filter_bar_control = build_orders_filter_bar(self)
+        filter_bar_control = _get_or_build_orders_filter_bar(self)
         table_header_widget = self._build_table_header_widget(table_content)
 
         body_column = ft.Column([table_container], spacing=0, tight=True)
@@ -9877,6 +9982,12 @@ class CostPriceView:
 
         try:
             self.content_area.scroll = ft.ScrollMode.ADAPTIVE
+            # _on_v_scroll existed but was never actually wired up, so
+            # _orders_v_scroll_offset stayed frozen at 0 and the restore
+            # below (search _restore_v) was a permanent no-op — the page
+            # visibly snapped back to the top on every rebuild (background
+            # ref-data pulse, filter change, row edit, ...).
+            self.content_area.on_scroll = _on_v_scroll
         except Exception:
             pass
         self.content_area.controls.append(_v_body)
@@ -9969,24 +10080,31 @@ class CostPriceView:
                     _ind_ref.visible = False
 
             # First render: restore saved scroll position (or scroll to top if none).
-            if not getattr(self, "_initial_render_done", False):
-                self._initial_render_done = True
-                _restore_v = float(self._orders_v_scroll_offset or 0.0)
-                _v_col = getattr(self, "_v_body_col_ref", None)
-                _scroll_target = _v_col if _v_col is not None else self.content_area
-                try:
-                    if hasattr(pg, "run_task"):
+            # Subsequent full re-renders (background ref-data pulse, filter
+            # change, ...) also rebuild content_area from scratch, which
+            # would otherwise silently snap the page back to the top each
+            # time — restore the same tracked offset there too, just with a
+            # shorter settle delay since the page is already up and running.
+            _is_initial_render = not getattr(self, "_initial_render_done", False)
+            self._initial_render_done = True
+            _restore_v = float(self._orders_v_scroll_offset or 0.0)
+            _v_col = getattr(self, "_v_body_col_ref", None)
+            _scroll_target = _v_col if _v_col is not None else self.content_area
+            try:
+                if hasattr(pg, "run_task"):
 
-                        async def _restore_v_scroll(_v=_restore_v, _t=_scroll_target):
-                            import asyncio
+                    async def _restore_v_scroll(
+                        _v=_restore_v, _t=_scroll_target, _delay=(0.5 if _is_initial_render else 0.05)
+                    ):
+                        import asyncio
 
-                            await asyncio.sleep(0.5)
-                            with contextlib.suppress(Exception):
-                                await _t.scroll_to(offset=_v, duration=0)
+                        await asyncio.sleep(_delay)
+                        with contextlib.suppress(Exception):
+                            await _t.scroll_to(offset=_v, duration=0)
 
-                        pg.run_task(_restore_v_scroll)
-                except Exception:
-                    pass
+                    pg.run_task(_restore_v_scroll)
+            except Exception:
+                pass
 
     def _render_loading_stub(self):
         self._header_loading_indicator = create_orders_header_loading_indicator(

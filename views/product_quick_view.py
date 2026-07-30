@@ -1,18 +1,28 @@
 """Shared product quick-view / quick-edit modal callable from any view."""
 from __future__ import annotations
 
+import asyncio
+import contextlib
+
 import flet as ft
 import i18n
 from logger import logger
 
 
-def open_product_quick_view(
+async def open_product_quick_view(
     content_area,
     db,
     product_id: str,
     user_data: dict,
 ) -> None:
-    """Fetch product by ID and open the details modal with a Перегляд/Редагування toggle."""
+    """Fetch product by ID and open the details modal with a Перегляд/Редагування toggle.
+
+    The product fetch (and the details dialog's own build, see
+    ProductsView.show_product_details_dialog) run off the UI thread — doing
+    these DB round trips inline on Flet's single event loop is what made
+    this modal (and every other one built the same way) take up to a
+    minute to open on Android, where each round trip is much slower than
+    on desktop's LAN."""
     _mid = str((user_data or {}).get("active_manager_id") or (user_data or {}).get("id") or "")
     _t = i18n.bind(str((user_data or {}).get("id") or ""))
     pid = str(product_id or "").strip()
@@ -25,7 +35,7 @@ def open_product_quick_view(
 
     company_id = (user_data or {}).get("company_id")
     try:
-        product = db.get_product_by_id(company_id, pid)
+        product = await asyncio.to_thread(db.get_product_by_id, company_id, pid)
     except Exception:
         logger.exception("open_product_quick_view: get_product_by_id failed pid=%s", pid)
         product = None
@@ -60,26 +70,40 @@ def open_product_quick_view(
                 pass
             dlg_ref[0] = None
 
-    def _switch_to_view():
+    async def _switch_to_view():
         # Re-fetch so any edits made just before switching back are reflected.
         try:
-            fresh = db.get_product_by_id(company_id, pid)
+            fresh = await asyncio.to_thread(db.get_product_by_id, company_id, pid)
         except Exception:
             fresh = None
-        _open_view(fresh or product)
+        await _open_view(fresh or product)
 
     def _switch_to_edit():
         _close_current_dlg()
-        pv.show_product_dialog(product, on_switch_to_view=_switch_to_view)
+        # Opening the edit dialog in the same tick as closing the view
+        # dialog can outrun Flutter's close transition — the new dialog
+        # silently fails to render and the modal just disappears ("closes,
+        # doesn't switch to edit"). Give the close a brief moment to settle.
+        if hasattr(page, "run_task"):
 
-    def _open_view(prod: dict) -> None:
-        pv.show_product_details_dialog(
+            async def _delayed_open():
+                await asyncio.sleep(0.2)
+                with contextlib.suppress(Exception):
+                    await pv.show_product_dialog(product, on_switch_to_view=_switch_to_view)
+
+            with contextlib.suppress(Exception):
+                page.run_task(_delayed_open)
+        # else: no page/run_task available — nothing we can safely schedule
+        # the (now async) show_product_dialog coroutine onto.
+
+    async def _open_view(prod: dict) -> None:
+        await pv.show_product_details_dialog(
             prod,
             on_switch_to_edit=_switch_to_edit if can_edit else None,
             _dlg_ref=dlg_ref,
         )
 
-    _open_view(product)
+    await _open_view(product)
 
 
 def product_icon_btn(
@@ -100,12 +124,18 @@ def product_icon_btn(
     pid = str(product_id or "").strip()
     if not pid:
         return ft.Container(width=0, height=0, visible=False)
+    def _on_click(_e):
+        _pg = getattr(content_area, "page", None)
+        if _pg and hasattr(_pg, "run_task"):
+            with contextlib.suppress(Exception):
+                _pg.run_task(open_product_quick_view, content_area, db, pid, user_data)
+
     return ft.IconButton(
         icon=ft.Icons.INFO_OUTLINE,
         icon_size=size,
         icon_color="#94A3B8",
         tooltip=tooltip if tooltip is not None else _t("products.card_tooltip", "Картка товару"),
-        on_click=lambda _: open_product_quick_view(content_area, db, pid, user_data),
+        on_click=_on_click,
         style=ft.ButtonStyle(
             padding=ft.padding.all(0),
         ),

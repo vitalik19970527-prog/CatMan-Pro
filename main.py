@@ -650,6 +650,21 @@ def main(page: ft.Page):
     except Exception:
         pass
 
+    # Every view in this app already calls .update() explicitly and
+    # precisely on whatever control actually changed (hundreds of call
+    # sites across views/*.py) — nothing here relies on Flet's automatic
+    # post-event page update. That automatic update fires after EVERY
+    # single event (click, hover-move, anything) regardless, and on a page
+    # with a large control tree underneath (e.g. GSM Parser's 2000+ device
+    # table) its full-tree diff took multiple seconds PER EVENT — a live
+    # py-spy dump caught it running even from inside a handler that had
+    # just called ft.context.disable_auto_update() itself, meaning
+    # Flet resets that per-event before the next dispatch either way, so
+    # disabling it once per handler never reliably stuck. Disabling it
+    # globally, once, for the whole session removes that unconditionally.
+    with suppress(Exception):
+        ft.context.disable_auto_update()
+
     def _diag_session_meta():
         try:
             session_id = str(getattr(page, "session_id", "") or "")
@@ -1327,8 +1342,15 @@ def main(page: ft.Page):
         "app_boot",
         "logout_button_click",
         "account_switch_confirmed",
+        "system_backup_lock",
+        "session_kicked",
     }
-    _manual_auth_reasons = {"logout_button_click", "account_switch_confirmed"}
+    _manual_auth_reasons = {
+        "logout_button_click",
+        "account_switch_confirmed",
+        "system_backup_lock",
+        "session_kicked",
+    }
 
     def _install_page_lifecycle_logs():
         def _safe_log(tag: str, extra: str = ""):

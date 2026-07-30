@@ -59,6 +59,11 @@ class MainDashboard:
             )
         self.current_manager_id = self.user_data.get("id")
         self.current_manager_name = self.user_data.get("full_name", "Мої дані")
+        # Single-active-device enforcement: the token check_auth stamped for
+        # THIS login. _watch_session_kick polls the DB copy and force-logs-out
+        # the moment it no longer matches (another device logged into the
+        # same account and overwrote it).
+        self._my_session_token = str(self.user_data.get("session_token") or "").strip()
         self.visible_managers = []
         self.current_region = None
         self.current_view_func = self.show_home
@@ -149,14 +154,18 @@ class MainDashboard:
             horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
         )
         self.content_area.controls.append(self._scratch_col)
-        # Page zoom state (Ctrl+Scroll)
+        # Page zoom state (Ctrl+Scroll on desktop, pinch on mobile)
         self._zoom_factor: float = 1.0
-        self._zoom_steps = [0.75, 0.80, 0.85, 0.90, 1.00, 1.10, 1.15, 1.25, 1.50, 2.00]
+        self._zoom_steps = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 1.00, 1.10, 1.15, 1.25, 1.50, 2.00]
+        self._zoom_min = 0.35
+        self._zoom_max = 2.00
         self._zoomable: ft.Container | None = None
         self._scaled_content: ft.Container | None = None
         self._main_layout_ref: ft.Row | None = None
         self._zoom_h_scroller: ft.Row | None = None
         self._zoom_by_vkey: dict[str, float] = {}  # per-tab zoom, cleared on app close
+        self._mobile_default_zoom_applied: bool = False
+        self._mobile_pinch_start_factor: float = 1.0
         self._search_hl_ctrl: ft.Control | None = None
         self._search_hl_saves: tuple | None = None  # (ctrl, orig_bgcolor, orig_color)
         self._search_hl_all_saves: list = (
@@ -2734,6 +2743,7 @@ class MainDashboard:
                     "logout_button_click",
                     "account_switch_confirmed",
                     "system_backup_lock",
+                    "session_kicked",
                 }
                 if reason not in allowed_reasons:
                     logger.error(
@@ -2906,10 +2916,20 @@ class MainDashboard:
             clock_size = 16 if is_small_header else 20
             date_size = 10 if is_small_header else 12
             button_h = 32 if is_small_header else 36
+            # Mobile-only (never touches desktop/exe sizing, even a narrow
+            # windowed one, which only gets is_small_header above): phone
+            # screens are short enough that the stock 44x44 icon chips and
+            # 12px row spacing alone made the header eat a large chunk of
+            # the screen (see screenshots) — shrink those specifically.
+            _is_mob = _is_mobile_device(self.page)
+            _icon_box = 34 if _is_mob else 44
+            _avatar_size = 28 if _is_mob else 40
+            _header_row_spacing = 6 if _is_mob else 12
 
             menu_toggle_btn = ft.IconButton(
                 icon=ft.Icons.MENU,
                 icon_color=_th_icon,
+                icon_size=20 if _is_mob else None,
                 tooltip=self.t("nav.toggle_menu", "Показати/сховати меню"),
             )
 
@@ -2929,14 +2949,14 @@ class MainDashboard:
                 [
                     ft.Container(
                         content=menu_toggle_btn,
-                        width=44,
-                        height=44,
-                        border_radius=12,
+                        width=_icon_box,
+                        height=_icon_box,
+                        border_radius=10 if _is_mob else 12,
                         bgcolor=_th_chip_bg,
                     ),
                     ft.Icon(
                         ft.Icons.ACCOUNT_CIRCLE,
-                        size=40,
+                        size=_avatar_size,
                         color=_th_icon,
                     ),
                     ft.Column(
@@ -2950,13 +2970,20 @@ class MainDashboard:
                     ),
                     ft.IconButton(
                         icon=ft.Icons.HELP_OUTLINE,
-                        icon_size=18,
+                        icon_size=16 if _is_mob else 18,
                         icon_color=_th_icon,
                         tooltip=self.t("nav.help_tooltip", "Довідка"),
                         on_click=lambda _e: self._show_nav_help(),
                     ),
                 ],
-                spacing=12,
+                spacing=_header_row_spacing,
+                # On a squeezed mobile header (esp. landscape, where top_left
+                # only gets a quarter of the row's width) this content can be
+                # wider than its allotted space. A plain Row doesn't clip
+                # overflow, so without wrap it renders past its bounds and
+                # visually collides with top_center's clock ("?" over the
+                # time) instead of just... being not wrapped.
+                wrap=is_small_header,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
             )
 
@@ -3012,6 +3039,62 @@ class MainDashboard:
                             logger.exception("[backup-lock-watch] tick failed")
 
                 self.page.run_task(_watch_backup_lock)
+
+            if not getattr(self, "_session_kick_watch_started", False):
+                self._session_kick_watch_started = True
+
+                async def _watch_session_kick():
+                    # Independent of Config.SYNC_PULSES_ENABLED (unlike
+                    # _sync_poll_loop) — only one device may hold an active
+                    # session per manager account; a login elsewhere must
+                    # force this one out even with live sync polling off. See
+                    # check_auth / get_manager_active_session_token.
+                    if not self._my_session_token:
+                        # This login never got a token (e.g. REST-backend
+                        # mode, where get_manager_active_session_token is a
+                        # no-op) — nothing to compare against, so skip
+                        # entirely rather than false-triggering on every tick.
+                        return
+                    while True:
+                        await asyncio.sleep(12)
+                        try:
+                            mid = (self.current_manager_id or "").strip()
+                            if not mid:
+                                continue
+                            current_token = await asyncio.to_thread(
+                                self.db.get_manager_active_session_token, mid
+                            )
+                            if current_token is None:
+                                # Lookup failed/unsupported this tick — skip,
+                                # don't treat as a mismatch.
+                                continue
+                            if (
+                                current_token
+                                and current_token != self._my_session_token
+                            ):
+                                with contextlib.suppress(Exception):
+                                    self.page.snack_bar = ft.SnackBar(
+                                        content=ft.Text(
+                                            self.t(
+                                                "dashboard.session_kicked",
+                                                "Ви увійшли в акаунт на іншому "
+                                                "пристрої. Цю сесію завершено.",
+                                            ),
+                                            color="#FFFFFF",
+                                            weight="bold",
+                                        ),
+                                        bgcolor="#B91C1C",
+                                        duration=6000,
+                                    )
+                                    self.page.snack_bar.open = True
+                                    self.page.update()
+                                _mark_manual_logout_intent("session_kicked")
+                                do_logout(None, reason="session_kicked")
+                                return
+                        except Exception:
+                            logger.exception("[session-kick-watch] tick failed")
+
+                self.page.run_task(_watch_session_kick)
 
             top_center = ft.Column(
                 [
@@ -3078,24 +3161,26 @@ class MainDashboard:
                         content=ft.IconButton(
                             icon=ft.Icons.HOME_ROUNDED,
                             icon_color=_th_icon,
+                            icon_size=18 if _is_mob else None,
                             tooltip=self.t("nav.home_tooltip", "Головна сторінка"),
                             on_click=self.show_home,
                         ),
-                        width=44,
-                        height=44,
-                        border_radius=12,
+                        width=_icon_box,
+                        height=_icon_box,
+                        border_radius=10 if _is_mob else 12,
                         bgcolor=_th_chip_bg,
                     ),
                     ft.Container(
                         content=ft.IconButton(
                             icon=ft.Icons.SETTINGS,
                             icon_color=_th_icon,
+                            icon_size=18 if _is_mob else None,
                             tooltip=self.t("nav.settings_tooltip", "Налаштування"),
                             on_click=self.show_settings,
                         ),
-                        width=44,
-                        height=44,
-                        border_radius=12,
+                        width=_icon_box,
+                        height=_icon_box,
+                        border_radius=10 if _is_mob else 12,
                         bgcolor=_th_chip_bg,
                     ),
                     self._build_lang_switcher_box(_dash_manager_id, _th_chip_bg),
@@ -3103,20 +3188,21 @@ class MainDashboard:
                         content=ft.IconButton(
                             icon=ft.Icons.LOGOUT,
                             icon_color=ft.Colors.RED_700,
+                            icon_size=18 if _is_mob else None,
                             tooltip=self.t("nav.logout_tooltip", "Вийти з акаунта"),
                             on_click=lambda _: (
                                 _mark_manual_logout_intent("logout_button_click"),
                                 do_logout(_, reason="logout_button_click"),
                             ),
                         ),
-                        width=44,
-                        height=44,
-                        border_radius=12,
+                        width=_icon_box,
+                        height=_icon_box,
+                        border_radius=10 if _is_mob else 12,
                         bgcolor="#FFF1F2",
                     ),
                 ],
-                spacing=10,
-                run_spacing=8,
+                spacing=6 if _is_mob else 10,
+                run_spacing=6 if _is_mob else 8,
                 wrap=True,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 alignment=ft.MainAxisAlignment.END,
@@ -3313,10 +3399,23 @@ class MainDashboard:
             self._sidebar_container = sidebar
             self._sidebar_col_ref = _sidebar_col
 
+            if _is_mobile_device(self.page):
+                # wrap=True (the desktop default, set once in __init__) makes
+                # tab chips stack one-per-line the moment they don't fit a
+                # phone's width — with several tabs open this alone can eat
+                # most of the footer's height. A single horizontally
+                # scrollable line is the standard mobile pattern (see
+                # mobile_layout_helpers.make_scrollable_chip_row) and costs a
+                # fixed, small height no matter how many tabs are open.
+                self._workspace_tabs_row.wrap = False
+                self._workspace_tabs_row.scroll = ft.ScrollMode.AUTO
+
             workspace_bar = ft.Container(
                 bgcolor=_bar_color,
                 border_radius=10,
-                padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                padding=ft.padding.symmetric(
+                    horizontal=8, vertical=(2 if _is_mobile_device(self.page) else 4)
+                ),
                 content=ft.Row(
                     [
                         ft.Container(
@@ -3367,7 +3466,9 @@ class MainDashboard:
 
             self._workspace_bar_container_ref = workspace_bar
             workspace_footer = ft.Container(
-                padding=ft.padding.only(left=0, right=0, bottom=8),
+                padding=ft.padding.only(
+                    left=0, right=0, bottom=(2 if _is_mob else 8)
+                ),
                 content=ft.SafeArea(
                     maintain_bottom_view_padding=True,
                     minimum_padding=ft.padding.only(bottom=2),
@@ -3381,7 +3482,9 @@ class MainDashboard:
                     ft.Container(
                         content=self.content_area,
                         expand=True,
-                        padding=ft.padding.only(left=0, right=0, top=0, bottom=8),
+                        padding=ft.padding.only(
+                            left=0, right=0, top=0, bottom=(2 if _is_mob else 8)
+                        ),
                         bgcolor="transparent",
                         border_radius=15,
                         clip_behavior=ft.ClipBehavior.HARD_EDGE,
@@ -3413,10 +3516,22 @@ class MainDashboard:
 
             self._scaled_content = None
             self._main_layout_ref = main_layout
-            self._zoomable = ft.Container(
+            _zoomable_container = ft.Container(
                 content=main_layout,
                 expand=True,
             )
+            if _is_mobile_device(self.page):
+                # Pinch-to-zoom — desktop keeps Ctrl+Scroll/Ctrl+±/0 only, since a
+                # GestureDetector here would otherwise intercept two-finger
+                # trackpad gestures too.
+                self._zoomable = ft.GestureDetector(
+                    content=_zoomable_container,
+                    on_scale_start=self._on_mobile_scale_start,
+                    on_scale_update=self._on_mobile_scale_update,
+                    on_scale_end=self._on_mobile_scale_end,
+                )
+            else:
+                self._zoomable = _zoomable_container
             self._zoom_h_scroller = None  # unused; keep for compatibility
             self._zoom_indicator_text = ft.Text(
                 "100%", size=16, color="white", weight="bold"
@@ -3447,7 +3562,7 @@ class MainDashboard:
                             workspace_footer,
                         ],
                         expand=True,
-                        spacing=6,
+                        spacing=2 if _is_mob else 6,
                         horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                     )
                 )
@@ -3499,6 +3614,19 @@ class MainDashboard:
             self._search_query: str = ""
             self.page.on_keyboard_event = self._on_keyboard_event
             self.page.update()
+
+            # Mobile: start at 65% so a phone screen shows meaningfully more
+            # of a desktop-proportioned layout than 100% ever could — once,
+            # on first build only (later tab switches restore whatever zoom
+            # the user left each tab at, including one they pinched back up).
+            if (
+                not self._mobile_default_zoom_applied
+                and _is_mobile_device(self.page)
+            ):
+                self._mobile_default_zoom_applied = True
+                self._zoom_factor = 0.65
+                self._zoom_apply_seq += 1
+                self.page.run_task(self._apply_zoom_async, self._zoom_apply_seq)
 
         except Exception as ex:
             logger.exception("Dashboard build failed")
@@ -6320,6 +6448,35 @@ class MainDashboard:
         if abs(target - current) < 0.001:
             return
         self._zoom_factor = target
+        self._zoom_apply_seq += 1
+        self.page.run_task(self._apply_zoom_async, self._zoom_apply_seq)
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Mobile pinch-to-zoom (GestureDetector on_scale_*)
+    # ────────────────────────────────────────────────────────────────────────
+
+    def _on_mobile_scale_start(self, _e=None) -> None:
+        self._mobile_pinch_start_factor = self._zoom_factor
+
+    def _on_mobile_scale_update(self, e) -> None:
+        try:
+            raw = float(self._mobile_pinch_start_factor) * float(
+                getattr(e, "scale", 1.0) or 1.0
+            )
+        except Exception:
+            return
+        target = max(self._zoom_min, min(self._zoom_max, raw))
+        self._zoom_factor = target
+        ml = self._main_layout_ref
+        if ml is not None:
+            # Live visual feedback only during the gesture — a pure Transform.scale,
+            # no width/height relayout (that happens once at gesture end in
+            # _apply_zoom_async) so rapid pinch updates stay smooth.
+            ml.scale = ft.Scale(scale=target, alignment=ft.Alignment(-1, -1))
+            with contextlib.suppress(Exception):
+                ml.update()
+
+    def _on_mobile_scale_end(self, _e=None) -> None:
         self._zoom_apply_seq += 1
         self.page.run_task(self._apply_zoom_async, self._zoom_apply_seq)
 

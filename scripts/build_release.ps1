@@ -447,6 +447,13 @@ finally:
                 throw "flet.exe not found at $fletExe"
             }
 
+            # Flet's default Android template lacks a <queries> declaration for
+            # ACTION_VIEW/http(s), so page.launch_url() silently no-ops on
+            # Android 11+ instead of opening the browser (the APK-update-button
+            # bug). Patches the cached cookiecutter template in place; safe/
+            # idempotent to run before every build.
+            & ".venv/Scripts/python.exe" "scripts/patch_flet_android_template.py"
+
             # Flutter/Android SDK/Java are not on PATH by default on this
             # machine (confirmed empty JAVA_HOME/ANDROID_HOME/FLUTTER_HOME) —
             # same paths as scripts/build_android_stage.ps1's manual staging

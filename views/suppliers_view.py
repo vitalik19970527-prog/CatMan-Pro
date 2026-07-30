@@ -7,6 +7,8 @@ import uuid
 import flet as ft
 import i18n
 
+from views.async_view_build_helper import safe_update_with_retry
+
 # ---------------------------------------------------------------------------
 # Theme colour shims
 # ---------------------------------------------------------------------------
@@ -143,6 +145,12 @@ class SuppliersView:
         self._debounce_tasks = {}
         self._search_query = ""
         self._header_loading_indicator = None
+
+    def _page(self):
+        try:
+            return self.content_area.page if self.content_area else None
+        except RuntimeError:
+            return None
 
     def _can_modify_supplier(self, supplier):
         supplier = supplier if isinstance(supplier, dict) else {}
@@ -560,6 +568,17 @@ class SuppliersView:
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
 
+        # Region access and category access are separate grants -- creating
+        # or editing a supplier is tied to the category/level it serves, so
+        # a manager with zero category ownership in the current region
+        # should only be able to browse, not add/edit.
+        try:
+            self._region_create_allowed = self.db.manager_has_category_access_in_region(
+                self.manager_id, self.company_id, self._effective_region_id()
+            )
+        except Exception:
+            self._region_create_allowed = True
+
         header = ft.Column(
             [
                 ft.Row(
@@ -588,7 +607,10 @@ class SuppliersView:
                                 text_style=ft.TextStyle(size=11),
                                 padding=ft.padding.symmetric(horizontal=8, vertical=2),
                             ),
-                            on_click=lambda _: self.show_supplier_dialog(),
+                            on_click=lambda _: self._page()
+                            and self._page().run_task(self.show_supplier_dialog),
+                            visible=not self.read_only_subordinate
+                            and self._region_create_allowed,
                         ),
                     ],
                     spacing=6,
@@ -833,8 +855,7 @@ class SuppliersView:
                 self._build_archive_section(current_region_id, load_manager_id)
             )
 
-        with contextlib.suppress(Exception):
-            self.suppliers_list.update()
+        safe_update_with_retry(self.suppliers_list, self._page())
 
     def _build_archive_section(self, region_id, manager_id):
         """Згорнута секція архівованих постачальників з можливістю відновлення."""
@@ -1163,8 +1184,9 @@ class SuppliersView:
                                                 horizontal=7, vertical=1
                                             ),
                                         ),
-                                        on_click=lambda _: self.show_supplier_details_dialog(
-                                            s
+                                        on_click=lambda _, _s=s: self._page()
+                                        and self._page().run_task(
+                                            self.show_supplier_details_dialog, _s
                                         ),
                                     ),
                                     ft.OutlinedButton(
@@ -1177,14 +1199,16 @@ class SuppliersView:
                                                 horizontal=7, vertical=1
                                             ),
                                         ),
-                                        visible=not self.read_only_subordinate,
+                                        visible=not self.read_only_subordinate
+                                        and getattr(self, "_region_create_allowed", True),
                                         disabled=not can_modify,
                                         tooltip=(
                                             "Запис закріплений за іншим користувачем"
                                             if not can_modify
                                             else None
                                         ),
-                                        on_click=lambda _: self.show_supplier_dialog(s),
+                                        on_click=lambda _, _s=s: self._page()
+                                        and self._page().run_task(self.show_supplier_dialog, _s),
                                     ),
                                     ft.IconButton(
                                         ft.Icons.UNARCHIVE_OUTLINED
@@ -1200,7 +1224,8 @@ class SuppliersView:
                                             if can_modify
                                             else "Запис закріплений за іншим користувачем"
                                         ),
-                                        visible=not self.read_only_subordinate,
+                                        visible=not self.read_only_subordinate
+                                        and getattr(self, "_region_create_allowed", True),
                                         disabled=not can_modify,
                                         on_click=(
                                             (lambda _: self.restore_supplier(s.get("id")))
@@ -1235,7 +1260,7 @@ class SuppliersView:
         )
 
     def _close_dlg(self, dlg):
-        page = self.content_area.page if self.content_area else None
+        page = self._page()
         if not page:
             logger.warning("[modal:suppliers] close skipped: page is None")
             return
@@ -1255,7 +1280,14 @@ class SuppliersView:
             len(getattr(page, "overlay", []) or []),
         )
 
-    def show_supplier_details_dialog(self, supplier):
+    async def show_supplier_details_dialog(self, supplier):
+        """Builds the (DB-heavy) supplier card dialog off the UI thread, then
+        shows it — see ProductsView.show_product_details_dialog for the same
+        fix and why it matters on Android."""
+        dlg = await asyncio.to_thread(self._build_supplier_details_dialog, supplier)
+        self.content_area.page.show_dialog(dlg)
+
+    def _build_supplier_details_dialog(self, supplier) -> ft.AlertDialog:
         supplier = supplier if isinstance(supplier, dict) else {}
         company_id = supplier.get("company_id") or self.company_id
         region_name = self._region_name_by_id.get(
@@ -1448,7 +1480,7 @@ class SuppliersView:
 
         def _view_help(_):
             from views.help_utils import show_modal_help
-            _pg = self.content_area.page if self.content_area else None
+            _pg = self._page()
             show_modal_help(_pg, self.t("suppliers.view_help.title", "Перегляд постачальника"), [
                 self.t("suppliers.view_help.step1", "1. Тут відображаються всі дані постачальника."),
                 self.t("suppliers.view_help.step2", "2. QR-коди можна збільшити, натиснувши на них."),
@@ -1534,22 +1566,44 @@ class SuppliersView:
             ),
             actions=[ft.TextButton(self.t("packaging.dlg.close", "Закрити"), on_click=lambda _: self._close_dlg(dlg))],
         )
-        self.content_area.page.show_dialog(dlg)
+        return dlg
 
-    def show_supplier_dialog(self, supplier=None):
+    async def show_supplier_dialog(self, supplier=None):
+        """Builds the (DB-heavy) supplier form off the UI thread, then shows
+        it — see ProductsView.show_product_dialog for the same fix and why
+        it matters on Android. The fast, non-DB permission checks run here
+        on the main thread first (cheap, and _show_snack/page.update() must
+        not be called from the background thread the builder runs in)."""
         if self.read_only_subordinate:
             self._show_snack(self.t("packaging.subordinate_readonly", "У вкладці підлеглого доступний лише перегляд"), "orange")
             return
+        if not getattr(self, "_region_create_allowed", True):
+            self._show_snack(
+                self.t(
+                    "products.no_category_access",
+                    "Немає доступу до категорій у цьому регіоні — лише перегляд",
+                ),
+                "orange",
+            )
+            return
 
+        result = await asyncio.to_thread(self._build_supplier_dialog, supplier)
+        if isinstance(result, tuple):
+            _, error_msg = result
+            self._show_snack(error_msg, "orange")
+            return
+        if result is not None:
+            self.content_area.page.show_dialog(result)
+
+    def _build_supplier_dialog(self, supplier=None):
         if (
             isinstance(supplier, dict)
             and supplier.get("id")
             and not self._can_modify_supplier(supplier)
         ):
-            self._show_snack(
-                self.t("suppliers.locked_by_other", "Цей постачальник закріплений за іншим користувачем"), "orange"
+            return None, self.t(
+                "suppliers.locked_by_other", "Цей постачальник закріплений за іншим користувачем"
             )
-            return
 
         is_edit = isinstance(supplier, dict)
         if not is_edit:
@@ -2494,7 +2548,7 @@ class SuppliersView:
 
         def _supplier_help(_):
             from views.help_utils import show_modal_help
-            _pg = self.content_area.page if self.content_area else None
+            _pg = self._page()
             show_modal_help(_pg, self.t("suppliers.edit_help.title", "Постачальник"), [
                 self.t("suppliers.edit_help.step1", "1. Введіть назву постачальника."),
                 self.t("suppliers.edit_help.step2", "2. Вкажіть телефон і оберіть регіон та валюту."),
@@ -2537,7 +2591,7 @@ class SuppliersView:
                 save_btn,
             ],
         )
-        self.content_area.page.show_dialog(dlg)
+        return dlg
 
     def archive_supplier(self, s_id):
         if self.read_only_subordinate:
@@ -2713,7 +2767,7 @@ class SuppliersView:
 
     def _show_help(self) -> None:
         from views.help_utils import show_modal_help
-        page = self.content_area.page if self.content_area else None
+        page = self._page()
         show_modal_help(page, self.t("suppliers.help.title", "Постачальники"), [
             self.t("suppliers.help.desc", "Каталог постачальників: контакти, реквізити оплати, регіони, валюта."),
             (self.t("suppliers.help.steps_title", "Як користуватись"), None),

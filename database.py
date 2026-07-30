@@ -129,6 +129,7 @@ class DataManager:
         # a single connection attribute without a signature change.
         self._general_pg_conn: psycopg.Connection | None = None
         self._general_pg_conns: dict[int, psycopg.Connection] = {}
+        self._general_pg_conns_last_used: dict[int, float] = {}
         self._general_schema_ready: bool = False
         # Per-company connections — each company has its OWN dedicated Postgres
         # database (connection info stored in public.companies on the general DB).
@@ -138,6 +139,12 @@ class DataManager:
         # connection — sharing one across threads let their queries interleave
         # on the same socket and hang indefinitely under load (see _pg()).
         self._company_conns: dict[str, psycopg.Connection] = {}
+        # Last-use timestamp per _pg() cache key — lets us cheaply detect a
+        # connection the server silently dropped while idle (cloud Postgres
+        # idle timeout, laptop sleep/resume, network blip) before handing it
+        # to a caller, instead of the caller's first query blowing up with
+        # "server closed the connection unexpectedly".
+        self._company_conns_last_used: dict[str, float] = {}
         # Guards _ensure_company_schema/_backfill_owner_tables so only the
         # FIRST thread to open a connection for a given company runs the DDL
         # bootstrap batch — every other concurrent background thread (tab
@@ -184,6 +191,19 @@ class DataManager:
         self._session_cache[cache_key] = value
         return value
 
+    def _invalidate_mgr_scope_cache(self, company_id: str) -> None:
+        """Clear cached _get_manager_visible_scope_context() results for this
+        company. That context bakes in entity_owners-derived id sets (orders,
+        packaging, schedule groups) at compute time, so anything created
+        after it was cached stays invisible to its own creator until this is
+        cleared — otherwise only an app restart (fresh, empty cache) fixes it."""
+        cid = str(company_id or "").strip()
+        if not cid:
+            return
+        prefix = f"mgr_scope_{cid}_"
+        for k in [k for k in self._session_cache if k.startswith(prefix)]:
+            self._session_cache.pop(k, None)
+
     def _invalidate_product_scope_cache(self, company_id: str) -> None:
         """Clear manager-scope AND get_products() cache entries for this
         company after add/update/delete."""
@@ -228,12 +248,21 @@ class DataManager:
             self._session_cache.pop(k, None)
 
     def invalidate_packaging_cache(self, company_id: str) -> None:
-        """Clear the cached get_packaging() result for this company."""
+        """Clear the cached get_packaging() result for this company.
+
+        Also clears mgr_scope_* — _get_manager_visible_scope_context() caches
+        packaging_ids (derived partly from entity_owners), so without this a
+        newly-created packaging stays invisible to its creator until the
+        cached scope context expires (i.e. an app restart)."""
         cid = str(company_id or "").strip()
         if not cid:
             return
-        prefix = f"packaging_{cid}_"
-        for k in [k for k in self._session_cache if k.startswith(prefix)]:
+        stale = [
+            k
+            for k in self._session_cache
+            if k.startswith(f"packaging_{cid}_") or k.startswith(f"mgr_scope_{cid}_")
+        ]
+        for k in stale:
             self._session_cache.pop(k, None)
 
     def invalidate_categories_cache(self, company_id: str) -> None:
@@ -362,6 +391,18 @@ class DataManager:
             raise RuntimeError("Postgres mode is not enabled (missing DATABASE_URL)")
         tid = threading.get_ident()
         conn = self._general_pg_conns.get(tid)
+        if conn is not None and not conn.closed:
+            # See _pg()'s matching check — a connection idle long enough may
+            # have been silently dropped server-side.
+            last_used = self._general_pg_conns_last_used.get(tid, 0.0)
+            if (time.monotonic() - last_used) > 30.0:
+                try:
+                    conn.execute("SELECT 1")
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        conn.close()
+                    conn = None
+                    self._general_pg_conns.pop(tid, None)
         if conn is None or conn.closed:
             conn = psycopg.connect(
                 self._pg_dsn,
@@ -382,6 +423,7 @@ class DataManager:
                 self._general_schema_ready = True
             except Exception:
                 logger.exception("_ensure_general_schema failed")
+        self._general_pg_conns_last_used[tid] = time.monotonic()
         return conn
 
     def _evict_general_connections(self) -> None:
@@ -523,6 +565,23 @@ class DataManager:
             else f"{cid}::t{tid}"
         )
         conn = self._company_conns.get(cache_key)
+        if conn is not None and not conn.closed:
+            # A connection idle for a while may have been silently dropped by
+            # the server (idle timeout, machine sleep/resume) while psycopg's
+            # own `.closed` flag still reads False — that only flips true
+            # *after* a query fails on it. Ping once before handing out a
+            # connection that's been sitting unused, so that failure (and the
+            # reconnect) happens here instead of surfacing as an unhandled
+            # OperationalError in whatever UI action runs the next query.
+            last_used = self._company_conns_last_used.get(cache_key, 0.0)
+            if (time.monotonic() - last_used) > 30.0:
+                try:
+                    conn.execute("SELECT 1")
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        conn.close()
+                    conn = None
+                    self._company_conns.pop(cache_key, None)
         if conn is None or conn.closed:
             dsn = self._resolve_company_dsn(cid)
             conn = psycopg.connect(dsn, autocommit=True, row_factory=dict_row)
@@ -542,6 +601,7 @@ class DataManager:
                     )
                     with self._schema_bootstrap_lock:
                         self._schema_bootstrapped_companies.discard(cid)
+        self._company_conns_last_used[cache_key] = time.monotonic()
         return conn
 
     def _evict_company_connections(self, company_id: str) -> None:
@@ -685,6 +745,13 @@ class DataManager:
             # rules used by the company registration flow.
             "ALTER TABLE public.managers ADD COLUMN IF NOT EXISTS account_kind character varying NOT NULL DEFAULT 'company';",
             "CREATE UNIQUE INDEX IF NOT EXISTS ux_managers_email_individual ON public.managers (lower(trim(email))) WHERE account_kind = 'individual';",
+            # Single-active-device enforcement: every successful login overwrites
+            # this with a fresh token and hands it to that device's session; any
+            # other device still holding an older token gets polled out (see
+            # check_auth / get_manager_active_session_token / dashboard.py's
+            # _watch_session_kick) — only the most-recently-logged-in device per
+            # manager account stays authenticated.
+            "ALTER TABLE public.managers ADD COLUMN IF NOT EXISTS active_session_token character varying;",
             """
             CREATE TABLE IF NOT EXISTS public.app_update_policy (
               id character varying NOT NULL,
@@ -4734,13 +4801,139 @@ class DataManager:
             row = cur.fetchone() or {}
         return int(row.get("n") or 0)
 
+    def _force_delete_products_and_dependents(
+        self, company_id: str, product_ids: list
+    ) -> dict:
+        """
+        Admin-only force delete: given a set of product ids that are about to
+        be removed (because their catalog category/level is being force-
+        deleted), cascade-remove everything that hangs off them — schedule
+        tasks/groups, media plan entries, cost-price stock inputs, orders
+        that contain them (and those orders' own cost-price inputs) — plus
+        their entity_owners rows. Without this, force-deleting the category
+        would leave dangling product_id references scattered across half a
+        dozen tables. Not used by the default (non-force) delete path, which
+        refuses outright instead.
+        """
+        cid = str(company_id or "").strip()
+        pids = sorted({str(x).strip() for x in (product_ids or []) if str(x).strip()})
+        counts = {
+            "products": 0, "orders": 0, "schedule_groups": 0,
+            "schedule_tasks": 0, "media_plan": 0,
+        }
+        if not self._use_postgres() or not cid or not pids:
+            return counts
+        pid_set = set(pids)
+        with self._pg().cursor() as cur:
+            cur.execute(
+                "SELECT id, product_ids FROM order_schedule_groups WHERE company_id=%s",
+                (cid,),
+            )
+            group_ids = [
+                str(r.get("id"))
+                for r in (cur.fetchall() or [])
+                if isinstance(r, dict)
+                and (set(self._normalize_json_list(r.get("product_ids"))) & pid_set)
+            ]
+            task_ids: list[str] = []
+            if group_ids:
+                cur.execute(
+                    "SELECT id FROM order_schedule_tasks WHERE group_id = ANY(%s)",
+                    (group_ids,),
+                )
+                task_ids = [
+                    str(r.get("id")) for r in (cur.fetchall() or []) if isinstance(r, dict)
+                ]
+
+            cur.execute(
+                "SELECT id, product_ids FROM media_plan_entries WHERE company_id=%s",
+                (cid,),
+            )
+            media_ids = [
+                str(r.get("id"))
+                for r in (cur.fetchall() or [])
+                if isinstance(r, dict)
+                and (set(self._normalize_json_list(r.get("product_ids"))) & pid_set)
+            ]
+
+            cur.execute(
+                """
+                SELECT id FROM orders o
+                WHERE o.company_id=%s
+                  AND EXISTS (
+                      SELECT 1
+                      FROM jsonb_array_elements(COALESCE(o.data->'items', '[]'::jsonb)) it
+                      WHERE (it->>'product_id') = ANY(%s)
+                  )
+                """,
+                (cid, pids),
+            )
+            order_ids = [
+                str(r.get("id")) for r in (cur.fetchall() or []) if isinstance(r, dict)
+            ]
+
+            if task_ids:
+                cur.execute("DELETE FROM order_schedule_tasks WHERE id = ANY(%s)", (task_ids,))
+                cur.execute(
+                    "DELETE FROM entity_owners WHERE company_id=%s AND entity_type='schedule_task' AND entity_id = ANY(%s)",
+                    (cid, task_ids),
+                )
+            if group_ids:
+                cur.execute("DELETE FROM order_schedule_groups WHERE id = ANY(%s)", (group_ids,))
+                cur.execute(
+                    "DELETE FROM entity_owners WHERE company_id=%s AND entity_type='schedule_group' AND entity_id = ANY(%s)",
+                    (cid, group_ids),
+                )
+            if media_ids:
+                cur.execute("DELETE FROM media_plan_entries WHERE id = ANY(%s)", (media_ids,))
+                cur.execute(
+                    "DELETE FROM entity_owners WHERE company_id=%s AND entity_type='media_plan' AND entity_id = ANY(%s)",
+                    (cid, media_ids),
+                )
+
+            cur.execute(
+                "DELETE FROM cost_price_stock_inputs WHERE company_id=%s AND product_id = ANY(%s)",
+                (cid, pids),
+            )
+
+            if order_ids:
+                cur.execute(
+                    "DELETE FROM cost_price_order_inputs WHERE company_id=%s AND order_id = ANY(%s)",
+                    (cid, order_ids),
+                )
+                cur.execute("DELETE FROM orders WHERE id = ANY(%s)", (order_ids,))
+                cur.execute(
+                    "DELETE FROM entity_owners WHERE company_id=%s AND entity_type='order' AND entity_id = ANY(%s)",
+                    (cid, order_ids),
+                )
+
+            cur.execute("DELETE FROM products WHERE company_id=%s AND id = ANY(%s)", (cid, pids))
+            cur.execute(
+                "DELETE FROM entity_owners WHERE company_id=%s AND entity_type='product' AND entity_id = ANY(%s)",
+                (cid, pids),
+            )
+
+        counts = {
+            "products": len(pids),
+            "orders": len(order_ids),
+            "schedule_groups": len(group_ids),
+            "schedule_tasks": len(task_ids),
+            "media_plan": len(media_ids),
+        }
+        logger.info(
+            "_force_delete_products_and_dependents company=%s -> %s", cid, counts
+        )
+        return counts
+
     def delete_category(
-        self, company_id: str, category_id: str
+        self, company_id: str, category_id: str, force: bool = False
     ) -> tuple[bool, str]:
         """Hard-delete a category (and its level_nodes/subcategories/series/
         brands) - only when NOTHING references it. Unlike archive_category,
         this permanently removes the rows; use archive instead if the
-        category (or anything under it) is actually in use."""
+        category (or anything under it) is actually in use. Pass force=True
+        (admin-only, from the UI) to cascade-delete every product under it
+        instead of refusing — see _force_delete_products_and_dependents."""
         cid = str(company_id or "").strip()
         catid = str(category_id or "").strip()
         if not self._use_postgres() or not cid or not catid:
@@ -4788,22 +4981,45 @@ class DataManager:
             used = self._count_products_by_data_field(cid, "brand_id", brand_ids)
         if not used and series_ids:
             used = self._count_products_by_data_field(cid, "series_id", series_ids)
-        if used:
+        if used and not force:
             return False, (
                 f"Категорію використовують {used} товар(ів) - "
                 "спочатку заархівуйте, видалити не можна"
             )
+
         with self._pg().cursor() as cur:
             cur.execute(
                 "SELECT count(*) AS n FROM order_schedule_groups WHERE company_id=%s AND category_id=%s",
                 (cid, catid),
             )
             schedule_n = int((cur.fetchone() or {}).get("n") or 0)
-        if schedule_n:
+        if schedule_n and not force:
             return False, (
                 f"Категорію використовують {schedule_n} групи розкладу замовлень - "
                 "спочатку заархівуйте, видалити не можна"
             )
+
+        deleted_products = 0
+        if force and (used or schedule_n):
+            with self._pg().cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM products WHERE company_id=%s AND (data->>'category_id' = %s OR data->>'catalog_node_id' = ANY(%s))",
+                    (cid, catid, [catid] + level_ids),
+                )
+                product_ids = [
+                    str(r.get("id")) for r in (cur.fetchall() or []) if isinstance(r, dict)
+                ]
+                cur.execute(
+                    "DELETE FROM order_schedule_tasks WHERE group_id IN (SELECT id FROM order_schedule_groups WHERE company_id=%s AND category_id=%s)",
+                    (cid, catid),
+                )
+                cur.execute(
+                    "DELETE FROM order_schedule_groups WHERE company_id=%s AND category_id=%s",
+                    (cid, catid),
+                )
+            if product_ids:
+                self._force_delete_products_and_dependents(cid, product_ids)
+            deleted_products = len(product_ids)
 
         all_node_ids = level_ids + subcat_ids + series_ids + brand_ids + [catid]
         with self._pg().cursor() as cur:
@@ -4824,6 +5040,8 @@ class DataManager:
             self.sync_company_catalog_nodes(cid)
         self._pulse(cid, "catalog")
         self._pulse(cid, "products")
+        if deleted_products:
+            return True, f"Категорію видалено разом з {deleted_products} товар(ів)"
         return True, "Категорію видалено"
 
     def _delete_leaf_catalog_row(
@@ -5233,10 +5451,13 @@ class DataManager:
             self._pulse(company_id, "catalog")
         return True
 
-    def delete_level_node(self, node_id: str) -> tuple[bool, str]:
+    def delete_level_node(self, node_id: str, force: bool = False) -> tuple[bool, str]:
         """Hard-delete a level node and its whole subtree - only when
         nothing references any node in that subtree. Unlike
-        archive_level_node, this permanently removes the rows."""
+        archive_level_node, this permanently removes the rows. Pass
+        force=True (admin-only, from the UI) to cascade-delete every
+        product in the subtree instead of refusing — see
+        _force_delete_products_and_dependents."""
         nid = str(node_id or "").strip()
         if not self._use_postgres() or not nid:
             return False, "Некоректні дані"
@@ -5258,11 +5479,25 @@ class DataManager:
         used = self._count_products_by_data_field(
             company_id, "catalog_node_id", subtree_ids
         )
-        if used:
+        if used and not force:
             return False, (
                 f"Рівень використовують {used} товар(ів) - "
                 "спочатку заархівуйте, видалити не можна"
             )
+
+        deleted_products = 0
+        if force and used:
+            with self._pg().cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM products WHERE company_id=%s AND data->>'catalog_node_id' = ANY(%s)",
+                    (company_id, subtree_ids),
+                )
+                product_ids = [
+                    str(r.get("id")) for r in (cur.fetchall() or []) if isinstance(r, dict)
+                ]
+            if product_ids:
+                self._force_delete_products_and_dependents(company_id, product_ids)
+            deleted_products = len(product_ids)
 
         with self._pg().cursor() as cur:
             cur.execute("DELETE FROM level_nodes WHERE id = ANY(%s)", (subtree_ids,))
@@ -5273,6 +5508,9 @@ class DataManager:
         with contextlib.suppress(Exception):
             self.sync_company_catalog_nodes(company_id)
         self._pulse(company_id, "catalog")
+        self._pulse(company_id, "products")
+        if deleted_products:
+            return True, f"Рівень видалено разом з {deleted_products} товар(ів)"
         return True, "Рівень видалено"
 
     # ----------------- edit locks (Postgres mode) -----------------
@@ -7381,6 +7619,34 @@ class DataManager:
         rid = str(region_id or "").strip()
         try:
             with self._pg().cursor() as cur:
+                # The table is otherwise only ever created lazily by
+                # add_packaging_writeoff() on the first write -- a company
+                # that only ever READS this (e.g. just opening the view)
+                # before anyone has recorded a single write-off would hit
+                # UndefinedTable here. Ensure it exists on the read path too.
+                with contextlib.suppress(Exception):
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS packaging_writeoffs (
+                            id          uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+                            context_id  text NOT NULL,
+                            product_id  text NOT NULL,
+                            seq_no      int  NOT NULL DEFAULT 1,
+                            qty         float8 NOT NULL DEFAULT 0,
+                            pack_qty    float8 NOT NULL DEFAULT 0,
+                            goods_qty   float8 NOT NULL DEFAULT 0,
+                            order_date  date,
+                            invoice_no  text NOT NULL DEFAULT '',
+                            comment     text NOT NULL DEFAULT 'Списання',
+                            manager_id  text NOT NULL DEFAULT '',
+                            region_id   text NOT NULL DEFAULT '',
+                            company_id  text NOT NULL DEFAULT '',
+                            created_at  timestamptz NOT NULL DEFAULT now(),
+                            updated_at  timestamptz NOT NULL DEFAULT now(),
+                            UNIQUE (context_id, product_id, seq_no, manager_id, region_id)
+                        )
+                        """
+                    )
                 # Ensure new columns exist before reading them (idempotent, cheap DDL)
                 for _col, _def in (
                     ("pack_qty", "float8 NOT NULL DEFAULT 0"),
@@ -8815,6 +9081,7 @@ class DataManager:
                     ),
                 )
             self._pulse(cid, "orders")
+            self._invalidate_mgr_scope_cache(cid)
             with contextlib.suppress(Exception):
                 self.reconcile_packaging_supply_goods_links(
                     cid, rid, manager_id=str(mid)
@@ -9621,6 +9888,7 @@ class DataManager:
             except Exception:
                 # display_label column doesn't exist yet — retry without it
                 _do_upsert(with_label=False)
+            self._pulse(cid, "media_plan")
             return True
         except Exception:
             logger.exception("upsert_media_plan_entry failed")
@@ -9940,6 +10208,7 @@ class DataManager:
                     ),
                 )
             self._pulse(cid, "schedule")
+            self._invalidate_mgr_scope_cache(cid)
             return True
         except Exception:
             logger.exception("upsert_order_schedule_group failed")
@@ -20265,11 +20534,229 @@ class DataManager:
             )
         return True
 
+    def _cleanup_orphaned_catalog_branches(
+        self, company_id: str, candidate_ids: list[str]
+    ) -> None:
+        """
+        Best-effort sweep run after a manager's node_owners rows are removed
+        (delete_manager_profile). Any candidate node/category that manager
+        used to own and that is now owned by nobody at all, AND whose whole
+        subtree is likewise unowned, is dead: no restricted (non-bypass)
+        manager will ever see it again, so it would just accumulate as an
+        invisible artifact. Removes those branches via the same safety-
+        checked delete_level_node/delete_category paths the UI uses — both
+        refuse (no-op) if any product anywhere in the subtree still
+        references it, so real data is never touched. Branches that still
+        have another owner are left untouched.
+        """
+        cid = str(company_id or "").strip()
+        ids = {str(x) for x in (candidate_ids or []) if str(x or "").strip()}
+        if not self._use_postgres() or not cid or not ids:
+            return
+        try:
+            with self._pg().cursor() as cur:
+                cur.execute("SELECT id FROM categories WHERE company_id=%s", (cid,))
+                cat_ids = {
+                    str(r.get("id"))
+                    for r in (cur.fetchall() or [])
+                    if isinstance(r, dict) and r.get("id")
+                }
+                if not cat_ids:
+                    return
+                cur.execute(
+                    "SELECT id, category_id, parent_node_id FROM level_nodes WHERE category_id = ANY(%s)",
+                    (list(cat_ids),),
+                )
+                nodes = cur.fetchall() or []
+                cur.execute(
+                    "SELECT DISTINCT node_id FROM node_owners WHERE company_id=%s",
+                    (cid,),
+                )
+                owned_ids = {
+                    str(r.get("node_id"))
+                    for r in (cur.fetchall() or [])
+                    if isinstance(r, dict) and r.get("node_id")
+                }
+
+            children_by_scope: dict[tuple[str, str], list[str]] = {}
+            node_category: dict[str, str] = {}
+            for n in nodes:
+                nid = str(n.get("id"))
+                catid = str(n.get("category_id"))
+                parent = str(n.get("parent_node_id") or "root")
+                node_category[nid] = catid
+                children_by_scope.setdefault((catid, parent), []).append(nid)
+
+            def is_dead(catid: str, node_id: str) -> bool:
+                if node_id in owned_ids:
+                    return False
+                return all(
+                    is_dead(catid, child)
+                    for child in children_by_scope.get((catid, node_id), [])
+                )
+
+            for candidate in ids:
+                try:
+                    if candidate in cat_ids:
+                        if candidate in owned_ids:
+                            continue
+                        top_nodes = children_by_scope.get((candidate, "root"), [])
+                        if all(is_dead(candidate, n) for n in top_nodes):
+                            ok, msg = self.delete_category(cid, candidate)
+                            logger.info(
+                                "delete_manager_profile cleanup: delete_category %s -> %s (%s)",
+                                candidate, ok, msg,
+                            )
+                    elif candidate in node_category:
+                        catid = node_category[candidate]
+                        if is_dead(catid, candidate):
+                            ok, msg = self.delete_level_node(candidate)
+                            logger.info(
+                                "delete_manager_profile cleanup: delete_level_node %s -> %s (%s)",
+                                candidate, ok, msg,
+                            )
+                except Exception:
+                    logger.exception(
+                        "delete_manager_profile cleanup failed for node %s", candidate
+                    )
+        except Exception:
+            logger.exception("_cleanup_orphaned_catalog_branches failed")
+
+    # Entities that participate in the shared-ownership model (entity_owners,
+    # derived from node_owners): plain `id` primary key, most also have their
+    # own `manager_id` column. cost_price_order_inputs/cost_price_stock_inputs
+    # use composite natural keys instead of `id` and are intentionally excluded
+    # — handled by the plain unconditional per-manager delete in
+    # delete_manager_profile, same as before.
+    _SHARED_OWNERSHIP_ENTITY_SPECS: tuple[tuple[str, str, bool], ...] = (
+        ("schedule_task", "order_schedule_tasks", True),
+        ("schedule_group", "order_schedule_groups", True),
+        ("media_plan", "media_plan_entries", True),
+        ("packaging_context", "packaging_supply_contexts", False),
+        ("order", "orders", True),
+        ("product", "products", True),
+        ("packaging", "packaging", True),
+        ("supplier", "suppliers", True),
+    )
+
+    def _cascade_or_strip_manager_entities(
+        self, company_id: str, manager_id: str
+    ) -> dict:
+        """
+        Deleting a manager should not leave their sole-owned data behind as
+        dead weight, but must not touch anything genuinely shared with a
+        remaining manager either. For every entity type in
+        _SHARED_OWNERSHIP_ENTITY_SPECS: if `manager_id` is the ONLY real
+        owner (per entity_owners — the same shared-ownership table
+        recompute_entity_owners_for_scope maintains — falling back to the
+        row's own manager_id column when no entity_owners rows exist for it
+        yet), the row is hard-deleted outright (products, orders, packaging,
+        suppliers, schedule/media-plan entries — everything under it). If
+        another manager still co-owns it (shared catalog-node access), the
+        row is kept and its manager_id column is reassigned to one of the
+        remaining owners instead of being left pointing at a manager that no
+        longer exists; that manager's own entity_owners row for it still
+        gets removed by the unconditional cleanup at the end of
+        delete_manager_profile, so remaining owners are correctly preserved.
+        """
+        cid = str(company_id or "").strip()
+        mid = str(manager_id or "").strip()
+        counts: dict = {"deleted": {}, "reassigned": {}}
+        if not self._use_postgres() or not cid or not mid:
+            return counts
+        with self._pg().cursor() as cur:
+            for entity_type, table, has_manager_col in self._SHARED_OWNERSHIP_ENTITY_SPECS:
+                try:
+                    direct_ids: set[str] = set()
+                    if has_manager_col:
+                        cur.execute(
+                            f"SELECT id FROM {table} WHERE company_id=%s AND manager_id=%s",
+                            (cid, mid),
+                        )
+                        direct_ids = {
+                            str(r.get("id"))
+                            for r in (cur.fetchall() or [])
+                            if isinstance(r, dict) and r.get("id")
+                        }
+                    cur.execute(
+                        "SELECT DISTINCT entity_id FROM entity_owners WHERE company_id=%s AND entity_type=%s AND manager_id=%s",
+                        (cid, entity_type, mid),
+                    )
+                    owner_ids = {
+                        str(r.get("entity_id"))
+                        for r in (cur.fetchall() or [])
+                        if isinstance(r, dict) and r.get("entity_id")
+                    }
+                    entity_ids = direct_ids | owner_ids
+                    if not entity_ids:
+                        continue
+
+                    cur.execute(
+                        "SELECT entity_id, manager_id FROM entity_owners WHERE company_id=%s AND entity_type=%s AND entity_id = ANY(%s)",
+                        (cid, entity_type, list(entity_ids)),
+                    )
+                    owners_by_entity: dict[str, set[str]] = {}
+                    for r in cur.fetchall() or []:
+                        if not isinstance(r, dict):
+                            continue
+                        eid = str(r.get("entity_id"))
+                        om = str(r.get("manager_id"))
+                        if eid and om:
+                            owners_by_entity.setdefault(eid, set()).add(om)
+
+                    to_delete: list[str] = []
+                    to_reassign: dict[str, str] = {}
+                    for eid in entity_ids:
+                        owners = set(owners_by_entity.get(eid, set()))
+                        if not owners and eid in direct_ids:
+                            # No entity_owners rows at all yet — its only tie
+                            # is the manager_id column itself.
+                            owners = {mid}
+                        remaining = owners - {mid}
+                        if remaining:
+                            if has_manager_col and eid in direct_ids:
+                                to_reassign[eid] = sorted(remaining)[0]
+                        else:
+                            to_delete.append(eid)
+
+                    if to_delete:
+                        cur.execute(
+                            f"DELETE FROM {table} WHERE company_id=%s AND id = ANY(%s)",
+                            (cid, to_delete),
+                        )
+                        cur.execute(
+                            "DELETE FROM entity_owners WHERE company_id=%s AND entity_type=%s AND entity_id = ANY(%s)",
+                            (cid, entity_type, to_delete),
+                        )
+                        counts["deleted"][entity_type] = len(to_delete)
+
+                    for eid, new_mid in to_reassign.items():
+                        cur.execute(
+                            f"UPDATE {table} SET manager_id=%s WHERE company_id=%s AND id=%s",
+                            (new_mid, cid, eid),
+                        )
+                    if to_reassign:
+                        counts["reassigned"][entity_type] = len(to_reassign)
+                except Exception:
+                    logger.exception(
+                        "_cascade_or_strip_manager_entities failed for %s", entity_type
+                    )
+        logger.info(
+            "_cascade_or_strip_manager_entities manager=%s company=%s -> %s",
+            mid, cid, counts,
+        )
+        return counts
+
     def delete_manager_profile(self, manager_id: str) -> bool:
         """
         Delete manager and ALL their data: orders, suppliers, products, packaging,
         settlements, cost-price inputs, scheduling, media plans, ownership rows.
-        Categories and catalog hierarchy are preserved.
+
+        Anything the manager solely owned is fully deleted (see
+        _cascade_or_strip_manager_entities / _cleanup_orphaned_catalog_branches).
+        Anything genuinely shared with another manager (still has another
+        owner after this one is removed) is kept — this manager is simply
+        dropped from it, and the remaining owner(s) keep full access.
         """
         if not self._use_postgres():
             return bool(
@@ -20294,23 +20781,20 @@ class DataManager:
             if company_id:
                 self.set_company(company_id, manager_id=mid)
 
+            # Sole-vs-shared cascade for the entities that support shared
+            # ownership (products/orders/packaging/suppliers/schedule/media
+            # plan) — must run BEFORE node_owners/entity_owners for this
+            # manager are wiped below, since that's the data the sole-vs-
+            # shared decision is based on.
+            if company_id:
+                with contextlib.suppress(Exception):
+                    self._cascade_or_strip_manager_entities(company_id, mid)
+
             with self._pg().cursor() as cur:
                 # === DATA TABLES (order matters for any implicit FKs) ===
-                # Schedule tasks before groups
-                with contextlib.suppress(Exception):
-                    cur.execute(
-                        "DELETE FROM order_schedule_tasks WHERE manager_id=%s", (mid,)
-                    )
-                with contextlib.suppress(Exception):
-                    cur.execute(
-                        "DELETE FROM order_schedule_groups WHERE manager_id=%s", (mid,)
-                    )
-                # Media plan
-                with contextlib.suppress(Exception):
-                    cur.execute(
-                        "DELETE FROM media_plan_entries WHERE manager_id=%s", (mid,)
-                    )
-                # Cost price
+                # Cost price inputs use composite natural keys (no plain id),
+                # so they're not part of the shared-ownership cascade above —
+                # always tied 1:1 to this manager, unconditional delete.
                 with contextlib.suppress(Exception):
                     cur.execute(
                         "DELETE FROM cost_price_order_inputs WHERE manager_id=%s",
@@ -20321,35 +20805,29 @@ class DataManager:
                         "DELETE FROM cost_price_stock_inputs WHERE manager_id=%s",
                         (mid,),
                     )
-                # Settlements
+                # Settlements / write-offs are personal transaction logs, not
+                # part of the shared-ownership model — unconditional delete.
                 with contextlib.suppress(Exception):
                     cur.execute(
                         "DELETE FROM supplier_settlements WHERE manager_id=%s", (mid,)
                     )
-                # Packaging write-offs
                 with contextlib.suppress(Exception):
                     cur.execute(
                         "DELETE FROM packaging_writeoffs WHERE manager_id=%s", (mid,)
                     )
-                # Orders
+                # Ownership — capture what this manager owned BEFORE removing
+                # their node_owners rows, so we can sweep for now-fully-
+                # orphaned catalog branches afterward (see cleanup call below).
+                owned_node_ids: list[str] = []
                 with contextlib.suppress(Exception):
-                    if company_id:
-                        cur.execute(
-                            "DELETE FROM orders WHERE manager_id=%s AND company_id=%s",
-                            (mid, company_id),
-                        )
-                    else:
-                        cur.execute("DELETE FROM orders WHERE manager_id=%s", (mid,))
-                # Packaging
-                with contextlib.suppress(Exception):
-                    cur.execute("DELETE FROM packaging WHERE manager_id=%s", (mid,))
-                # Products
-                with contextlib.suppress(Exception):
-                    cur.execute("DELETE FROM products WHERE manager_id=%s", (mid,))
-                # Suppliers
-                with contextlib.suppress(Exception):
-                    cur.execute("DELETE FROM suppliers WHERE manager_id=%s", (mid,))
-                # Ownership
+                    cur.execute(
+                        "SELECT node_id FROM node_owners WHERE manager_id=%s", (mid,)
+                    )
+                    owned_node_ids = [
+                        str(r.get("node_id"))
+                        for r in (cur.fetchall() or [])
+                        if isinstance(r, dict) and r.get("node_id")
+                    ]
                 with contextlib.suppress(Exception):
                     cur.execute("DELETE FROM node_owners WHERE manager_id=%s", (mid,))
                 with contextlib.suppress(Exception):
@@ -20396,6 +20874,16 @@ class DataManager:
                     )
                 with contextlib.suppress(Exception):
                     cur.execute("DELETE FROM edit_locks WHERE manager_id=%s", (mid,))
+
+            # Catalog hierarchy is normally preserved on manager deletion (it
+            # may be shared with other managers, or with admins who bypass
+            # ownership entirely) — but a branch this manager was the LAST
+            # owner of, with zero products anywhere in it, is now invisible
+            # to every restricted manager and would just accumulate as dead
+            # weight forever. Sweep those specific branches away.
+            if company_id and owned_node_ids:
+                with contextlib.suppress(Exception):
+                    self._cleanup_orphaned_catalog_branches(company_id, owned_node_ids)
 
             # === MANAGER RECORD (general database) ===
             with self._general_pg().cursor() as _gcur:
@@ -20725,6 +21213,19 @@ class DataManager:
             # ensure at least one region exists for smoother UI
             with contextlib.suppress(Exception):
                 self.create_region_with_defaults(cid, "Default")
+            bootstrap_session_token = ""
+            try:
+                bootstrap_session_token = str(uuid.uuid4())
+                with self._general_pg().cursor() as cur:
+                    cur.execute(
+                        "UPDATE public.managers SET active_session_token=%s WHERE id=%s",
+                        (bootstrap_session_token, mid),
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to stamp active_session_token on bootstrap login"
+                )
+                bootstrap_session_token = ""
             return {
                 "id": mid,
                 "company_id": cid,
@@ -20738,6 +21239,7 @@ class DataManager:
                 "account_kind": "company",
                 "storage_mode": "vps",
                 "superadmin_explicit_mode": True,
+                "session_token": bootstrap_session_token,
             }
 
         # Normal auth:
@@ -20954,6 +21456,22 @@ class DataManager:
             returned_company_name or "?",
             _cid_log[:12],
         )
+        # Single-active-device enforcement: stamp a fresh token on this login,
+        # overwriting whatever a previous device's session was holding — that
+        # older device's next _watch_session_kick poll will see the mismatch
+        # and force itself back to the login screen.
+        session_token = ""
+        if is_ok:
+            try:
+                session_token = str(uuid.uuid4())
+                with self._general_pg().cursor() as cur:
+                    cur.execute(
+                        "UPDATE public.managers SET active_session_token=%s WHERE id=%s",
+                        (session_token, row.get("id")),
+                    )
+            except Exception:
+                logger.exception("Failed to stamp active_session_token on login")
+                session_token = ""
         return {
             "id": row.get("id"),
             "company_id": row.get("company_id"),
@@ -20966,7 +21484,28 @@ class DataManager:
             "password": password,
             "account_kind": returned_account_kind,
             "storage_mode": returned_storage_mode,
+            "session_token": session_token,
         }
+
+    def get_manager_active_session_token(self, manager_id: str) -> str | None:
+        """Current active_session_token for `manager_id`, polled by
+        dashboard.py's _watch_session_kick to detect a login from another
+        device. Returns None (not "") on any lookup failure/unsupported
+        backend so the caller can tell "couldn't check" apart from a genuine
+        empty token and skip the kick rather than false-triggering it."""
+        if not self._use_postgres():
+            return None
+        try:
+            with self._general_pg().cursor() as cur:
+                cur.execute(
+                    "SELECT active_session_token FROM public.managers WHERE id=%s",
+                    (str(manager_id or ""),),
+                )
+                row = cur.fetchone()
+                return str((row or {}).get("active_session_token") or "")
+        except Exception:
+            logger.exception("get_manager_active_session_token failed")
+            return None
 
     def force_superadmin_credentials(
         self,
@@ -21776,6 +22315,54 @@ class DataManager:
             for r in rows
             if isinstance(r, dict) and r.get("node_id")
         ]
+
+    def manager_has_category_access_in_region(
+        self, manager_id: str, company_id: str, region_id: str | None
+    ) -> bool:
+        """Whether this manager can create/edit anything in region_id right now.
+
+        Region access and category access are granted separately (a manager
+        can be allowed into a region via manager_allowed_regions without
+        owning a single category node there) -- creating/editing a product,
+        order, packaging item, etc. always requires assigning it to a
+        category, so a manager with zero owned nodes in this specific
+        region should only be able to view, never add/edit.
+
+        get_manager_scope_node_ids() is NOT region-scoped (it returns every
+        node this manager owns company-wide), so this cross-references
+        those node ids against catalog_nodes.region_id to get a true
+        per-region answer. Admin/superadmin roles are never scope-restricted.
+        """
+        mid = str(manager_id or "").strip()
+        cid = str(company_id or "").strip()
+        rid = str(region_id or "").strip()
+        if not mid or not cid:
+            return False
+        role_slug = self._get_manager_role_slug(mid)
+        if role_slug in {
+            "адмін", "админ", "admin", "суперадмін", "суперадмин", "superadmin",
+        }:
+            return True
+        if not rid:
+            return False
+        node_ids = [
+            str(x) for x in (self.get_manager_scope_node_ids(mid, cid, "view") or [])
+            if str(x or "").strip()
+        ]
+        if not node_ids:
+            return False
+        if not self._use_postgres():
+            return True  # HTTP-backend mode: no local cross-reference available.
+        try:
+            with self._pg().cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM catalog_nodes WHERE company_id=%s AND region_id=%s AND id = ANY(%s) LIMIT 1",
+                    (cid, rid, list(set(node_ids))),
+                )
+                return bool(cur.fetchone())
+        except Exception:
+            logger.exception("manager_has_category_access_in_region failed")
+            return True  # fail open -- never block on an unrelated query error
 
     def has_shared_node_ownership(
         self, company_id: str, manager_a: str, manager_b: str
