@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import functools
 
 import flet as ft
 
@@ -1076,15 +1077,15 @@ class CategoriesBrandsView:
         self._show_dialog_safe(dlg)
 
     def _archive_level_node_and_refresh(self, node_id):
-        def confirm_archive(e):
-            if self.db.archive_level_node(node_id):
+        async def confirm_archive(e):
+            ok = await asyncio.to_thread(self.db.archive_level_node, node_id)
+            self._close_dlg(confirm_dlg)
+            if ok:
                 self._expanded_node_ids.discard(node_id)
                 self._save_expanded_state()
-                self._close_dlg(confirm_dlg)
                 self.load_categories()
                 self._show_snack("Рівень перенесено в архів", "blue")
             else:
-                self._close_dlg(confirm_dlg)
                 self._show_snack("Не вдалося архівувати рівень", "red")
 
         confirm_dlg = ft.AlertDialog(
@@ -1102,16 +1103,19 @@ class CategoriesBrandsView:
         )
         self._show_dialog_safe(confirm_dlg)
 
-    def _restore_level_node_and_refresh(self, node_id):
-        if self.db.restore_level_node(node_id):
+    async def _restore_level_node_and_refresh(self, node_id):
+        ok = await asyncio.to_thread(self.db.restore_level_node, node_id)
+        if ok:
             self.load_categories()
             self._show_snack("Рівень відновлено з архіву", "blue")
         else:
             self._show_snack("Не вдалося відновити рівень", "red")
 
     def _confirm_force_delete_level_node(self, node_id, reason_msg):
-        def force_confirm(e):
-            ok, msg = self.db.delete_level_node(node_id, force=True)
+        async def force_confirm(e):
+            ok, msg = await asyncio.to_thread(
+                self.db.delete_level_node, node_id, force=True
+            )
             self._close_dlg(force_dlg)
             if ok:
                 self._expanded_node_ids.discard(node_id)
@@ -1145,8 +1149,8 @@ class CategoriesBrandsView:
             )
             return
 
-        def confirm_delete(e):
-            ok, msg = self.db.delete_level_node(node_id)
+        async def confirm_delete(e):
+            ok, msg = await asyncio.to_thread(self.db.delete_level_node, node_id)
             self._close_dlg(confirm_dlg)
             if not ok and "товар" in msg:
                 self._confirm_force_delete_level_node(node_id, msg)
@@ -1293,7 +1297,7 @@ class CategoriesBrandsView:
                 tooltip="Відновити з архіву" if is_archived else "Архівувати",
                 visible=not self.read_only_subordinate,
                 on_click=(
-                    (lambda _, nid=node.get("id"): self._restore_level_node_and_refresh(nid))
+                    functools.partial(self._restore_level_node_and_refresh, node.get("id"))
                     if is_archived
                     else (lambda _, nid=node.get("id"): self._archive_level_node_and_refresh(nid))
                 ),
@@ -1621,7 +1625,7 @@ class CategoriesBrandsView:
                         else self.t("categories.archive", "Архівувати")
                     ),
                     on_click=(
-                        (lambda _: self.restore_category(cat_id))
+                        functools.partial(self.restore_category, cat_id)
                         if is_archived
                         else (lambda _: self.archive_category(cat_id))
                     ),
@@ -2125,7 +2129,7 @@ class CategoriesBrandsView:
                 for row in levels_rows
             ]
 
-        def save_click(e):
+        async def save_click(e):
             self._clear_field_errors(name_f)
             name_val = (name_f.value or "").strip()
             if not name_val:
@@ -2155,7 +2159,8 @@ class CategoriesBrandsView:
             }
 
             if is_edit:
-                if can_rename_category and self.db.category_name_exists(
+                if can_rename_category and await asyncio.to_thread(
+                    self.db.category_name_exists,
                     target_company_id,
                     self._resolve_region_id(),
                     name_val,
@@ -2171,7 +2176,8 @@ class CategoriesBrandsView:
                     if can_rename_category
                     else (category.get("name") or name_val)
                 )
-                ok = self.db.update_category(
+                ok = await asyncio.to_thread(
+                    self.db.update_category,
                     category.get("id"),
                     update_name,
                     hierarchy_config=hierarchy_config,
@@ -2183,13 +2189,16 @@ class CategoriesBrandsView:
                 if not region_id:
                     self._show_snack("Оберіть або налаштуйте регіон", "orange")
                     return
-                if self.db.category_name_exists(self.company_id, region_id, name_val):
+                if await asyncio.to_thread(
+                    self.db.category_name_exists, self.company_id, region_id, name_val
+                ):
                     self._mark_required(name_f, "Така категорія вже існує")
                     self._show_snack("Така категорія вже існує", "orange")
                     with contextlib.suppress(Exception):
                         name_f.update()
                     return
-                created_id = self.db.create_category_with_access(
+                created_id = await asyncio.to_thread(
+                    self.db.create_category_with_access,
                     self.company_id,
                     region_id,
                     name_val,
@@ -2262,11 +2271,14 @@ class CategoriesBrandsView:
             )
             return
 
-        def confirm_archive(e):
-            if self.db.archive_category(category_id, manager_id=self.manager_id):
+        async def confirm_archive(e):
+            ok = await asyncio.to_thread(
+                self.db.archive_category, category_id, manager_id=self.manager_id
+            )
+            self._close_dlg(confirm_dlg)
+            if ok:
                 self._expanded_category_ids.discard(category_id)
                 self._save_expanded_state()
-                self._close_dlg(confirm_dlg)
                 self.load_categories()
                 self._show_snack(self.t("categories.category_archived", "Категорію перенесено в архів"), "green")
             else:
@@ -2284,7 +2296,7 @@ class CategoriesBrandsView:
         )
         self._show_dialog_safe(confirm_dlg)
 
-    def restore_category(self, category_id):
+    async def restore_category(self, category_id):
         if self.read_only_subordinate:
             self._show_snack(self.t("packaging.subordinate_readonly", "У вкладці підлеглого доступний лише перегляд"), "orange")
             return
@@ -2293,15 +2305,18 @@ class CategoriesBrandsView:
                 "Лише Адмін/СуперАдмін може керувати категоріями", "orange"
             )
             return
-        if self.db.restore_category(category_id):
+        ok = await asyncio.to_thread(self.db.restore_category, category_id)
+        if ok:
             self.load_categories()
             self._show_snack(self.t("categories.category_restored", "Категорію відновлено з архіву"), "green")
         else:
             self._show_snack("Помилка відновлення категорії", "red")
 
     def _confirm_force_delete_category(self, category_id, reason_msg):
-        def force_confirm(e):
-            ok, msg = self.db.delete_category(self.company_id, category_id, force=True)
+        async def force_confirm(e):
+            ok, msg = await asyncio.to_thread(
+                self.db.delete_category, self.company_id, category_id, force=True
+            )
             self._close_dlg(force_dlg)
             if ok:
                 self._expanded_category_ids.discard(category_id)
@@ -2338,8 +2353,10 @@ class CategoriesBrandsView:
             )
             return
 
-        def confirm_delete(e):
-            ok, msg = self.db.delete_category(self.company_id, category_id)
+        async def confirm_delete(e):
+            ok, msg = await asyncio.to_thread(
+                self.db.delete_category, self.company_id, category_id
+            )
             self._close_dlg(confirm_dlg)
             if not ok and "товар" in msg:
                 self._confirm_force_delete_category(category_id, msg)

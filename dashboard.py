@@ -3058,7 +3058,12 @@ class MainDashboard:
                     while True:
                         await asyncio.sleep(12)
                         try:
-                            mid = (self.current_manager_id or "").strip()
+                            # Always the ACTUAL logged-in account — never
+                            # self.current_manager_id, which is the "viewing
+                            # as a subordinate" workspace-tab context and
+                            # changes constantly during normal use, causing
+                            # false kicks against an unrelated manager's token.
+                            mid = str(self.user_data.get("id") or "").strip()
                             if not mid:
                                 continue
                             current_token = await asyncio.to_thread(
