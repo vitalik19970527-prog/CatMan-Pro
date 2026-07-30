@@ -2140,29 +2140,6 @@ def build_orders_table(view, rows: list) -> dict:
             grp_tariff = _safe_float(gdata.get("tariff"), None)
             grp_log_fact = _safe_float(gdata.get("log_fact"), None)
             grp_comment = str(gdata.get("comment") or "")
-            # Aggregate C/В: weighted average unit cost by qty across all
-            # sub-rows. Sub-rows can each be in a different native currency
-            # now, so every value is converted into orders_unit_cost_ccy
-            # first — averaging raw numbers across mixed currencies would be
-            # meaningless.
-            _grp_uc_parts = [
-                (
-                    view._convert_currency(
-                        _safe_float(r.get("unit_cost_usd"), None),
-                        str(r.get("unit_cost_currency") or "USD").upper().strip() or "USD",
-                        orders_unit_cost_ccy,
-                    ),
-                    _safe_float(r.get("qty"), 0.0) or 0.0,
-                )
-                for r in all_rows
-            ]
-            _grp_uc_qty_total = sum(q for uc, q in _grp_uc_parts if uc is not None)
-            grp_cv_usd = (
-                sum(uc * q for uc, q in _grp_uc_parts if uc is not None)
-                / _grp_uc_qty_total
-                if _grp_uc_qty_total > 0
-                else None
-            )
             grp_status = str(
                 (all_orders[0] if all_orders else {}).get("status") or "production"
             )
@@ -2341,16 +2318,11 @@ def build_orders_table(view, rows: list) -> dict:
                     h=_grp_h,
                 ),
                 _cell_text(
-                    (
-                        view._fmt_money(
-                            # grp_cv_usd was already converted into
-                            # orders_unit_cost_ccy while weight-averaging above.
-                            grp_cv_usd,
-                            orders_unit_cost_ccy,
-                        )
-                        if grp_cv_usd is not None
-                        else "-"
-                    ),
+                    # С/В (unit cost) is a per-product figure, already shown
+                    # on each sub-row — never shown/averaged on the merged
+                    # group header, since averaging across a group's
+                    # different products/orders would be meaningless.
+                    "-",
                     widths[17],
                     merge_bg,
                     h=_grp_h,
@@ -8653,32 +8625,16 @@ class CostPriceView:
         self._snack("Вагу розподілено — збережено локально", _SKY)
 
     def _update_merge_group_cv_cell(self, gid: str, order_ids_set: set) -> None:
-        """Recompute the merged group header C/В cell from current _orders_rows unit_cost_usd."""
+        """The merged group header never shows a С/В value — it's a
+        per-product figure, already shown on each sub-row; averaging it
+        across a merged group's different products/orders is meaningless."""
         cv_ref = (getattr(self, "_merge_cv_cell_refs", None) or {}).get(gid)
         if cv_ref is None:
             return
-        cv_cell, ccy = cv_ref
+        cv_cell, _ccy = cv_ref
         if not (hasattr(cv_cell, "content") and hasattr(cv_cell.content, "value")):
             return
-        parts = []
-        for row in self._orders_rows:
-            if str(row.get("order_id") or "") not in order_ids_set:
-                continue
-            uc = _safe_float(row.get("unit_cost_usd"), None)
-            uc_ccy = str(row.get("unit_cost_currency") or "USD").upper().strip() or "USD"
-            # Convert to the group's display currency before averaging —
-            # sub-rows can each be in a different native currency now.
-            uc_in_ccy = self._convert_currency(uc, uc_ccy, ccy) if uc is not None else None
-            q = _safe_float(row.get("qty"), 0.0) or 0.0
-            if uc_in_ccy is not None:
-                parts.append((uc_in_ccy, q))
-        total_q = sum(q for _, q in parts)
-        grp_cv_usd = sum(uc * q for uc, q in parts) / total_q if total_q > 0 else None
-        cv_cell.content.value = (
-            self._fmt_money(grp_cv_usd, ccy)
-            if grp_cv_usd is not None
-            else "-"
-        )
+        cv_cell.content.value = "-"
         with contextlib.suppress(Exception):
             cv_cell.update()
 
