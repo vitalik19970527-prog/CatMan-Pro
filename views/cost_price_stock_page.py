@@ -3186,6 +3186,7 @@ class CostPriceStockView:
         self._sticky_currency_bar_ref = currency_bar
         self._sticky_counters_ref = counters
         self._sticky_filter_bar_ref = filter_bar
+        self._sticky_totals_row_ref = totals_row
         self._sticky_table_header_ref = table_header_widget
 
         if pg:
@@ -3450,8 +3451,9 @@ class CostPriceStockView:
             _cb = getattr(self, "_sticky_currency_bar_ref", None)
             _cn = getattr(self, "_sticky_counters_ref", None)
             _fb = getattr(self, "_sticky_filter_bar_ref", None)
+            _tr = getattr(self, "_sticky_totals_row_ref", None)
             _th = getattr(self, "_sticky_table_header_ref", None)
-            new_controls = [c for c in [_hr, _cb, _cn, _fb, _th] if c is not None]
+            new_controls = [c for c in [_hr, _cb, _cn, _fb, _tr, _th] if c is not None]
             if new_controls:
                 _sticky.controls.clear()
                 _sticky.controls.extend(new_controls)

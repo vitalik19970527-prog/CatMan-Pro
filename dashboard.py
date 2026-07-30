@@ -5561,8 +5561,9 @@ class MainDashboard:
                     _cb = getattr(_cpsi, "_sticky_currency_bar_ref", None)
                     _cn = getattr(_cpsi, "_sticky_counters_ref", None)
                     _fb = getattr(_cpsi, "_sticky_filter_bar_ref", None)
+                    _tr = getattr(_cpsi, "_sticky_totals_row_ref", None)
                     _th = getattr(_cpsi, "_sticky_table_header_ref", None)
-                    _new = [c for c in [_hr, _cb, _cn, _fb, _th] if c is not None]
+                    _new = [c for c in [_hr, _cb, _cn, _fb, _tr, _th] if c is not None]
                     if _new:
                         _sticky.controls[:] = _new
                 self.page.update()
@@ -5573,6 +5574,27 @@ class MainDashboard:
                     except Exception:
                         pass
                 return
+
+        if _cpsi is not None:
+            # A build for this view is already in flight (e.g. a rapid
+            # double-click before _stock_ui_ready flips True) - constructing
+            # a SECOND CostPriceStockView here used to race the first one:
+            # both target the same shared wrapper/sticky header, and since
+            # each instance's _render() only clears+repopulates once its own
+            # (awaited) data load finishes, whichever one lands last would
+            # leave the OTHER's header/filter block stacked above it instead
+            # of replacing it. Just re-show the in-flight instance's tab.
+            self._detach_live_mirror_views_for("cost_price_stock")
+            self._set_view_for_workspace("show_cost_price_stock")
+            try:
+                self.page._active_view = "show_cost_price_stock"
+            except Exception:
+                pass
+            self._live_cost_price_stock_view_ref = _cpsi
+            self._activate_cached_view("cost_price_stock")
+            with contextlib.suppress(Exception):
+                self.page.update()
+            return
 
         self._detach_live_mirror_views_for("cost_price_stock")
         self._set_view_for_workspace("show_cost_price_stock")
