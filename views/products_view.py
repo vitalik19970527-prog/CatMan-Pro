@@ -6000,10 +6000,17 @@ class ProductsView:
         # edit. Chain to whatever was already there instead.
         _prev_on_dismiss = dlg.on_dismiss if existing_dlg is not None else None
 
-        def _on_dismiss_chained(_e):
+        async def _on_dismiss_chained(_e):
             _release_lock_once()
             if _prev_on_dismiss is not None:
-                _prev_on_dismiss(_e)
+                # _prev_on_dismiss is page.show_dialog()'s own
+                # wrapped_on_dismiss, which is itself `async def` — calling
+                # it without awaiting just creates a coroutine object that
+                # never runs (dialog-stack cleanup silently skipped) and
+                # logs "coroutine was never awaited" on GC.
+                result = _prev_on_dismiss(_e)
+                if asyncio.iscoroutine(result):
+                    await result
 
         dlg.on_dismiss = _on_dismiss_chained if _prev_on_dismiss is not None else _on_dismiss
         dlg.content = ft.Container(
