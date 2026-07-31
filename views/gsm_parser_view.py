@@ -6334,7 +6334,7 @@ class GsmParserView:
             self._refresh_table(rebuild_filters=False)
             if btn_ref.current:
                 label, icon = _label_and_icon()
-                btn_ref.current.text = label
+                btn_ref.current.content = label
                 btn_ref.current.icon = icon
                 with contextlib.suppress(Exception):
                     btn_ref.current.update()
@@ -6342,7 +6342,7 @@ class GsmParserView:
         label, icon = _label_and_icon()
         return ft.OutlinedButton(
             ref=btn_ref,
-            text=label,
+            content=label,
             icon=icon,
             on_click=_toggle_grouping,
             tooltip="Вимкнути/увімкнути групування пристроїв по брендам",
