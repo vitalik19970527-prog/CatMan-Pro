@@ -135,11 +135,22 @@ class GitHubPublisher:
             return [], f"{repo_path} не є директорією"
         return [e for e in data if isinstance(e, dict) and e.get("type") == "file"], ""
 
-    def raw_url(self, repo_path: str) -> str:
+    def raw_url(self, repo_path: str, cache_bust: str = "") -> str:
         """Direct raw.githubusercontent.com URL — Flet's ft.Image can load
         this straight from the web, no need to fetch bytes into the app
-        just to display a thumbnail."""
-        return f"https://raw.githubusercontent.com/{self.owner}/{self.repo}/{self.branch}/{repo_path}"
+        just to display a thumbnail.
+
+        raw.githubusercontent.com is served through a CDN that keeps
+        serving the old bytes for a path for a while after that path's
+        content changes — pass the file's current blob `sha` (from a
+        fresh list_dir()/get_file_sha() call) as cache_bust so a replaced
+        image's URL actually changes and the CDN is forced to fetch fresh
+        content instead of a locally-updated GitHub commit looking, from
+        the app's point of view, like the image "didn't change"."""
+        url = f"https://raw.githubusercontent.com/{self.owner}/{self.repo}/{self.branch}/{repo_path}"
+        if cache_bust:
+            url += f"?v={cache_bust}"
+        return url
 
     def put_file(
         self, repo_path: str, content_bytes: bytes, message: str

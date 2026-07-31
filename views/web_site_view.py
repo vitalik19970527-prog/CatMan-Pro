@@ -1240,6 +1240,11 @@ class WebSiteView:
         entries = self._img_listing_cache or []
         disk_names = {e["name"] for e in entries}
         sizes_by_name = {e["name"]: int(e.get("size") or 0) for e in entries}
+        # raw.githubusercontent.com is CDN-cached by path — this sha lets
+        # every thumbnail URL change the instant a file's content changes,
+        # so a replaced image actually shows the new bytes instead of the
+        # CDN's stale cached copy of the old ones (see raw_url()).
+        shas_by_name = {e["name"]: str(e.get("sha") or "")[:12] for e in entries}
 
         containers = self._find_shot_containers()
         filled = sum(1 for c in containers if c["filename"] in disk_names)
@@ -1270,7 +1275,11 @@ class WebSiteView:
                 continue
             tiles = [
                 self._build_shot_tile(
-                    c, c["filename"] in disk_names, sizes_by_name.get(c["filename"], 0), lightbox_images
+                    c,
+                    c["filename"] in disk_names,
+                    sizes_by_name.get(c["filename"], 0),
+                    shas_by_name.get(c["filename"], ""),
+                    lightbox_images,
                 )
                 for c in page_containers
             ]
@@ -1297,7 +1306,9 @@ class WebSiteView:
                         ),
                         ft.Row(
                             [
-                                self._build_orphan_tile(name, sizes_by_name.get(name, 0), lightbox_images)
+                                self._build_orphan_tile(
+                                    name, sizes_by_name.get(name, 0), shas_by_name.get(name, ""), lightbox_images
+                                )
                                 for name in orphans
                             ],
                             wrap=True,
@@ -1315,6 +1326,13 @@ class WebSiteView:
         """Full-size click-to-enlarge viewer with close + prev/next
         (mouse and ←/→/Esc keys) — same proven pattern as the packaging
         photo gallery in views/packaging_view.py's open_image_view()."""
+        try:
+            self._open_lightbox_unsafe(images, start_index)
+        except Exception as e:
+            logger.exception("WebSiteView: failed to open image lightbox")
+            self._snack(f"Не вдалося відкрити зображення: {e}", "red")
+
+    def _open_lightbox_unsafe(self, images: list[dict], start_index: int):
         page = self._page()
         if not page or not images:
             return
@@ -1449,34 +1467,43 @@ class WebSiteView:
             return ""
         return str(getattr(result[0], "path", "") or "")
 
-    def _build_shot_tile(self, container: dict, exists: bool, size_bytes: int, lightbox_images: list[dict]):
+    def _build_shot_tile(self, container: dict, exists: bool, size_bytes: int, sha: str, lightbox_images: list[dict]):
         filename = container["filename"]
         caption = container["caption"]
         description = container.get("description") or ""
-        img_url = self._publisher.raw_url(f"{IMG_REPO_DIR}/{filename}")
+        img_url = self._publisher.raw_url(f"{IMG_REPO_DIR}/{filename}", cache_bust=sha)
         size_kb = (size_bytes / 1024) if exists else 0
 
         async def _do_set(_filename=filename):
-            src_path = await self._pick_single_file(
-                f"Оберіть зображення для «{caption}»", ["png", "jpg", "jpeg", "webp", "svg"]
-            )
-            if not src_path:
-                return
+            # page.run_task() swallows exceptions raised in here into
+            # Python's internal concurrent.futures logging — nothing shows
+            # on screen and nothing lands in catman.log, so a failed
+            # replace just silently does nothing from the user's point of
+            # view. Catch everything and surface it explicitly instead.
+            try:
+                src_path = await self._pick_single_file(
+                    f"Оберіть зображення для «{caption}»", ["png", "jpg", "jpeg", "webp", "svg"]
+                )
+                if not src_path:
+                    return
 
-            def _apply() -> bytes:
-                with open(src_path, "rb") as f:
-                    return f.read()
+                def _apply() -> bytes:
+                    with open(src_path, "rb") as f:
+                        return f.read()
 
-            def _on_done():
-                self._img_listing_cache = None
-                self.build()
+                def _on_done():
+                    self._img_listing_cache = None
+                    self.build()
 
-            data = await asyncio.to_thread(_apply)
-            await self._save_and_publish(
-                [(f"{IMG_REPO_DIR}/{_filename}", data)],
-                f"Web сайт: оновлено зображення {_filename}",
-                on_done=_on_done,
-            )
+                data = await asyncio.to_thread(_apply)
+                await self._save_and_publish(
+                    [(f"{IMG_REPO_DIR}/{_filename}", data)],
+                    f"Web сайт: оновлено зображення {_filename}",
+                    on_done=_on_done,
+                )
+            except Exception as e:
+                logger.exception("WebSiteView: replace image failed | filename=%s", _filename)
+                self._snack(f"Не вдалося замінити зображення: {e}", "red")
 
         def _set_click(_e, _s=_do_set):
             page = self._page()
@@ -1490,11 +1517,15 @@ class WebSiteView:
             dlg_ref: list = [None]
 
             async def _do_delete():
-                await self._delete_and_publish(
-                    f"{IMG_REPO_DIR}/{_filename}", f"Web сайт: видалено зображення {_filename}"
-                )
-                self._img_listing_cache = None
-                self.build()
+                try:
+                    await self._delete_and_publish(
+                        f"{IMG_REPO_DIR}/{_filename}", f"Web сайт: видалено зображення {_filename}"
+                    )
+                    self._img_listing_cache = None
+                    self.build()
+                except Exception as e:
+                    logger.exception("WebSiteView: delete image failed | filename=%s", _filename)
+                    self._snack(f"Не вдалося видалити зображення: {e}", "red")
 
             def _confirm(_e2):
                 with contextlib.suppress(Exception):
@@ -1589,8 +1620,8 @@ class WebSiteView:
             ),
         )
 
-    def _build_orphan_tile(self, name: str, size_bytes: int, lightbox_images: list[dict]):
-        img_url = self._publisher.raw_url(f"{IMG_REPO_DIR}/{name}")
+    def _build_orphan_tile(self, name: str, size_bytes: int, sha: str, lightbox_images: list[dict]):
+        img_url = self._publisher.raw_url(f"{IMG_REPO_DIR}/{name}", cache_bust=sha)
         size_kb = size_bytes / 1024
 
         lb_index = len(lightbox_images)
@@ -1606,9 +1637,13 @@ class WebSiteView:
             dlg_ref: list = [None]
 
             async def _do_delete():
-                await self._delete_and_publish(f"{IMG_REPO_DIR}/{_name}", f"Web сайт: видалено зображення {_name}")
-                self._img_listing_cache = None
-                self.build()
+                try:
+                    await self._delete_and_publish(f"{IMG_REPO_DIR}/{_name}", f"Web сайт: видалено зображення {_name}")
+                    self._img_listing_cache = None
+                    self.build()
+                except Exception as e:
+                    logger.exception("WebSiteView: delete orphan image failed | name=%s", _name)
+                    self._snack(f"Не вдалося видалити зображення: {e}", "red")
 
             def _confirm(_e2):
                 with contextlib.suppress(Exception):
