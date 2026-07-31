@@ -994,6 +994,10 @@ class GsmParserView:
         self._sort_col = "brand"
         self._sort_asc = True
         self._page_idx = 0
+        # Toggled by the "Групування" toolbar button — when True, the table
+        # is a single flat list of every device (no brand headers/dividers/
+        # collapse state at all) instead of the normal brand-grouped view.
+        self._flat_mode: bool = False
         self._brand_devs_by_name: dict[str, list[dict]] = {}
         self._brand_body_by_name: dict[str, ft.Container] = {}
         self._color_maps: tuple = ({}, {}, {}, {})
@@ -5272,60 +5276,74 @@ class GsmParserView:
             if self._table_body_ref is not None:
                 self._table_body_ref.controls.clear()
                 rows = []
-                # Group by brand — insert header + thick divider between brands
-                prev_brand: str | None = None
-                brand_group: list[dict] = []
-                brand_groups: list[tuple[str, list[dict]]] = []
-                for d in page_devs:
-                    b = str(d.get("brand") or "")
-                    if b != prev_brand:
-                        if brand_group:
-                            brand_groups.append((prev_brand, brand_group))
-                        brand_group = [d]
-                        prev_brand = b
-                    else:
-                        brand_group.append(d)
-                if brand_group:
-                    brand_groups.append((prev_brand, brand_group))
-
-                # Cached for the lazy per-brand row build used by toggle clicks
-                # (see _build_brand_header) — avoids a full-table rebuild on
-                # collapse/expand, which used to freeze the whole app at
-                # 2000+ devices.
-                self._brand_devs_by_name = {b: devs for b, devs in brand_groups}
                 self._color_maps = (gsm_sz_c, ek_sz_c, gsm_dg_c, ek_dg_c)
-                # Per-brand body container refs — lets a single delete/update
-                # patch just that one row's control in place afterwards
-                # (see _remove_devices_in_place/_update_device_row_in_place)
-                # instead of rebuilding the whole table, which used to reset
-                # scroll position and every brand's expand/collapse state.
-                self._brand_body_by_name = {}
-
-                # Rows are NEVER built synchronously here, even for brands that
-                # should appear expanded — building hundreds of rows then
-                # sending them in one update() is exactly the "thousands of
-                # controls in one Flutter patch" freeze pattern. Bodies start
-                # empty; brands that should be visible are filled afterwards,
-                # one brand at a time, in small chunks (_fill_expanded_brands_async).
-                first_brand = True
                 _to_fill: list[tuple[ft.Container, list[dict]]] = []
-                for brand_name, brand_devs in brand_groups:
-                    if not first_brand:
-                        rows.append(ft.Divider(height=3, thickness=3, color=_ACCENT))
-                    first_brand = False
-                    if brand_name not in _KNOWN_BRANDS:
-                        _KNOWN_BRANDS.add(brand_name)
-                        _COLLAPSED_BRANDS.add(brand_name)
-                    collapsed = brand_name in _COLLAPSED_BRANDS
+                if self._flat_mode:
+                    # "Групування" toggled off — one continuous list, no
+                    # brand headers/dividers/collapse state at all.
+                    self._brand_devs_by_name = {"__flat__": page_devs}
+                    self._brand_body_by_name = {}
                     body_col = ft.Column(spacing=0)
-                    body_container = ft.Container(content=body_col, visible=not collapsed)
-                    self._brand_body_by_name[brand_name] = body_container
-                    if fill_all_brands or not collapsed:
-                        _to_fill.append((body_container, brand_devs))
-                    rows.append(
-                        self._build_brand_header(brand_name, len(brand_devs), body_container)
-                    )
+                    body_container = ft.Container(content=body_col, visible=True)
+                    self._brand_body_by_name["__flat__"] = body_container
+                    if page_devs:
+                        _to_fill.append((body_container, page_devs))
                     rows.append(body_container)
+                else:
+                    # Group by brand — insert header + thick divider between brands
+                    prev_brand: str | None = None
+                    brand_group: list[dict] = []
+                    brand_groups: list[tuple[str, list[dict]]] = []
+                    for d in page_devs:
+                        b = str(d.get("brand") or "")
+                        if b != prev_brand:
+                            if brand_group:
+                                brand_groups.append((prev_brand, brand_group))
+                            brand_group = [d]
+                            prev_brand = b
+                        else:
+                            brand_group.append(d)
+                    if brand_group:
+                        brand_groups.append((prev_brand, brand_group))
+
+                    # Cached for the lazy per-brand row build used by toggle
+                    # clicks (see _build_brand_header) — avoids a full-table
+                    # rebuild on collapse/expand, which used to freeze the
+                    # whole app at 2000+ devices.
+                    self._brand_devs_by_name = {b: devs for b, devs in brand_groups}
+                    # Per-brand body container refs — lets a single delete/
+                    # update patch just that one row's control in place
+                    # afterwards (see _remove_devices_in_place/
+                    # _update_device_row_in_place) instead of rebuilding the
+                    # whole table, which used to reset scroll position and
+                    # every brand's expand/collapse state.
+                    self._brand_body_by_name = {}
+
+                    # Rows are NEVER built synchronously here, even for
+                    # brands that should appear expanded — building hundreds
+                    # of rows then sending them in one update() is exactly
+                    # the "thousands of controls in one Flutter patch"
+                    # freeze pattern. Bodies start empty; brands that should
+                    # be visible are filled afterwards, one brand at a time,
+                    # in small chunks (_fill_expanded_brands_async).
+                    first_brand = True
+                    for brand_name, brand_devs in brand_groups:
+                        if not first_brand:
+                            rows.append(ft.Divider(height=3, thickness=3, color=_ACCENT))
+                        first_brand = False
+                        if brand_name not in _KNOWN_BRANDS:
+                            _KNOWN_BRANDS.add(brand_name)
+                            _COLLAPSED_BRANDS.add(brand_name)
+                        collapsed = brand_name in _COLLAPSED_BRANDS
+                        body_col = ft.Column(spacing=0)
+                        body_container = ft.Container(content=body_col, visible=not collapsed)
+                        self._brand_body_by_name[brand_name] = body_container
+                        if fill_all_brands or not collapsed:
+                            _to_fill.append((body_container, brand_devs))
+                        rows.append(
+                            self._build_brand_header(brand_name, len(brand_devs), body_container)
+                        )
+                        rows.append(body_container)
                 self._table_body_ref.controls.extend(rows or [self._empty_row()])
             else:
                 logger.warning(
@@ -6257,6 +6275,45 @@ class GsmParserView:
             tooltip="Розгорнути всі бренди" if _all_collapsed() else "Згорнути всі бренди",
             on_click=_toggle_all,
             style=ft.ButtonStyle(padding=ft.padding.all(2)),
+        )
+
+    def _build_group_toggle_btn(self) -> ft.OutlinedButton:
+        """Toolbar button: switch the whole table between the normal
+        brand-grouped view (headers, dividers, collapse/expand) and one
+        flat continuous list of every device with no grouping at all."""
+        btn_ref = ft.Ref[ft.OutlinedButton]()
+
+        def _label_and_icon():
+            if self._flat_mode:
+                return "Групування вимкнено", ft.Icons.VIEW_AGENDA_OUTLINED
+            return "Групування по брендам", ft.Icons.VIEW_LIST_OUTLINED
+
+        def _toggle_grouping(_e=None):
+            if self._cache_busy():
+                self._warn_cache_busy()
+                return
+            self._flat_mode = not self._flat_mode
+            self._refresh_table(rebuild_filters=False)
+            if btn_ref.current:
+                label, icon = _label_and_icon()
+                btn_ref.current.text = label
+                btn_ref.current.icon = icon
+                with contextlib.suppress(Exception):
+                    btn_ref.current.update()
+
+        label, icon = _label_and_icon()
+        return ft.OutlinedButton(
+            ref=btn_ref,
+            text=label,
+            icon=icon,
+            on_click=_toggle_grouping,
+            tooltip="Вимкнути/увімкнути групування пристроїв по брендам",
+            style=ft.ButtonStyle(
+                color=_ACCENT,
+                side=ft.BorderSide(1, ft.Colors.BLUE_200),
+                padding=ft.padding.symmetric(horizontal=10, vertical=5),
+                text_style=ft.TextStyle(size=11),
+            ),
         )
 
     def _build_brand_header(
@@ -8533,6 +8590,8 @@ class GsmParserView:
                 text_style=ft.TextStyle(size=11),
             ),
         )
+        # Flat-list/grouped toggle — all users, rightmost button
+        group_toggle_btn = self._build_group_toggle_btn()
 
         # Row 1 — user controls (all users)
         from views.mobile_layout_helpers import (is_mobile,
@@ -8550,7 +8609,7 @@ class GsmParserView:
             user_row = ft.Column(
                 [
                     make_scrollable_chip_row(
-                        left_toolbar_controls + [compat_global_btn],
+                        left_toolbar_controls + [compat_global_btn, group_toggle_btn],
                         spacing=8,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
@@ -8563,7 +8622,7 @@ class GsmParserView:
             user_row = ft.Row(
                 [
                     ft.Row(
-                        left_toolbar_controls + [compat_global_btn],
+                        left_toolbar_controls + [compat_global_btn, group_toggle_btn],
                         spacing=8,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
@@ -8914,45 +8973,55 @@ class GsmParserView:
         # not skip it.
         gsm_sz_c, ek_sz_c, gsm_dg_c, ek_dg_c = _compute_color_maps(filtered)
 
-        prev_brand: str | None = None
-        brand_group: list[dict] = []
-        brand_groups: list[tuple[str, list[dict]]] = []
-        for d in page_devs:
-            b = str(d.get("brand") or "")
-            if b != prev_brand:
-                if brand_group:
-                    brand_groups.append((prev_brand, brand_group))
-                brand_group = [d]
-                prev_brand = b
-            else:
-                brand_group.append(d)
-        if brand_group:
-            brand_groups.append((prev_brand, brand_group))
-
-        self._brand_devs_by_name = {b: devs for b, devs in brand_groups}
         self._color_maps = (gsm_sz_c, ek_sz_c, gsm_dg_c, ek_dg_c)
-        self._brand_body_by_name = {}
-
         rows: list[ft.Control] = []
-        first_brand = True
         _to_fill: list[tuple[ft.Container, list[dict]]] = []
-        for brand_name, brand_devs in brand_groups:
-            if not first_brand:
-                rows.append(ft.Divider(height=3, thickness=3, color=_ACCENT))
-            first_brand = False
-            if brand_name not in _KNOWN_BRANDS:
-                _KNOWN_BRANDS.add(brand_name)
-                _COLLAPSED_BRANDS.add(brand_name)
-            collapsed = brand_name in _COLLAPSED_BRANDS
+        if self._flat_mode:
+            self._brand_devs_by_name = {"__flat__": page_devs}
+            self._brand_body_by_name = {}
             body_col = ft.Column(spacing=0)
-            body_container = ft.Container(content=body_col, visible=not collapsed)
-            self._brand_body_by_name[brand_name] = body_container
-            if not collapsed:
-                _to_fill.append((body_container, brand_devs))
-            rows.append(
-                self._build_brand_header(brand_name, len(brand_devs), body_container)
-            )
+            body_container = ft.Container(content=body_col, visible=True)
+            self._brand_body_by_name["__flat__"] = body_container
+            if page_devs:
+                _to_fill.append((body_container, page_devs))
             rows.append(body_container)
+        else:
+            prev_brand: str | None = None
+            brand_group: list[dict] = []
+            brand_groups: list[tuple[str, list[dict]]] = []
+            for d in page_devs:
+                b = str(d.get("brand") or "")
+                if b != prev_brand:
+                    if brand_group:
+                        brand_groups.append((prev_brand, brand_group))
+                    brand_group = [d]
+                    prev_brand = b
+                else:
+                    brand_group.append(d)
+            if brand_group:
+                brand_groups.append((prev_brand, brand_group))
+
+            self._brand_devs_by_name = {b: devs for b, devs in brand_groups}
+            self._brand_body_by_name = {}
+
+            first_brand = True
+            for brand_name, brand_devs in brand_groups:
+                if not first_brand:
+                    rows.append(ft.Divider(height=3, thickness=3, color=_ACCENT))
+                first_brand = False
+                if brand_name not in _KNOWN_BRANDS:
+                    _KNOWN_BRANDS.add(brand_name)
+                    _COLLAPSED_BRANDS.add(brand_name)
+                collapsed = brand_name in _COLLAPSED_BRANDS
+                body_col = ft.Column(spacing=0)
+                body_container = ft.Container(content=body_col, visible=not collapsed)
+                self._brand_body_by_name[brand_name] = body_container
+                if not collapsed:
+                    _to_fill.append((body_container, brand_devs))
+                rows.append(
+                    self._build_brand_header(brand_name, len(brand_devs), body_container)
+                )
+                rows.append(body_container)
         row_controls = rows or [self._empty_row()]
         table_body = ft.Column(row_controls, spacing=0, tight=True)
         self._table_body_ref = table_body
