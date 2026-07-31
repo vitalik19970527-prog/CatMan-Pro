@@ -83,13 +83,40 @@ async def open_product_quick_view(
         # Opening the edit dialog in the same tick as closing the view
         # dialog can outrun Flutter's close transition — the new dialog
         # silently fails to render and the modal just disappears ("closes,
-        # doesn't switch to edit"). Give the close a brief moment to settle.
+        # doesn't switch to edit"). Poll for the view dialog to actually
+        # leave the page's dialog stack (Flutter reports the close async,
+        # a fixed sleep isn't a real guarantee) before opening the next one.
         if hasattr(page, "run_task"):
 
             async def _delayed_open():
-                await asyncio.sleep(0.2)
-                with contextlib.suppress(Exception):
+                dialogs_ctrl = getattr(page, "_dialogs", None)
+                for _ in range(20):  # up to ~1s
+                    still_open = getattr(dialogs_ctrl, "controls", None)
+                    if not still_open or not any(
+                        getattr(d, "open", False) for d in still_open
+                    ):
+                        break
+                    await asyncio.sleep(0.05)
+                else:
+                    await asyncio.sleep(0.2)
+                try:
                     await pv.show_product_dialog(product, on_switch_to_view=_switch_to_view)
+                except Exception as e:
+                    # Previously swallowed via contextlib.suppress(Exception) -
+                    # any real bug in here looked identical to the close-race
+                    # ("modal just disappears, nothing happens"), impossible
+                    # to tell apart or diagnose. Surface it instead.
+                    logger.exception(
+                        "open_product_quick_view: switch to edit failed pid=%s", pid
+                    )
+                    with contextlib.suppress(Exception):
+                        page.snack_bar = ft.SnackBar(
+                            ft.Text(f"Не вдалося відкрити редагування: {e}", color="white"),
+                            bgcolor="#EF4444",
+                            duration=3500,
+                        )
+                        page.snack_bar.open = True
+                        page.update()
 
             with contextlib.suppress(Exception):
                 page.run_task(_delayed_open)
