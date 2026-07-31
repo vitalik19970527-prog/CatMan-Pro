@@ -1017,6 +1017,7 @@ class GsmParserView:
         # collapse state at all) instead of the normal brand-grouped view.
         self._flat_mode: bool = False
         self._flat_last_page_devs: list[dict] | None = None
+        self._pending_fill: tuple | None = None
         self._brand_devs_by_name: dict[str, list[dict]] = {}
         self._brand_body_by_name: dict[str, ft.Container] = {}
         self._color_maps: tuple = ({}, {}, {}, {})
@@ -1670,8 +1671,12 @@ class GsmParserView:
                 result = sorted(result, key=key_fn, reverse=reverse)
         # Pass 2: stable regroup by brand (ascending) so brand groups never
         # interleave — ties (same brand) keep the order from pass 1, so the
-        # chosen sort still applies *within* each brand group.
-        result = sorted(result, key=lambda d: (d.get("brand") or "").lower())
+        # chosen sort still applies *within* each brand group. Only makes
+        # sense for the brand-grouped view — in flat mode (grouping off)
+        # the user expects one true global sort by the chosen column, not
+        # a sort-within-brand-then-brand-order, so skip it entirely there.
+        if not self._flat_mode:
+            result = sorted(result, key=lambda d: (d.get("brand") or "").lower())
         return result
 
     def _page_items(self, filtered: list[dict]) -> list[dict]:
@@ -5299,7 +5304,12 @@ class GsmParserView:
     # ------------------------------------------------------------------ #
     #  Build results content                                               #
     # ------------------------------------------------------------------ #
-    def _refresh_table(self, rebuild_filters: bool = True, fill_all_brands: bool = False):
+    def _refresh_table(
+        self,
+        rebuild_filters: bool = True,
+        fill_all_brands: bool = False,
+        defer_fill_to_caller: bool = False,
+    ):
         """Rebuild table body + pagination + stats in-place.
 
         fill_all_brands=True forces every brand group's rows to be queued
@@ -5513,12 +5523,30 @@ class GsmParserView:
                     with contextlib.suppress(Exception):
                         _ref.update()
 
-            if page_ctrl and "_to_fill" in locals() and _to_fill:
-                page_ctrl.run_task(
-                    self._fill_expanded_brands_async,
-                    _to_fill,
-                    (gsm_sz_c, ek_sz_c, gsm_dg_c, ek_dg_c),
-                )
+            if "_to_fill" in locals() and _to_fill:
+                if defer_fill_to_caller:
+                    # Caller (currently only _reveal_sync) awaits the fill
+                    # directly instead of us fire-and-forgetting it via
+                    # page_ctrl.run_task — that used to force the caller
+                    # to poll self._brand_fill_running/_brand_fill_queue
+                    # to know when it's done, and those flags could still
+                    # read as "nothing running" for a moment after
+                    # run_task schedules the coroutine but before it's
+                    # actually had a turn to execute. Polling could then
+                    # see a false "already done" and let the table reveal
+                    # before brands were actually filled — exactly what
+                    # made brand-expand still feel slow after the "loaded
+                    # behind the spinner" rework. Handing back the pending
+                    # work directly removes the race entirely.
+                    self._pending_fill = (
+                        _to_fill, (gsm_sz_c, ek_sz_c, gsm_dg_c, ek_dg_c)
+                    )
+                elif page_ctrl:
+                    page_ctrl.run_task(
+                        self._fill_expanded_brands_async,
+                        _to_fill,
+                        (gsm_sz_c, ek_sz_c, gsm_dg_c, ek_dg_c),
+                    )
         except Exception as exc:
             logger.error("[GSM] _refresh_table FAILED: %s", exc, exc_info=True)
 
