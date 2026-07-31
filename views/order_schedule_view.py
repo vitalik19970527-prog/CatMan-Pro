@@ -866,6 +866,16 @@ class OrderScheduleView:
                             page.run_task(self._flush_workspace_state_async)
 
     async def _force_sync_workspace_state_async(self) -> None:
+        # See media_plan_view.py's matching method for the full reasoning:
+        # _flush_workspace_state_async no-ops immediately if a flush is
+        # already running, which let _restart_tab's rebuild proceed
+        # before an in-flight save had actually reached the DB — the
+        # fresh instance's disk/DB re-read could then race that write and
+        # load a snapshot from just before it.
+        for _ in range(100):  # up to ~5s
+            if not self._workspace_outbox_running:
+                break
+            await asyncio.sleep(0.05)
         await self._flush_workspace_state_async()
 
     def _restart_tab(self) -> None:
@@ -1166,15 +1176,23 @@ class OrderScheduleView:
 
         def _save_months_only(_=None):
             # Standalone save workaround: commits just the months count,
-            # independent of the archive/order/pin settings and without
-            # needing the big "Зберегти" + tab restart below.
+            # independent of the archive/order/pin settings. Uses
+            # _schedule_rebuild (redraw THIS instance from its
+            # already-updated in-memory state), not _restart_tab —
+            # _restart_tab's hard ctrl+f5 rebuild creates a brand-new
+            # instance that re-reads workspace state from disk/DB, which
+            # raced the still-in-flight async flush this same save queues
+            # and could load a snapshot from just before this change.
+            # _schedule_rebuild never touches disk/DB, so there's nothing
+            # to race — this is what actually made the field's value
+            # reliably stick, on top of the earlier on_change fix.
             try:
                 cnt = max(1, min(24, int(str(months_f.value or "12").strip() or "12")))
             except Exception:
                 cnt = 12
             self._visible_months_count = cnt
             self._save_month_view_settings()
-            self._restart_tab()
+            self._schedule_rebuild()
             self._snack(self.t("media.months_saved", f"Збережено: {cnt} міс."), "#10B981")
 
         months_row = ft.Row(

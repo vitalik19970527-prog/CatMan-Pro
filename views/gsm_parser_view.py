@@ -1673,25 +1673,18 @@ class GsmParserView:
         result = sorted(result, key=lambda d: (d.get("brand") or "").lower())
         return result
 
-    _PAGE_SIZE = 50
-
     def _page_items(self, filtered: list[dict]) -> list[dict]:
-        # Real pagination, 50 devices/page — on a 1000+ device catalog,
-        # showing "everything on one page" meant every render (including
-        # every sort click and the initial full-catalog reveal/preload)
-        # had to build/preload the ENTIRE filtered set regardless of
-        # brand-collapse or chunking. Slicing to a page up front bounds
-        # that cost to 50 devices no matter what filters/grouping/sort are
-        # active — that's what actually makes "прибрати групування" and
-        # first-time reveal fast, not the chunking alone.
+        # Explicit product requirement: everything stays on ONE page/table,
+        # no pagination — a 50/page split was tried and rejected. Speed
+        # instead comes from _ROW_CTRL_CACHE (see _get_or_build_row): every
+        # device's row Control is built at most once per process and
+        # reused from then on, whether it's revealed via brand-expand or
+        # via flat mode, and a background pass (_prebuild_all_rows) warms
+        # that cache for the whole filtered catalog shortly after load so
+        # toggling "Групування" off draws from cache instead of building
+        # ~1000 rows on the spot.
         self._last_filtered_count = len(filtered)
-        total_pages = max(1, (len(filtered) + self._PAGE_SIZE - 1) // self._PAGE_SIZE)
-        if self._page_idx >= total_pages:
-            self._page_idx = total_pages - 1
-        if self._page_idx < 0:
-            self._page_idx = 0
-        start = self._page_idx * self._PAGE_SIZE
-        return filtered[start : start + self._PAGE_SIZE]
+        return filtered
 
     # ------------------------------------------------------------------ #
     #  Helper: show snack                                                  #
@@ -7093,45 +7086,8 @@ class GsmParserView:
                 break
 
     def _build_pager_controls(self) -> list:
-        total = getattr(self, "_last_filtered_count", 0)
-        if total <= self._PAGE_SIZE:
-            return []
-        total_pages = max(1, (total + self._PAGE_SIZE - 1) // self._PAGE_SIZE)
-        cur = max(0, min(self._page_idx, total_pages - 1))
-
-        def _go(delta: int):
-            def _handler(_e):
-                new_idx = max(0, min(total_pages - 1, self._page_idx + delta))
-                if new_idx != self._page_idx:
-                    self._page_idx = new_idx
-                    self._refresh_table(rebuild_filters=False)
-            return _handler
-
-        return [
-            ft.IconButton(
-                icon=ft.Icons.CHEVRON_LEFT,
-                icon_size=18,
-                disabled=cur <= 0,
-                on_click=_go(-1),
-                tooltip=self.t("gsm.pager.prev", "Попередня сторінка"),
-                style=ft.ButtonStyle(padding=ft.padding.all(4)),
-            ),
-            ft.Text(
-                self.t("gsm.pager.label", "Стор. {cur}/{total}").format(
-                    cur=cur + 1, total=total_pages
-                ),
-                size=11,
-                color=_MUTED,
-            ),
-            ft.IconButton(
-                icon=ft.Icons.CHEVRON_RIGHT,
-                icon_size=18,
-                disabled=cur >= total_pages - 1,
-                on_click=_go(1),
-                tooltip=self.t("gsm.pager.next", "Наступна сторінка"),
-                style=ft.ButtonStyle(padding=ft.padding.all(4)),
-            ),
-        ]
+        # Everything is shown on one page (see _page_items) — no pager UI.
+        return []
 
     def _sort_click(self, col: str):
         if self._sort_col != col:
