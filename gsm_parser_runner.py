@@ -171,6 +171,62 @@ def _fetch_one_ek_by_url(cur, source_url: str) -> Optional[dict]:
     return row if isinstance(row, dict) else None
 
 
+def _link_new_gsm_device_to_standalone_ek(
+    db: DataManager,
+    gsm_device_id: str,
+    brand: str,
+    device_type: str,
+    model_name: str,
+    rules: Any,
+) -> None:
+    """A brand-new GSM Arena device may be the very same real-world phone as
+    an existing STANDALONE E-Katalog row — one stored with no GSM match at
+    all because GSM Arena hadn't listed it yet (see the leftover-candidates
+    pass in run_gsm_parser). If a name match is found here, link them via
+    the same specs["gsm_ref_device_id"]/["gsm_ref_model_key"] fields every
+    other GSM<->EK link already uses (get_gsm_merged_results, comparisons,
+    the results table's GSM/EK column pairing — all of it keys off this
+    field), instead of leaving two permanently-separate rows for one
+    device. Best-effort: any failure here must never break the GSM Arena
+    insert it's called right after."""
+    try:
+        legacy_ek = _legacy_ek()
+        with db._general_pg().cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, model_name, specs
+                FROM public.gsm_parser_devices
+                WHERE source=%s AND brand=%s AND device_type=%s
+                  AND (specs->>'gsm_ref_device_id' IS NULL OR specs->>'gsm_ref_device_id' = '')
+                """,
+                (SOURCE_EK, brand, device_type),
+            )
+            candidates = cur.fetchall() or []
+            for row in candidates:
+                ek_name = str(row.get("model_name") or "")
+                if not ek_name or not _ek_name_matches(legacy_ek, model_name, ek_name):
+                    continue
+                specs = row.get("specs") if isinstance(row.get("specs"), dict) else {}
+                specs = dict(specs)
+                specs["gsm_ref_device_id"] = gsm_device_id
+                specs["gsm_ref_model_key"] = _normalize_model_name(model_name, rules)
+                cur.execute(
+                    "UPDATE public.gsm_parser_devices SET specs=%s::jsonb, updated_at=%s WHERE id=%s",
+                    (json.dumps(specs, ensure_ascii=False), datetime.now(), row.get("id")),
+                )
+                db._general_pg().commit()
+                logger.info(
+                    "[gsm-ek-link] linked new GSM device %s (%s) to standalone EK row %s",
+                    gsm_device_id, model_name, row.get("id"),
+                )
+                return  # link to the first/best match only
+    except Exception:
+        logger.exception(
+            "[gsm-ek-link] failed to link new GSM device %s (%s) to a standalone EK row",
+            gsm_device_id, model_name,
+        )
+
+
 def _log_change(
     cur,
     device_id: str,
@@ -2278,6 +2334,20 @@ def run_gsm_parser(
                                 f" ({link_idx}/{effective_total}) — {status_label}"
                                 f" | всього записано: {stats['gsm_written']}"
                             )
+                            if status == "new":
+                                # This device may already exist as a
+                                # standalone E-Katalog row (found on EK
+                                # before GSM Arena ever listed it) — link
+                                # them instead of leaving two rows for the
+                                # same phone. Best-effort, never fatal.
+                                _link_new_gsm_device_to_standalone_ek(
+                                    db,
+                                    dev_id,
+                                    str(payload.get("brand") or ""),
+                                    str(payload.get("device_type") or ""),
+                                    model_name,
+                                    rules,
+                                )
                             if status in {"new", "updated"}:
                                 if status == "new" and str(payload.get("brand") or "").strip().lower() == "xiaomi":
                                     _r = _xiaomi_regions_str(db, dev_id)
@@ -2598,6 +2668,11 @@ def run_gsm_parser(
                     )
 
                     # Process all GSM devices of this brand/type inline
+                    # URLs matched to a GSM device below are tracked here so
+                    # the leftover-candidates pass after this loop (see
+                    # "EK devices with no GSM Arena match yet" below) only
+                    # ever picks up genuinely unmatched listing items.
+                    matched_ek_urls: set[str] = set()
                     for ek_idx, row in enumerate(devices_for_type, 1):
                         _check_control()
 
@@ -2664,6 +2739,9 @@ def run_gsm_parser(
                                     ):
                                         parsed = tmp
                                         item_url = existing_url
+                                        matched_ek_urls.add(
+                                            item_url.strip().lower().rstrip("/")
+                                        )
                                     else:
                                         _log(
                                             f"[2/2] ЄК ► [{brand}] {model_name}"
@@ -2757,6 +2835,9 @@ def run_gsm_parser(
                                         parsed = tmp
                                         item_url = link
                                         found = True
+                                        matched_ek_urls.add(
+                                            item_url.strip().lower().rstrip("/")
+                                        )
                                         _log(
                                             f"[2/2] ЄК ► [{brand}] {model_name}"
                                             f" — ЗНАЙДЕНО: {link}"
@@ -2879,6 +2960,138 @@ def run_gsm_parser(
                             _log(
                                 f"[2/2] ЄК ► [{brand}] {model_name}"
                                 f" — помилка запису в БД"
+                            )
+
+                        _smart_sleep(random.uniform(2.0, 5.0))
+
+                    # EK devices with no GSM Arena match yet: a brand can be
+                    # tracked on GSM Arena overall while still missing a
+                    # specific model that IS on E-Katalog (GSM Arena simply
+                    # hasn't listed it, or listed it under a name the
+                    # matcher above didn't accept). Previously every listing
+                    # candidate that didn't match one of THIS brand/type's
+                    # GSM devices was silently dropped every run — never
+                    # stored, never shown. Store it as a standalone EK row
+                    # instead (same shape as the EK-primary-brand path
+                    # above, just for leftover candidates within an
+                    # otherwise GSM-tracked brand) so it at least shows up
+                    # with EK data and an empty GSM Arena side. If the
+                    # device later appears on GSM Arena, the GSM Arena
+                    # insert path (_link_new_gsm_device_to_standalone_ek)
+                    # links it into this same row instead of leaving a
+                    # separate duplicate.
+                    leftover_candidates = [
+                        c
+                        for c in candidate_links
+                        if str(c.get("url") or "").strip().lower().rstrip("/")
+                        not in matched_ek_urls
+                        and str(c.get("url") or "").strip()
+                    ]
+                    for ek_idx, cand in enumerate(leftover_candidates, 1):
+                        _check_control()
+                        link = str(cand.get("url") or "")
+                        cand_title = str(cand.get("title") or link).strip()
+                        try:
+                            tmp = legacy_ek.parse_ekatalog_item(
+                                link, "", dtype, skip_net_check=True
+                            )
+                        except Exception as exc:
+                            _log(
+                                f"[2/2] ЄК ► [{bname}] {cand_title}"
+                                f" (без GSM, {ek_idx}/{len(leftover_candidates)})"
+                                f" — помилка: {exc}"
+                            )
+                            _smart_sleep(random.uniform(2.0, 5.0))
+                            continue
+                        if not tmp or "fail_net" in tmp:
+                            _smart_sleep(random.uniform(2.0, 5.0))
+                            continue
+
+                        ek_model_name = str(tmp.get("W") or cand_title).strip()
+                        if not ek_model_name:
+                            _smart_sleep(random.uniform(2.0, 5.0))
+                            continue
+
+                        _ek_date_raw = str(tmp.get("Y") or "")
+                        _ek_year, _ek_month = _parse_ek_date_added(_ek_date_raw)
+                        ek_specs = {
+                            "date_added": _ek_date_raw,
+                            "date_added_year": _ek_year,
+                            "date_added_month": _ek_month,
+                            "dimensions": str(tmp.get("Z") or ""),
+                            "length": str(tmp.get("AA") or ""),
+                            "width": str(tmp.get("AB") or ""),
+                            "thickness": str(tmp.get("AC") or ""),
+                            "weight": str(tmp.get("AD") or ""),
+                            "display": str(tmp.get("AE") or ""),
+                            "os": str(tmp.get("AF") or ""),
+                            "cpu": str(tmp.get("AG") or ""),
+                            "memory": str(tmp.get("AH") or ""),
+                            "battery": str(tmp.get("AI") or ""),
+                            "status": str(tmp.get("AJ") or ""),
+                            "price_low": str(tmp.get("AK") or ""),
+                            "price_min": str(tmp.get("AL") or ""),
+                            "price_max": str(tmp.get("AM") or ""),
+                            "ek_url": link,
+                            "shops_count": str(tmp.get("AK") or ""),
+                            "variations": {
+                                "AP": str(tmp.get("AP") or ""),
+                                "AQ": str(tmp.get("AQ") or ""),
+                                "AR": str(tmp.get("AR") or ""),
+                                "AS": str(tmp.get("AS") or ""),
+                                "AT": str(tmp.get("AT") or ""),
+                            },
+                        }
+                        ek_payload = {
+                            "source": SOURCE_EK,
+                            "brand": bname,
+                            "device_type": dtype,
+                            "model_name": ek_model_name,
+                            "model_key": _normalize_model_name(ek_model_name, rules),
+                            "source_url": link,
+                            "image_url": str(tmp.get("PHOTO_MAIN") or ""),
+                            "specs": ek_specs,
+                        }
+
+                        ok, dev_id, ch, ev_status, ev_extra_status = _upsert_device(
+                            db, ek_payload, shops_appeared_max_age_months,
+                            ek_on_sale_status_prefixes,
+                        )
+                        if ok:
+                            stats["ek_written"] += 1
+                            stats["changed"] += int(ch)
+                            _record_daily_history(db, dev_id, SOURCE_EK, ek_specs)
+                            if ev_status in {"new", "updated"}:
+                                with contextlib.suppress(Exception):
+                                    _save_ek_primary_photos(
+                                        legacy_ek, db, dev_id, tmp
+                                    )
+                            ek_st_label = {
+                                "new": "НОВИЙ (без GSM)",
+                                "updated": "оновлено (без GSM)",
+                                "shops_appeared": "з'явились магазини",
+                                "seen": "без змін",
+                            }.get(ev_status, ev_status)
+                            _log(
+                                f"[2/2] ЄК ► [{bname}] {ek_model_name}"
+                                f" (без GSM, {ek_idx}/{len(leftover_candidates)})"
+                                f" — {ek_st_label} | всього ЄК: {stats['ek_written']}"
+                            )
+                            if ev_status in {"new", "updated", "shops_appeared"}:
+                                events.append(
+                                    {
+                                        "source": SOURCE_EK,
+                                        "status": ev_status,
+                                        "changes": int(ch),
+                                        "device_id": dev_id,
+                                        "payload": ek_payload,
+                                    }
+                                )
+                        else:
+                            stats["errors"] += 1
+                            _log(
+                                f"[2/2] ЄК ► [{bname}] {ek_model_name}"
+                                f" (без GSM) — помилка запису в БД"
                             )
 
                         _smart_sleep(random.uniform(2.0, 5.0))
