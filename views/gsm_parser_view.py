@@ -553,18 +553,18 @@ def _save_chart_cache_to_disk() -> None:
 
 
 def _last_9am_boundary(now: datetime | None = None) -> datetime:
-    """The most recent 9:00 — today's if we're past it, otherwise yesterday's."""
+    """The most recent 8:00 — today's if we're past it, otherwise yesterday's."""
     now = now or datetime.now()
-    today_9 = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    today_9 = now.replace(hour=8, minute=0, second=0, microsecond=0)
     return today_9 if now >= today_9 else today_9 - timedelta(days=1)
 
 
 def _needs_daily_sync(last_sync_ts: datetime | None) -> bool:
-    """True when the cache hasn't been synced since the most recent 9:00
-    boundary — correct for BOTH 'it's after 9:00 and we haven't refreshed
-    today' and 'it's before 9:00 and we never refreshed since yesterday's
-    9:00'. (The old _needs_daily_refresh unconditionally returned False
-    before 9:00, which silently skipped the missed-yesterday case.)"""
+    """True when the cache hasn't been synced since the most recent 8:00
+    boundary — correct for BOTH 'it's after 8:00 and we haven't refreshed
+    today' and 'it's before 8:00 and we never refreshed since yesterday's
+    8:00'. (The old _needs_daily_refresh unconditionally returned False
+    before 8:00, which silently skipped the missed-yesterday case.)"""
     if last_sync_ts is None:
         return True
     return last_sync_ts < _last_9am_boundary()
@@ -1018,6 +1018,11 @@ class GsmParserView:
         self._flat_mode: bool = False
         self._flat_last_page_devs: list[dict] | None = None
         self._pending_fill: tuple | None = None
+        self._reveal_status_ref: ft.Text | None = None
+        self._reveal_rows_done: int = 0
+        self._reveal_rows_total: int = 0
+        self._reveal_charts_done: int = 0
+        self._reveal_charts_total: int = 0
         self._brand_devs_by_name: dict[str, list[dict]] = {}
         self._brand_body_by_name: dict[str, ft.Container] = {}
         self._color_maps: tuple = ({}, {}, {}, {})
@@ -1072,7 +1077,7 @@ class GsmParserView:
         # gsm_parser_trigger.last_parse_at when it finishes — regardless of
         # who triggered it. If that's newer than what this session last
         # synced, the local cache is stale even though it's the same day
-        # and force-refreshes instead of waiting for tomorrow's 9:00
+        # and force-refreshes instead of waiting for tomorrow's 8:00
         # boundary or an unrelated manual "Синхронізація" click.
         with contextlib.suppress(Exception):
             trigger = self.db.get_gsm_parse_trigger() or {}
@@ -1132,6 +1137,27 @@ class GsmParserView:
         if self._status_cb is not None:
             with contextlib.suppress(Exception):
                 self._status_cb(text)
+        if self._reveal_status_ref is not None:
+            self._reveal_status_ref.value = text
+            with contextlib.suppress(Exception):
+                self._reveal_status_ref.update()
+
+    def _update_reveal_progress_text(self) -> None:
+        """Real progress counter for the full-preload loading screen —
+        explicit product requirement over a plain spinner. Cheap enough to
+        call after every 50-item batch (row or chart)."""
+        if self._reveal_status_ref is None:
+            return
+        parts = []
+        if self._reveal_rows_total:
+            parts.append(f"Рядки: {min(self._reveal_rows_done, self._reveal_rows_total)}/{self._reveal_rows_total}")
+        if self._reveal_charts_total:
+            parts.append(f"Діаграми: {min(self._reveal_charts_done, self._reveal_charts_total)}/{self._reveal_charts_total}")
+        if not parts:
+            return
+        self._reveal_status_ref.value = "Завантаження… " + ", ".join(parts)
+        with contextlib.suppress(Exception):
+            self._reveal_status_ref.update()
 
     def _cache_busy(self) -> bool:
         """True while a cache sync is in progress. Interactions that depend on
@@ -1324,7 +1350,7 @@ class GsmParserView:
 
     async def _background_load(self, page):
         """Cold start: paint instantly from the on-disk cache if present, then
-        — only if the daily 9:00 boundary was missed (or 'Синхронізація' was
+        — only if the daily 8:00 boundary was missed (or 'Синхронізація' was
         forced) — run a blocking diff-sync against the DB. The loading bar
         only disappears once the sync is fully done; the page stays
         non-interactive (toolbar disabled) until then.
@@ -1395,7 +1421,7 @@ class GsmParserView:
                 # immediately, so a caller that gates a loading state on this
                 # coroutine (see _reveal_and_sync) doesn't reveal the table
                 # while that other sync is still actively changing it.
-                for _ in range(600):  # up to ~2 minutes
+                for _ in range(3000):  # up to ~10 minutes — see _reveal_and_sync's cap
                     await asyncio.sleep(0.2)
                     _, _, loading = _get_cache()
                     if not loading:
@@ -1407,9 +1433,79 @@ class GsmParserView:
                 return
             if not _parser_is_running() and self._needs_reload():
                 await asyncio.to_thread(self._sync_cache_from_db, False)
-            self._refresh_table(fill_all_brands=True)
+
+            # Build the container/header structure now, but hand the actual
+            # row-fill work back to us instead of letting _refresh_table
+            # fire-and-forget it via page_ctrl.run_task — awaiting it
+            # directly here removes the race that used to let the table
+            # reveal (spinner gone) before every brand had actually
+            # finished filling (see _refresh_table's defer_fill_to_caller
+            # docstring for the full explanation).
+            self._reveal_rows_done = 0
+            self._reveal_rows_total = 0
+            self._reveal_charts_done = 0
+            self._reveal_charts_total = 0
+            self._refresh_table(fill_all_brands=True, defer_fill_to_caller=True)
+            pending = self._pending_fill
+            self._pending_fill = None
+            if pending:
+                _to_fill, color_maps = pending
+                self._reveal_rows_total = sum(len(devs) for _, devs in _to_fill)
+                self._update_reveal_progress_text()
+                await self._fill_expanded_brands_async(_to_fill, color_maps)
+
+            # Diagrams — batched, and cache-aware (_build_adaptive_charts
+            # skips anything already rendered whose price history hasn't
+            # changed since last time), so this is only slow the very
+            # first time it ever runs.
+            await self._preload_charts_for_current_page()
+
+            # Local photo cache — bulk-warmed from DB for the WHOLE
+            # filtered catalog, not just whatever this sync's changed_ids
+            # covered, so no row's first paint ever falls back to fetching
+            # from GSM Arena/E-Katalog directly.
+            await self._warm_photo_cache_from_db()
         except Exception as exc:
             logger.error("[GSM] _reveal_sync FAILED: %s", exc, exc_info=True)
+
+    async def _warm_photo_cache_from_db(self) -> None:
+        """Bulk-warms the local disk photo cache (_photo_cache_path) from
+        the DB (gsm_parser_device_photos, already 100% populated for every
+        device the table can ever render — verified directly against the
+        live DB) for the whole filtered catalog. changed_ids-based
+        warming (see _sync_cache_from_db) only covers whatever a diff sync
+        just touched, so a device that was never "changed" during this
+        process's lifetime could otherwise have no local file yet and hit
+        _build_table_row's image_url fallback — a live fetch straight from
+        GSM Arena/E-Katalog, which must never happen (photos only ever
+        come from this app's own DB)."""
+        try:
+            filtered = self._get_filtered_devices()
+            page_devs = self._page_items(filtered)
+        except Exception:
+            logger.exception("[GSM] _warm_photo_cache_from_db: failed to compute device list")
+            return
+        missing_ids = [
+            did for d in page_devs
+            if (did := str(d.get("id") or "").strip())
+            and not os.path.exists(_photo_cache_path(did))
+        ]
+        if not missing_ids:
+            return
+        CHUNK = 50
+        for i in range(0, len(missing_ids), CHUNK):
+            chunk_ids = missing_ids[i : i + CHUNK]
+            try:
+                photos = await asyncio.to_thread(
+                    self.db.get_gsm_device_main_photos_bulk, chunk_ids
+                )
+                for did, photo_bytes in photos.items():
+                    with contextlib.suppress(Exception):
+                        with open(_photo_cache_path(did), "wb") as f:
+                            f.write(photo_bytes)
+            except Exception:
+                logger.exception("[GSM] photo cache warm failed for a chunk")
+            await asyncio.sleep(0)
 
     async def _preload_charts_for_current_page(self) -> None:
         """Pre-renders every currently-visible device's chart into
@@ -1421,7 +1517,7 @@ class GsmParserView:
         Flet/matplotlib work on this thread at once is what freezes the
         app at scale. Sequential, chunked, yielding between chunks so the
         event loop can still service other UI events during this pass."""
-        CHUNK = 30
+        CHUNK = 50  # explicit spec: load/render in blocks of 50
         try:
             filtered = self._get_filtered_devices()
             page_devs = self._page_items(filtered)
@@ -1431,6 +1527,8 @@ class GsmParserView:
             )
             return
         total = len(page_devs)
+        self._reveal_charts_total = total
+        self._reveal_charts_done = 0
         for i in range(0, total, CHUNK):
             chunk = page_devs[i : i + CHUNK]
             for dev in chunk:
@@ -1453,13 +1551,8 @@ class GsmParserView:
                     logger.exception(
                         "[GSM] chart preload failed for device_id=%s", did
                     )
-            done = min(i + CHUNK, total)
-            self._update_loading_status(
-                self.t(
-                    "gsm.preparing_charts", "Підготовка діаграм… {n}/{total}"
-                ).format(n=done, total=total),
-                (done / total) if total else None,
-            )
+            self._reveal_charts_done = min(i + CHUNK, total)
+            self._update_reveal_progress_text()
             await asyncio.sleep(0)
         with contextlib.suppress(Exception):
             await asyncio.to_thread(_save_chart_cache_to_disk)
@@ -6347,6 +6440,8 @@ class GsmParserView:
             controls.extend(chunk_rows)
             with contextlib.suppress(Exception):
                 body_container.update()
+            self._reveal_rows_done += len(chunk_rows)
+            self._update_reveal_progress_text()
             await asyncio.sleep(0)
         body_container.data = "filled"
 
@@ -8841,10 +8936,12 @@ class GsmParserView:
             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             spacing=16,
         )
+        _reveal_status_text = ft.Text("Завантаження...", size=13, color=_MUTED)
+        self._reveal_status_ref = _reveal_status_text
         _reveal_loading_col = ft.Column(
             [
                 ft.ProgressRing(width=32, height=32, color=_OK_DK),
-                ft.Text("Завантаження...", size=13, color=_MUTED),
+                _reveal_status_text,
             ],
             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             alignment=ft.MainAxisAlignment.CENTER,
@@ -8862,37 +8959,16 @@ class GsmParserView:
             # One clear wait up front beats a table that LOOKS interactive
             # but secretly still competes with the sync for the same thread.
             try:
-                await self._reveal_sync(page_ctrl_arg)
-                # _reveal_sync's _refresh_table() call queues row-building
-                # for any already-expanded brand as a separate fire-and-
-                # forget task (self._fill_expanded_brands_async, via
-                # page_ctrl.run_task) instead of awaiting it — that's the
-                # right call for a plain tab-refresh (never block on it), but
-                # here it meant the spinner vanished and the table looked
-                # "done" while those rows were still visibly popping in one
-                # chunk at a time right after. Wait for that queue to fully
-                # drain too before this reveal counts as finished.
-                #
-                # _refresh_table() only SCHEDULES that fill task via
-                # page_ctrl.run_task — it hasn't actually started (and so
-                # hasn't set _brand_fill_running/populated the queue yet)
-                # until this coroutine yields at least once. Sleep(0) first
-                # so the check below sees its real state, not a stale
-                # "nothing queued yet" snapshot from before it got to run.
-                await asyncio.sleep(0)
-                for _ in range(600):  # up to ~2 minutes
-                    if not self._brand_fill_running and not self._brand_fill_queue:
-                        break
-                    await asyncio.sleep(0.2)
-                # Deliberately NOT pre-rendering every device's chart here
-                # too — matplotlib per device is real work, and doing it
-                # for the WHOLE catalog (1000+) before ever showing the
-                # table would make the loading screen itself take far
-                # longer than what it's meant to hide. Charts stay
-                # click-to-render (already off the UI thread and with
-                # matplotlib's import pre-warmed at module load, so a cold
-                # first render no longer freezes anything — see
-                # _build_lazy_tab).
+                # _reveal_sync now directly awaits everything itself — row
+                # fill (via _pending_fill, no more fire-and-forget +
+                # polling race), diagram preload, and photo-cache warm —
+                # so by the time this returns the table is genuinely fully
+                # ready. A 10-minute outer cap is a last-resort safety net
+                # only; the per-phase work inside _reveal_sync is what
+                # actually bounds this in normal operation.
+                await asyncio.wait_for(self._reveal_sync(page_ctrl_arg), timeout=600)
+            except asyncio.TimeoutError:
+                logger.error("[GSM] _reveal_and_sync: exceeded 10-minute safety cap")
             except Exception as exc:
                 logger.error("[GSM] _reveal_and_sync FAILED: %s", exc, exc_info=True)
             finally:
