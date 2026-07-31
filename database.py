@@ -15011,6 +15011,99 @@ class DataManager:
             return dict(row) if isinstance(row, dict) else None
         return None
 
+    def find_standalone_gsm_devices(
+        self, source: str, query: str, limit: int = 20
+    ) -> list[dict]:
+        """SuperAdmin manual-merge picker: devices from `source` ('GSM Arena'
+        or 'E-Katalog') that have no counterpart on the other side yet — the
+        candidates a superadmin can manually link together when auto-
+        matching missed a genuinely identical device (see
+        merge_gsm_ek_devices)."""
+        if not self._use_postgres():
+            return []
+        q = f"%{(query or '').strip()}%"
+        with contextlib.suppress(Exception):
+            with self._general_pg().cursor() as cur:
+                if source == "GSM Arena":
+                    cur.execute(
+                        """
+                        SELECT g.id, g.brand, g.device_type, g.model_name, g.image_url
+                        FROM public.gsm_parser_devices g
+                        WHERE g.source='GSM Arena'
+                          AND g.model_name ILIKE %s
+                          AND NOT EXISTS (
+                            SELECT 1 FROM public.gsm_parser_devices e
+                            WHERE e.source='E-Katalog'
+                              AND (e.specs->>'gsm_ref_device_id') = g.id
+                          )
+                        ORDER BY g.model_name
+                        LIMIT %s
+                        """,
+                        (q, limit),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT id, brand, device_type, model_name, image_url
+                        FROM public.gsm_parser_devices
+                        WHERE source='E-Katalog'
+                          AND model_name ILIKE %s
+                          AND (specs->>'gsm_ref_device_id' IS NULL OR specs->>'gsm_ref_device_id' = '')
+                        ORDER BY model_name
+                        LIMIT %s
+                        """,
+                        (q, limit),
+                    )
+                return [dict(r) for r in (cur.fetchall() or [])]
+        return []
+
+    def merge_gsm_ek_devices(self, gsm_device_id: str, ek_device_id: str) -> tuple[bool, str]:
+        """SuperAdmin manual override: link a standalone GSM Arena row and a
+        standalone E-Katalog row that are actually the same real device but
+        auto-matching (see _ek_name_matches in gsm_parser_runner.py) missed
+        it. Uses the exact same specs["gsm_ref_device_id"]/
+        ["gsm_ref_model_key"] link every other GSM<->EK pairing relies on
+        (get_gsm_merged_results, the results table, comparisons - all of
+        it), so a manual merge behaves identically to an automatic one from
+        that point on."""
+        if not self._use_postgres():
+            return False, "PostgreSQL вимкнено"
+        gsm_device_id = str(gsm_device_id or "").strip()
+        ek_device_id = str(ek_device_id or "").strip()
+        if not gsm_device_id or not ek_device_id:
+            return False, "Не вибрано обидва записи"
+        try:
+            with self._general_pg().cursor() as cur:
+                cur.execute(
+                    "SELECT id, source, model_key FROM public.gsm_parser_devices WHERE id=%s",
+                    (gsm_device_id,),
+                )
+                gsm_row = cur.fetchone()
+                if not gsm_row or str(gsm_row.get("source") or "") != "GSM Arena":
+                    return False, "Запис GSM Arena не знайдено"
+                cur.execute(
+                    "SELECT id, source, specs FROM public.gsm_parser_devices WHERE id=%s",
+                    (ek_device_id,),
+                )
+                ek_row = cur.fetchone()
+                if not ek_row or str(ek_row.get("source") or "") != "E-Katalog":
+                    return False, "Запис Єкаталог не знайдено"
+                specs = ek_row.get("specs") if isinstance(ek_row.get("specs"), dict) else {}
+                existing_ref = str(specs.get("gsm_ref_device_id") or "").strip()
+                if existing_ref and existing_ref != gsm_device_id:
+                    return False, "Цей запис Єкаталог вже прив'язаний до іншого пристрою GSM Arena"
+                specs = dict(specs)
+                specs["gsm_ref_device_id"] = gsm_device_id
+                specs["gsm_ref_model_key"] = str(gsm_row.get("model_key") or "")
+                cur.execute(
+                    "UPDATE public.gsm_parser_devices SET specs=%s::jsonb, updated_at=%s WHERE id=%s",
+                    (json.dumps(specs, ensure_ascii=False), datetime.now(), ek_device_id),
+                )
+            return True, "Об'єднано"
+        except Exception as e:
+            logger.exception("merge_gsm_ek_devices failed")
+            return False, f"Помилка: {e}"
+
     def get_gsm_distinct_brands(self) -> list[str]:
         if not self._use_postgres():
             return []

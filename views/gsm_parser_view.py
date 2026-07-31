@@ -172,6 +172,31 @@ def _fmt_dims(specs: dict) -> str:
     return ""
 
 
+def _dim_value(specs: dict, which: str) -> float | None:
+    """One dimension (length/width/thickness) as a float, for sorting by
+    just that axis — e.g. to find the narrowest/widest device for box
+    selection. Same source/fallback as _fmt_dims: the dedicated key first,
+    then parsed out of the combined "dimensions" text."""
+    if not isinstance(specs, dict):
+        return None
+    raw = str(specs.get(which) or "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except Exception:
+            pass
+    dims = str(specs.get("dimensions") or "").strip()
+    m = re.match(r"([\d.]+)\s*[x×]\s*([\d.]+)\s*[x×]\s*([\d.]+)", dims)
+    if m:
+        idx = {"length": 1, "width": 2, "thickness": 3}.get(which)
+        if idx:
+            try:
+                return float(m.group(idx))
+            except Exception:
+                pass
+    return None
+
+
 def _release_label(gsm_specs: dict) -> str:
     """Returns 'Р: <date>' or 'А: <date>' or empty string."""
     rel = str(gsm_specs.get("released") or "").strip()
@@ -1539,6 +1564,14 @@ class GsmParserView:
                 return _rel_key
             if col == "gsm_size":
                 return lambda d: _fmt_dims(d.get("gsm_specs") or {}).lower()
+            if col in {"gsm_length", "gsm_width", "gsm_thickness"}:
+                _which = col[len("gsm_"):]
+
+                def _gsm_dim_key(d, _w=_which):
+                    v = _dim_value(d.get("gsm_specs") or {}, _w)
+                    return v if v is not None else -1.0
+
+                return _gsm_dim_key
             if col == "gsm_diag":
                 def _diag_key(d):
                     try:
@@ -1556,6 +1589,14 @@ class GsmParserView:
                 return _ek_date_key
             if col == "ek_size":
                 return lambda d: _fmt_dims(d.get("ek_specs") or {}).lower()
+            if col in {"ek_length", "ek_width", "ek_thickness"}:
+                _which = col[len("ek_"):]
+
+                def _ek_dim_key(d, _w=_which):
+                    v = _dim_value(d.get("ek_specs") or {}, _w)
+                    return v if v is not None else -1.0
+
+                return _ek_dim_key
             if col == "ek_diag":
                 def _ek_diag_key(d):
                     try:
@@ -3970,6 +4011,99 @@ class GsmParserView:
         )
         page.show_dialog(dlg)
 
+    def _merge_devices_dialog(self, page, device_id: str, is_gsm_side: bool, seed_query: str):
+        """SA action: manually link a standalone GSM Arena row with a
+        standalone E-Katalog row that are actually the same device but
+        auto-matching missed it (see _link_new_gsm_device_to_standalone_ek
+        in gsm_parser_runner.py — the automatic version of this same
+        merge). is_gsm_side=True means THIS card is the GSM Arena row and
+        we're searching for its E-Katalog counterpart; False means the
+        reverse (this card IS the standalone E-Katalog row)."""
+        opposite_source = "E-Katalog" if is_gsm_side else "GSM Arena"
+        search_field = ft.TextField(
+            value=seed_query, label="Пошук пристрою", expand=True, autofocus=True
+        )
+        results_col = ft.Column([], spacing=2, scroll=ft.ScrollMode.AUTO, height=260, tight=True)
+
+        def _row_label(r: dict) -> str:
+            return f"{r.get('brand') or ''} {r.get('model_name') or ''}".strip()
+
+        async def _do_merge(other_id: str, other_label: str):
+            gsm_id_arg = device_id if is_gsm_side else other_id
+            ek_id_arg = other_id if is_gsm_side else device_id
+            ok, msg = await asyncio.to_thread(
+                self.db.merge_gsm_ek_devices, gsm_id_arg, ek_id_arg
+            )
+            with contextlib.suppress(Exception):
+                page.pop_dialog()
+            self._show_snack(msg, ft.Colors.GREEN if ok else ft.Colors.RED)
+            if ok:
+                await asyncio.to_thread(self._refresh_cached_detail, device_id)
+                with contextlib.suppress(Exception):
+                    self._refresh_table(rebuild_filters=False)
+
+        async def _do_search(_e=None):
+            q = (search_field.value or "").strip()
+            rows = await asyncio.to_thread(
+                self.db.find_standalone_gsm_devices, opposite_source, q
+            )
+            results_col.controls.clear()
+            if not rows:
+                results_col.controls.append(
+                    ft.Text("Нічого не знайдено", size=12, color=_MUTED)
+                )
+            for r in rows:
+                rid = str(r.get("id") or "")
+                label = _row_label(r) or rid
+
+                def _pick(_e2, _rid=rid, _label=label):
+                    page.run_task(_do_merge, _rid, _label)
+
+                results_col.controls.append(
+                    ft.TextButton(
+                        content=ft.Text(label, size=12),
+                        on_click=_pick,
+                        style=ft.ButtonStyle(
+                            padding=ft.padding.symmetric(horizontal=8, vertical=6),
+                            alignment=ft.Alignment(-1, 0),
+                        ),
+                    )
+                )
+            with contextlib.suppress(Exception):
+                results_col.update()
+
+        search_field.on_submit = lambda e: page.run_task(_do_search)
+        search_btn = ft.IconButton(
+            icon=ft.Icons.SEARCH, tooltip="Шукати", on_click=lambda e: page.run_task(_do_search)
+        )
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(f"Об'єднати з {opposite_source}", size=15, weight=ft.FontWeight.W_700),
+            content=ft.Container(
+                width=380,
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            "Якщо це той самий пристрій, що автопошук не з'єднав —"
+                            " знайдіть його нижче і виберіть, щоб об'єднати одразу.",
+                            size=11,
+                            color=ft.Colors.BLUE_GREY_600,
+                        ),
+                        ft.Row([search_field, search_btn]),
+                        ft.Divider(height=1),
+                        results_col,
+                    ],
+                    spacing=8,
+                    tight=True,
+                ),
+            ),
+            actions=[ft.TextButton("Закрити", on_click=lambda _: page.pop_dialog())],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        page.show_dialog(dlg)
+        page.run_task(_do_search)
+
     def _confirm_remove_ek_match(self, page, device_id: str, ek_id: str):
         """SA action: delete only the E-Katalog side of a merged device (the
         GSM Arena row stays untouched). Use when auto-matching picked the
@@ -4574,6 +4708,27 @@ class GsmParserView:
             if self.is_superadmin and ek_id
             else None
         )
+        # Manual-merge button: only when this card is missing its other
+        # side (GSM-primary with no EK match, or a standalone EK-only
+        # card) — once both sides are present there's nothing to merge.
+        _is_gsm_side = gsm_name != "—"
+        _merge_missing_side = (_is_gsm_side and not ek_id) or not _is_gsm_side
+        merge_btn = (
+            ft.IconButton(
+                icon=ft.Icons.JOIN_FULL,
+                icon_size=16,
+                tooltip=(
+                    "Об'єднати з існуючим записом Єкаталог"
+                    if _is_gsm_side
+                    else "Об'єднати з існуючим записом GSM Arena"
+                ),
+                on_click=lambda _: self._merge_devices_dialog(
+                    page, device_id, _is_gsm_side, brand
+                ),
+            )
+            if self.is_superadmin and _merge_missing_side
+            else None
+        )
 
         # ---- "Огляд" — combined tab (GSM + EK + compat + comment) ----
         # Compat, regional variants, and comment are loaded lazily to keep
@@ -4612,7 +4767,8 @@ class GsmParserView:
                         ft.Row(
                             [ek_link_btn]
                             + ([ek_manual_btn] if ek_manual_btn else [])
-                            + ([ek_remove_btn] if ek_remove_btn else []),
+                            + ([ek_remove_btn] if ek_remove_btn else [])
+                            + ([merge_btn] if merge_btn else []),
                             spacing=0,
                             vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         )
@@ -8560,33 +8716,86 @@ class GsmParserView:
                 else ft.Icons.KEYBOARD_ARROW_DOWN
             )
 
+        # "Розмір" expands into per-axis sort choices (Довжина/Ширина/
+        # Товщина) via a small popup instead of three permanent columns —
+        # inserting real extra columns would mean every row-render call
+        # site across this file (there are many) needs to know about a
+        # dynamic 1<->3 column layout, which is far riskier than a popup
+        # that reuses the exact same _sort_click/_sort_col machinery every
+        # other column already uses. Lets you quickly find the
+        # narrowest/widest/thinnest device for box selection.
+        _DIM_AXES = [("length", "Довжина"), ("width", "Ширина"), ("thickness", "Товщина")]
+
+        def _dim_popup(prefix: str, txt_color: str) -> ft.PopupMenuButton:
+            def _axis_item(axis_key, axis_label):
+                col = f"{prefix}_{axis_key}"
+                active = self._sort_col == col
+                icon = (
+                    (ft.Icons.KEYBOARD_ARROW_UP if self._sort_asc else ft.Icons.KEYBOARD_ARROW_DOWN)
+                    if active
+                    else ft.Icons.UNFOLD_MORE
+                )
+                return ft.PopupMenuItem(
+                    content=ft.Row(
+                        [
+                            ft.Text(axis_label, size=12, weight=ft.FontWeight.W_600 if active else None),
+                            ft.Icon(icon, size=14, color=_MUTED),
+                        ],
+                        spacing=6,
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    on_click=lambda _, c=col: self._sort_click(c),
+                )
+
+            return ft.PopupMenuButton(
+                icon=ft.Icons.STRAIGHTEN,
+                icon_size=13,
+                icon_color=txt_color,
+                tooltip="Сортувати за довжиною / шириною / товщиною",
+                padding=ft.padding.all(0),
+                items=[_axis_item(k, lbl) for k, lbl in _DIM_AXES],
+            )
+
         def _hdr_cell(key, width, label, sortable, txt_color):
             if sortable:
+                _extra = (
+                    [_dim_popup(key.split("_")[0], txt_color)]
+                    if key in ("gsm_size", "ek_size")
+                    else []
+                )
                 return ft.Container(
                     width=width,
                     alignment=ft.Alignment(0, 0),
-                    content=ft.TextButton(
-                        content=ft.Row(
-                            [
-                                ft.Text(
-                                    label,
-                                    size=10,
-                                    weight=ft.FontWeight.W_700,
-                                    color=txt_color,
+                    content=ft.Row(
+                        [
+                            ft.TextButton(
+                                content=ft.Row(
+                                    [
+                                        ft.Text(
+                                            label,
+                                            size=10,
+                                            weight=ft.FontWeight.W_700,
+                                            color=txt_color,
+                                        ),
+                                        ft.Icon(
+                                            _sort_icon(key),
+                                            size=12,
+                                            color=_MUTED,
+                                        ),
+                                    ],
+                                    spacing=2,
+                                    tight=True,
                                 ),
-                                ft.Icon(
-                                    _sort_icon(key),
-                                    size=12,
-                                    color=_MUTED,
+                                style=ft.ButtonStyle(
+                                    padding=ft.padding.symmetric(horizontal=2, vertical=2)
                                 ),
-                            ],
-                            spacing=2,
-                            tight=True,
-                        ),
-                        style=ft.ButtonStyle(
-                            padding=ft.padding.symmetric(horizontal=2, vertical=2)
-                        ),
-                        on_click=lambda _, c=key: self._sort_click(c),
+                                on_click=lambda _, c=key: self._sort_click(c),
+                            ),
+                        ]
+                        + _extra,
+                        spacing=0,
+                        tight=True,
+                        alignment=ft.MainAxisAlignment.CENTER,
                     ),
                 )
             return ft.Container(
