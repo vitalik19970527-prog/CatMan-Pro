@@ -462,6 +462,53 @@ def _save_cache_to_disk() -> None:
             logger.exception("[GSM] failed to save on-disk cache")
 
 
+def _chart_cache_file_path() -> str:
+    return os.path.join(_app_data_dir(), "gsm_chart_cache_v1.json")
+
+
+def _load_chart_cache_from_disk() -> bool:
+    """Populate _CHART_RENDER_CACHE from disk — pre-rendered charts from a
+    previous session mean _preload_charts_for_current_page finds most
+    devices already cache-hit (the "sig" check inside _build_adaptive_charts
+    still catches any that changed since), instead of re-rendering the
+    whole visible page's matplotlib charts from scratch every app launch."""
+    global _CHART_RENDER_CACHE
+    path = _chart_cache_file_path()
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            return False
+        with _CHART_RENDER_LOCK:
+            _CHART_RENDER_CACHE = payload
+        return True
+    except Exception:
+        logger.exception("[GSM] failed to load on-disk chart cache")
+        return False
+
+
+def _save_chart_cache_to_disk() -> None:
+    """Persist _CHART_RENDER_CACHE (device_id -> b64 PNG + hotspot data) to
+    its own file, separate from gsm_parser_cache_v1.json — this dict is
+    made of base64 PNG strings for potentially thousands of devices, so
+    keeping it out of the devices/detail payload keeps THAT file (loaded
+    on every cold start) small and fast to parse regardless of how many
+    charts have ever been pre-rendered."""
+    with _CHART_RENDER_LOCK:
+        payload = dict(_CHART_RENDER_CACHE)
+    path = _chart_cache_file_path()
+    tmp_path = path + ".tmp"
+    with _CACHE_SAVE_LOCK:
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, default=_json_default)
+            os.replace(tmp_path, path)
+        except Exception:
+            logger.exception("[GSM] failed to save on-disk chart cache")
+
+
 def _last_9am_boundary(now: datetime | None = None) -> datetime:
     """The most recent 9:00 — today's if we're past it, otherwise yesterday's."""
     now = now or datetime.now()
@@ -1252,8 +1299,10 @@ class GsmParserView:
 
             if devices is None:
                 loaded_from_disk = await asyncio.to_thread(_load_cache_from_disk)
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(_load_chart_cache_from_disk)
                 if loaded_from_disk:
-                    self._refresh_table()
+                    self._refresh_table(fill_all_brands=True)
 
             if self._needs_reload():
                 _set_loading(True)
@@ -1271,7 +1320,7 @@ class GsmParserView:
                     await asyncio.to_thread(self._sync_cache_from_db, False)
                 finally:
                     _set_loading(False)
-                self._refresh_table()
+                self._refresh_table(fill_all_brands=True)
 
             self._hide_loading_overlay()
 
@@ -1302,15 +1351,62 @@ class GsmParserView:
                     _, _, loading = _get_cache()
                     if not loading:
                         break
-                self._refresh_table()
+                self._refresh_table(fill_all_brands=True)
                 return
             if devices is None:
                 await self._background_load(page)
                 return
             await asyncio.to_thread(self._sync_cache_from_db, False)
-            self._refresh_table()
+            self._refresh_table(fill_all_brands=True)
         except Exception as exc:
             logger.error("[GSM] _reveal_sync FAILED: %s", exc, exc_info=True)
+
+    async def _preload_charts_for_current_page(self) -> None:
+        """Pre-renders every currently-visible device's chart into
+        _CHART_RENDER_CACHE so opening ANY device's chart tab afterwards
+        hits the cache (see _build_lazy_tab) instead of running matplotlib
+        on click. Called by _reveal_and_sync strictly AFTER the brand-row
+        -fill queue has fully drained — never concurrently with it, same
+        reasoning as _queue_brand_fill: two things building
+        Flet/matplotlib work on this thread at once is what freezes the
+        app at scale. Sequential, chunked, yielding between chunks so the
+        event loop can still service other UI events during this pass."""
+        CHUNK = 30
+        try:
+            filtered = self._get_filtered_devices()
+            page_devs = self._page_items(filtered)
+        except Exception:
+            logger.exception(
+                "[GSM] _preload_charts_for_current_page: failed to compute device list"
+            )
+            return
+        total = len(page_devs)
+        for i in range(0, total, CHUNK):
+            chunk = page_devs[i : i + CHUNK]
+            for dev in chunk:
+                did = str(dev.get("id") or "").strip()
+                if not did:
+                    continue
+                try:
+                    # Return value (a throwaway ft.Control) is discarded —
+                    # only the _CHART_RENDER_CACHE side effect matters here.
+                    # Cache-hit devices (unchanged history, see the sig
+                    # check inside) return near-instantly.
+                    self._build_adaptive_charts(did, dev)
+                except Exception:
+                    logger.exception(
+                        "[GSM] chart preload failed for device_id=%s", did
+                    )
+            done = min(i + CHUNK, total)
+            self._update_loading_status(
+                self.t(
+                    "gsm.preparing_charts", "Підготовка діаграм… {n}/{total}"
+                ).format(n=done, total=total),
+                (done / total) if total else None,
+            )
+            await asyncio.sleep(0)
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(_save_chart_cache_to_disk)
 
     async def _prepare_results_content(self, status_cb=None) -> ft.Control:
         """Results-tab entry point: check whether a sync is needed, run it
@@ -4973,8 +5069,18 @@ class GsmParserView:
     # ------------------------------------------------------------------ #
     #  Build results content                                               #
     # ------------------------------------------------------------------ #
-    def _refresh_table(self, rebuild_filters: bool = True):
-        """Rebuild table body + pagination + stats in-place."""
+    def _refresh_table(self, rebuild_filters: bool = True, fill_all_brands: bool = False):
+        """Rebuild table body + pagination + stats in-place.
+
+        fill_all_brands=True forces every brand group's rows to be queued
+        for building, not just the ones currently expanded — used only by
+        the "Показати результати" reveal flow (_reveal_sync), which needs
+        the whole page fully built before it hides its loading state so
+        expanding ANY brand afterwards is instant instead of triggering a
+        background build. Routine refreshes (search/filter/pagination/sync
+        ticks) must keep the old lazy-only-visible behavior — building
+        every brand's rows on every keystroke would reintroduce the exact
+        freeze this laziness was added to avoid."""
         try:
             devices, _, loading = _get_cache()
             logger.info(
@@ -5038,7 +5144,7 @@ class GsmParserView:
                     body_col = ft.Column(spacing=0)
                     body_container = ft.Container(content=body_col, visible=not collapsed)
                     self._brand_body_by_name[brand_name] = body_container
-                    if not collapsed:
+                    if fill_all_brands or not collapsed:
                         _to_fill.append((body_container, brand_devs))
                     rows.append(
                         self._build_brand_header(brand_name, len(brand_devs), body_container)
@@ -8392,6 +8498,13 @@ class GsmParserView:
                     if not self._brand_fill_running and not self._brand_fill_queue:
                         break
                     await asyncio.sleep(0.2)
+                # Only now, with every brand's rows fully built (never
+                # concurrently with the queue above — see its own
+                # docstring), pre-render every visible device's chart too.
+                # This is the step that makes opening ANY card's chart tab
+                # afterwards instant instead of triggering a background
+                # matplotlib render on click.
+                await self._preload_charts_for_current_page()
             except Exception as exc:
                 logger.error("[GSM] _reveal_and_sync FAILED: %s", exc, exc_info=True)
             finally:
