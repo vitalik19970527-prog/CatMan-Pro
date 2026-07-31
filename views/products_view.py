@@ -3993,8 +3993,22 @@ class ProductsView:
             product, on_switch_to_edit, _dlg_ref, existing_dlg,
         )
         if existing_dlg is not None:
-            with contextlib.suppress(Exception):
+            # See show_product_dialog's matching block for why this is no
+            # longer a blind contextlib.suppress(Exception): a raise here
+            # used to look identical to the click doing nothing at all.
+            try:
                 dlg.update()
+                logger.info(
+                    "[edit-switch] view-mode dlg.update() OK pid=%s",
+                    (product or {}).get("id"),
+                )
+            except Exception:
+                logger.exception(
+                    "[edit-switch] view-mode dlg.update() raised pid=%s — falling back to page.update()",
+                    (product or {}).get("id"),
+                )
+                with contextlib.suppress(Exception):
+                    self.content_area.page.update()
         else:
             self.content_area.page.show_dialog(dlg)
 
@@ -5960,7 +5974,20 @@ class ProductsView:
             ],
             vertical_alignment=ft.CrossAxisAlignment.CENTER, tight=True,
         )
-        dlg.on_dismiss = _on_dismiss
+        # page.show_dialog() (called the first time this dlg was ever
+        # opened, in view mode) wraps dlg.on_dismiss in its own handler
+        # that removes the dialog from the page's internal dialog stack —
+        # overwriting it outright here (as this used to do) broke that
+        # bookkeeping on every Esc/backdrop dismiss after switching to
+        # edit. Chain to whatever was already there instead.
+        _prev_on_dismiss = dlg.on_dismiss if existing_dlg is not None else None
+
+        def _on_dismiss_chained(_e):
+            _release_lock_once()
+            if _prev_on_dismiss is not None:
+                _prev_on_dismiss(_e)
+
+        dlg.on_dismiss = _on_dismiss_chained if _prev_on_dismiss is not None else _on_dismiss
         dlg.content = ft.Container(
             width=760,
             content=ft.Column([dialog_loading, dialog_form], spacing=0),
@@ -5969,11 +5996,28 @@ class ProductsView:
             ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=_cancel),
             save_btn,
         ]
+        logger.info(
+            "[edit-switch] about to render edit dialog dlg_reused=%s pid=%s",
+            existing_dlg is not None, (product or {}).get("id"),
+        )
         if existing_dlg is not None:
             # Same dialog object, already open — just patch what changed,
             # no close/open transition (and no second dialog) at all.
-            with contextlib.suppress(Exception):
+            # Previously wrapped in a blind contextlib.suppress(Exception)
+            # — if .update() raised (e.g. the dialog wasn't actually
+            # attached to the page the way this code assumed), the whole
+            # switch would silently no-op with zero trace: exactly the
+            # repeated "nothing happens" reports. Surface it instead.
+            try:
                 dlg.update()
+                logger.info("[edit-switch] dlg.update() OK pid=%s", (product or {}).get("id"))
+            except Exception:
+                logger.exception(
+                    "[edit-switch] dlg.update() raised pid=%s — falling back to page.update()",
+                    (product or {}).get("id"),
+                )
+                with contextlib.suppress(Exception):
+                    self.content_area.page.update()
         else:
             self.content_area.page.show_dialog(dlg)
 

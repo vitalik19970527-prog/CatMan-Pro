@@ -1203,6 +1203,35 @@ class MediaPlanView:
             # typed, always falling through to look unchanged/reverted.
             on_change=lambda e: None,
         )
+
+        def _save_months_only(_=None):
+            # Requested as a direct workaround: a button that ONLY commits
+            # the months count, independent of the big "Зберегти" at the
+            # bottom of this dialog (which also saves columns/sorting and
+            # closes the dialog) — so this field's value is never at the
+            # mercy of the rest of the dialog's state.
+            try:
+                n = max(1, min(24, int(str(months_f.value or "3").strip() or "3")))
+            except Exception:
+                n = 3
+            self._visible_months_count = n
+            self._save_month_view_settings()
+            self._schedule_rebuild()
+            self._snack(self.t("media.months_saved", f"Збережено: {n} міс."), "#10B981")
+
+        months_row = ft.Row(
+            [
+                months_f,
+                ft.IconButton(
+                    icon=ft.Icons.SAVE_OUTLINED,
+                    tooltip=self.t("media.field.months_save", "Зберегти кількість місяців"),
+                    on_click=_save_months_only,
+                    style=ft.ButtonStyle(padding=ft.padding.all(4)),
+                ),
+            ],
+            spacing=2,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
         pin_cb = ft.Checkbox(
             label=self.t("media.field.show_prev_month", "Показувати попередній місяць"),
             value=self._pin_last_archive_month,
@@ -1882,7 +1911,7 @@ class MediaPlanView:
                 [
                     rows_host,
                     ft.Divider(height=8),
-                    months_f,
+                    months_row,
                     pin_cb,
                     ft.Divider(height=8),
                     ft.Text("Черговість категорій", size=10, color=self._th_text),
@@ -2150,6 +2179,33 @@ class MediaPlanView:
             # typed, always falling through to look unchanged/reverted.
             on_change=lambda e: None,
         )
+
+        def _save_months_only(_=None):
+            # Same standalone-save workaround as the columns dialog above —
+            # commits just the months count without touching column/day
+            # settings and without needing the big "Зберегти" + tab restart.
+            try:
+                n = max(1, min(24, int(str(months_f.value or "3").strip() or "3")))
+            except Exception:
+                n = 3
+            self._visible_months_count = n
+            self._save_month_view_settings()
+            self._restart_tab()
+            self._snack(self.t("media.months_saved", f"Збережено: {n} міс."), "#10B981")
+
+        months_row = ft.Row(
+            [
+                months_f,
+                ft.IconButton(
+                    icon=ft.Icons.SAVE_OUTLINED,
+                    tooltip=self.t("media.field.months_save", "Зберегти кількість місяців"),
+                    on_click=_save_months_only,
+                    style=ft.ButtonStyle(padding=ft.padding.all(4)),
+                ),
+            ],
+            spacing=2,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
         pin_cb = ft.Checkbox(
             label=self.t("media.field.show_prev_month", "Показувати попередній місяць"),
             value=self._pin_last_archive_month,
@@ -2197,7 +2253,7 @@ class MediaPlanView:
                 [
                     rows_host,
                     ft.Divider(height=8),
-                    months_f,
+                    months_row,
                     pin_cb,
                     ft.Divider(height=8),
                     ft.Text("Дні для постів", size=11, color=self._th_text, weight=ft.FontWeight.W_500),

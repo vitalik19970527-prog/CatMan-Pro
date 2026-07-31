@@ -1163,6 +1163,33 @@ class OrderScheduleView:
             # typed, always falling through to look unchanged/reverted.
             on_change=lambda e: None,
         )
+
+        def _save_months_only(_=None):
+            # Standalone save workaround: commits just the months count,
+            # independent of the archive/order/pin settings and without
+            # needing the big "Зберегти" + tab restart below.
+            try:
+                cnt = max(1, min(24, int(str(months_f.value or "12").strip() or "12")))
+            except Exception:
+                cnt = 12
+            self._visible_months_count = cnt
+            self._save_month_view_settings()
+            self._restart_tab()
+            self._snack(self.t("media.months_saved", f"Збережено: {cnt} міс."), "#10B981")
+
+        months_row = ft.Row(
+            [
+                months_f,
+                ft.IconButton(
+                    icon=ft.Icons.SAVE_OUTLINED,
+                    tooltip=self.t("media.field.months_save", "Зберегти кількість місяців"),
+                    on_click=_save_months_only,
+                    style=ft.ButtonStyle(padding=ft.padding.all(4)),
+                ),
+            ],
+            spacing=2,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
         current_order_value = ",".join(
             self._ordered_schedule_right_columns(show_archive=True)
         )
@@ -1209,7 +1236,7 @@ class OrderScheduleView:
                     ft.Divider(height=8),
                     order_dd,
                     ft.Divider(height=8),
-                    months_f,
+                    months_row,
                     pin_cb,
                     ft.Divider(height=8),
                     ft.FilledButton(self.t("common.save", "Зберегти"), on_click=_save_columns),
@@ -1835,6 +1862,33 @@ class OrderScheduleView:
             # typed, always falling through to look unchanged/reverted.
             on_change=lambda e: None,
         )
+
+        def _save_months_only(_=None):
+            # Standalone save workaround: commits just the months count,
+            # independent of the archive/order/pin settings and without
+            # needing the big "Зберегти" below.
+            try:
+                cnt = max(1, min(24, int(str(months_f.value or "12").strip() or "12")))
+            except Exception:
+                cnt = 12
+            self._visible_months_count = cnt
+            self._save_month_view_settings()
+            self._schedule_rebuild()
+            self._snack(self.t("media.months_saved", f"Збережено: {cnt} міс."), "#10B981")
+
+        months_row = ft.Row(
+            [
+                months_f,
+                ft.IconButton(
+                    icon=ft.Icons.SAVE_OUTLINED,
+                    tooltip=self.t("media.field.months_save", "Зберегти кількість місяців"),
+                    on_click=_save_months_only,
+                    style=ft.ButtonStyle(padding=ft.padding.all(4)),
+                ),
+            ],
+            spacing=2,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
         current_order_value = ",".join(
             self._ordered_schedule_right_columns(show_archive=True)
         )
@@ -1901,7 +1955,7 @@ class OrderScheduleView:
                     ft.Divider(height=8),
                     order_dd,
                     ft.Divider(height=8),
-                    months_f,
+                    months_row,
                     pin_cb,
                 ],
                 spacing=6,

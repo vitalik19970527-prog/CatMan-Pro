@@ -998,6 +998,7 @@ class GsmParserView:
         # is a single flat list of every device (no brand headers/dividers/
         # collapse state at all) instead of the normal brand-grouped view.
         self._flat_mode: bool = False
+        self._flat_last_page_devs: list[dict] | None = None
         self._brand_devs_by_name: dict[str, list[dict]] = {}
         self._brand_body_by_name: dict[str, ft.Container] = {}
         self._color_maps: tuple = ({}, {}, {}, {})
@@ -5334,12 +5335,60 @@ class GsmParserView:
                 if self._flat_mode:
                     # "Групування" toggled off — one continuous list, no
                     # brand headers/dividers/collapse state at all.
+                    _prev_flat_container = (self._brand_body_by_name or {}).get("__flat__")
+                    _prev_flat_devs = getattr(self, "_flat_last_page_devs", None)
                     self._brand_devs_by_name = {"__flat__": page_devs}
                     self._brand_body_by_name = {}
                     body_col = ft.Column(spacing=0)
                     body_container = ft.Container(content=body_col, visible=True)
+
+                    _reused_rows = False
+                    if (
+                        _prev_flat_container is not None
+                        and _prev_flat_container.data == "filled"
+                        and _prev_flat_container.content is not None
+                        and _prev_flat_devs is not None
+                        and len(_prev_flat_devs) == len(page_devs)
+                    ):
+                        _by_id = {
+                            getattr(c, "data", None): c
+                            for c in _prev_flat_container.content.controls
+                        }
+                        _prev_by_id = {
+                            str(d.get("id") or ""): d for d in _prev_flat_devs
+                        }
+                        _wanted_ids = [str(d.get("id") or "") for d in page_devs]
+                        if (
+                            len(_by_id) == len(_wanted_ids)
+                            and all(did in _by_id for did in _wanted_ids)
+                            # Content-equal, not just same IDs — a background
+                            # sync can update prices/status for the SAME set
+                            # of devices between two sort clicks; comparing
+                            # full dicts (cheap: pure Python data, no Flet
+                            # Control construction) instead of just IDs is
+                            # what keeps this safe from showing stale rows.
+                            and all(
+                                _prev_by_id.get(did) == d
+                                for did, d in zip(_wanted_ids, page_devs)
+                            )
+                        ):
+                            # Every row for this exact device set is already
+                            # built and unchanged (this is a pure re-sort,
+                            # not a filter/search/data change) — reorder the
+                            # existing Control objects instead of rebuilding
+                            # ~1000+ rows from scratch through the chunked
+                            # async path. That chunked rebuild (20 rows/
+                            # chunk, one Flutter patch per chunk) is what
+                            # made every sort click in flat mode feel like it
+                            # hangs on a 1000+ device catalog — reusing built
+                            # rows makes re-sorting effectively instant.
+                            body_col.controls = [_by_id[did] for did in _wanted_ids]
+                            body_container.data = "filled"
+                            _reused_rows = True
+
                     self._brand_body_by_name["__flat__"] = body_container
-                    if page_devs:
+                    self._flat_last_page_devs = page_devs
+                    if page_devs and not _reused_rows:
                         _to_fill.append((body_container, page_devs))
                     rows.append(body_container)
                 else:
