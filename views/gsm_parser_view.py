@@ -5396,10 +5396,39 @@ class GsmParserView:
                             body_container.data = "filled"
                             _reused_rows = True
 
+                    if page_devs and not _reused_rows:
+                        # Build every row right here, synchronously, in one
+                        # pass — no chunked async queue. That queue (20
+                        # rows/chunk, one Flutter patch + yield per chunk)
+                        # was built to avoid one giant patch freezing the
+                        # UI, but for a catalog that's already fully loaded
+                        # in memory (no DB round trip per row — see
+                        # _build_table_row's local photo-cache path) the
+                        # ~55 extra network round trips it added COST more
+                        # total time than one direct build + one patch,
+                        # which is what actually made toggling grouping off
+                        # feel slow. A single synchronous build blocks the
+                        # UI thread briefly for an explicit, user-initiated
+                        # action instead — the same tradeoff superadmin's
+                        # always-immediate reveal already made.
+                        built_rows = []
+                        for d in page_devs:
+                            try:
+                                built_rows.append(
+                                    self._build_table_row(
+                                        d, gsm_sz_c, ek_sz_c, gsm_dg_c, ek_dg_c
+                                    )
+                                )
+                            except Exception as row_exc:
+                                logger.error(
+                                    "[GSM] flat-mode row build failed for %s: %s",
+                                    d.get("gsm_name"), row_exc,
+                                )
+                        body_col.controls = built_rows
+                        body_container.data = "filled"
+
                     self._brand_body_by_name["__flat__"] = body_container
                     self._flat_last_page_devs = page_devs
-                    if page_devs and not _reused_rows:
-                        _to_fill.append((body_container, page_devs))
                     rows.append(body_container)
                 else:
                     # Group by brand — insert header + thick divider between brands
@@ -9100,13 +9129,29 @@ class GsmParserView:
         rows: list[ft.Control] = []
         _to_fill: list[tuple[ft.Container, list[dict]]] = []
         if self._flat_mode:
+            # Same reasoning as _refresh_table's matching branch: build
+            # synchronously, no chunked async queue — the data is already
+            # fully cached (no DB round trip per row), so one direct build
+            # + one patch beats ~55 chunked patches on total wall time.
             self._brand_devs_by_name = {"__flat__": page_devs}
             self._brand_body_by_name = {}
             body_col = ft.Column(spacing=0)
             body_container = ft.Container(content=body_col, visible=True)
+            built_rows = []
+            for d in page_devs:
+                try:
+                    built_rows.append(
+                        self._build_table_row(d, gsm_sz_c, ek_sz_c, gsm_dg_c, ek_dg_c)
+                    )
+                except Exception as row_exc:
+                    logger.error(
+                        "[GSM] flat-mode initial row build failed for %s: %s",
+                        d.get("gsm_name"), row_exc,
+                    )
+            body_col.controls = built_rows
+            body_container.data = "filled"
             self._brand_body_by_name["__flat__"] = body_container
-            if page_devs:
-                _to_fill.append((body_container, page_devs))
+            self._flat_last_page_devs = page_devs
             rows.append(body_container)
         else:
             prev_brand: str | None = None
