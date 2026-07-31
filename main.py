@@ -1343,13 +1343,11 @@ def main(page: ft.Page):
         "logout_button_click",
         "account_switch_confirmed",
         "system_backup_lock",
-        "session_kicked",
     }
     _manual_auth_reasons = {
         "logout_button_click",
         "account_switch_confirmed",
         "system_backup_lock",
-        "session_kicked",
     }
 
     def _install_page_lifecycle_logs():

@@ -745,13 +745,6 @@ class DataManager:
             # rules used by the company registration flow.
             "ALTER TABLE public.managers ADD COLUMN IF NOT EXISTS account_kind character varying NOT NULL DEFAULT 'company';",
             "CREATE UNIQUE INDEX IF NOT EXISTS ux_managers_email_individual ON public.managers (lower(trim(email))) WHERE account_kind = 'individual';",
-            # Single-active-device enforcement: every successful login overwrites
-            # this with a fresh token and hands it to that device's session; any
-            # other device still holding an older token gets polled out (see
-            # check_auth / get_manager_active_session_token / dashboard.py's
-            # _watch_session_kick) — only the most-recently-logged-in device per
-            # manager account stays authenticated.
-            "ALTER TABLE public.managers ADD COLUMN IF NOT EXISTS active_session_token character varying;",
             """
             CREATE TABLE IF NOT EXISTS public.app_update_policy (
               id character varying NOT NULL,
@@ -21213,19 +21206,6 @@ class DataManager:
             # ensure at least one region exists for smoother UI
             with contextlib.suppress(Exception):
                 self.create_region_with_defaults(cid, "Default")
-            bootstrap_session_token = ""
-            try:
-                bootstrap_session_token = str(uuid.uuid4())
-                with self._general_pg().cursor() as cur:
-                    cur.execute(
-                        "UPDATE public.managers SET active_session_token=%s WHERE id=%s",
-                        (bootstrap_session_token, mid),
-                    )
-            except Exception:
-                logger.exception(
-                    "Failed to stamp active_session_token on bootstrap login"
-                )
-                bootstrap_session_token = ""
             return {
                 "id": mid,
                 "company_id": cid,
@@ -21239,7 +21219,6 @@ class DataManager:
                 "account_kind": "company",
                 "storage_mode": "vps",
                 "superadmin_explicit_mode": True,
-                "session_token": bootstrap_session_token,
             }
 
         # Normal auth:
@@ -21456,22 +21435,6 @@ class DataManager:
             returned_company_name or "?",
             _cid_log[:12],
         )
-        # Single-active-device enforcement: stamp a fresh token on this login,
-        # overwriting whatever a previous device's session was holding — that
-        # older device's next _watch_session_kick poll will see the mismatch
-        # and force itself back to the login screen.
-        session_token = ""
-        if is_ok:
-            try:
-                session_token = str(uuid.uuid4())
-                with self._general_pg().cursor() as cur:
-                    cur.execute(
-                        "UPDATE public.managers SET active_session_token=%s WHERE id=%s",
-                        (session_token, row.get("id")),
-                    )
-            except Exception:
-                logger.exception("Failed to stamp active_session_token on login")
-                session_token = ""
         return {
             "id": row.get("id"),
             "company_id": row.get("company_id"),
@@ -21484,28 +21447,7 @@ class DataManager:
             "password": password,
             "account_kind": returned_account_kind,
             "storage_mode": returned_storage_mode,
-            "session_token": session_token,
         }
-
-    def get_manager_active_session_token(self, manager_id: str) -> str | None:
-        """Current active_session_token for `manager_id`, polled by
-        dashboard.py's _watch_session_kick to detect a login from another
-        device. Returns None (not "") on any lookup failure/unsupported
-        backend so the caller can tell "couldn't check" apart from a genuine
-        empty token and skip the kick rather than false-triggering it."""
-        if not self._use_postgres():
-            return None
-        try:
-            with self._general_pg().cursor() as cur:
-                cur.execute(
-                    "SELECT active_session_token FROM public.managers WHERE id=%s",
-                    (str(manager_id or ""),),
-                )
-                row = cur.fetchone()
-                return str((row or {}).get("active_session_token") or "")
-        except Exception:
-            logger.exception("get_manager_active_session_token failed")
-            return None
 
     def force_superadmin_credentials(
         self,

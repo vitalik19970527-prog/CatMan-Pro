@@ -59,11 +59,6 @@ class MainDashboard:
             )
         self.current_manager_id = self.user_data.get("id")
         self.current_manager_name = self.user_data.get("full_name", "Мої дані")
-        # Single-active-device enforcement: the token check_auth stamped for
-        # THIS login. _watch_session_kick polls the DB copy and force-logs-out
-        # the moment it no longer matches (another device logged into the
-        # same account and overwrote it).
-        self._my_session_token = str(self.user_data.get("session_token") or "").strip()
         self.visible_managers = []
         self.current_region = None
         self.current_view_func = self.show_home
@@ -2743,7 +2738,6 @@ class MainDashboard:
                     "logout_button_click",
                     "account_switch_confirmed",
                     "system_backup_lock",
-                    "session_kicked",
                 }
                 if reason not in allowed_reasons:
                     logger.error(
@@ -3039,67 +3033,6 @@ class MainDashboard:
                             logger.exception("[backup-lock-watch] tick failed")
 
                 self.page.run_task(_watch_backup_lock)
-
-            if not getattr(self, "_session_kick_watch_started", False):
-                self._session_kick_watch_started = True
-
-                async def _watch_session_kick():
-                    # Independent of Config.SYNC_PULSES_ENABLED (unlike
-                    # _sync_poll_loop) — only one device may hold an active
-                    # session per manager account; a login elsewhere must
-                    # force this one out even with live sync polling off. See
-                    # check_auth / get_manager_active_session_token.
-                    if not self._my_session_token:
-                        # This login never got a token (e.g. REST-backend
-                        # mode, where get_manager_active_session_token is a
-                        # no-op) — nothing to compare against, so skip
-                        # entirely rather than false-triggering on every tick.
-                        return
-                    while True:
-                        await asyncio.sleep(12)
-                        try:
-                            # Always the ACTUAL logged-in account — never
-                            # self.current_manager_id, which is the "viewing
-                            # as a subordinate" workspace-tab context and
-                            # changes constantly during normal use, causing
-                            # false kicks against an unrelated manager's token.
-                            mid = str(self.user_data.get("id") or "").strip()
-                            if not mid:
-                                continue
-                            current_token = await asyncio.to_thread(
-                                self.db.get_manager_active_session_token, mid
-                            )
-                            if current_token is None:
-                                # Lookup failed/unsupported this tick — skip,
-                                # don't treat as a mismatch.
-                                continue
-                            if (
-                                current_token
-                                and current_token != self._my_session_token
-                            ):
-                                with contextlib.suppress(Exception):
-                                    self.page.snack_bar = ft.SnackBar(
-                                        content=ft.Text(
-                                            self.t(
-                                                "dashboard.session_kicked",
-                                                "Ви увійшли в акаунт на іншому "
-                                                "пристрої. Цю сесію завершено.",
-                                            ),
-                                            color="#FFFFFF",
-                                            weight="bold",
-                                        ),
-                                        bgcolor="#B91C1C",
-                                        duration=6000,
-                                    )
-                                    self.page.snack_bar.open = True
-                                    self.page.update()
-                                _mark_manual_logout_intent("session_kicked")
-                                do_logout(None, reason="session_kicked")
-                                return
-                        except Exception:
-                            logger.exception("[session-kick-watch] tick failed")
-
-                self.page.run_task(_watch_session_kick)
 
             top_center = ft.Column(
                 [
