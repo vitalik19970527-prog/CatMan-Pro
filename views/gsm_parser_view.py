@@ -6072,12 +6072,17 @@ class GsmParserView:
         device_id = str(dev.get("id") or "")
         gs = dev.get("gsm_specs") or {}
         es = dev.get("ek_specs") or {}
-        image_url = str(dev.get("image_url") or "")
 
         with _PHOTO_LOCK:
             cached_photos = list(_PHOTO_CACHE.get(device_id) or [])
 
-        all_urls = cached_photos if cached_photos else ([image_url] if image_url else [])
+        if not cached_photos:
+            # Same rule as the main table row: only ever show a photo that
+            # came from this app's own DB (_photo_cache_path/_PHOTO_CACHE),
+            # never a live fetch from GSM Arena/E-Katalog.
+            _local_main = _photo_cache_path(device_id) if device_id else ""
+            cached_photos = [_local_main] if _local_main and os.path.exists(_local_main) else []
+        all_urls = cached_photos
         if shared_photo_lists is not None:
             shared_photo_lists[dev_idx] = list(all_urls)
 
@@ -6671,16 +6676,20 @@ class GsmParserView:
         page_ctrl = self._page_ref
 
         # ---- GSM section ----
-        # Prefer the locally-cached photo file (downloaded once during sync,
-        # see _sync_cache_from_db) over the remote GSM Arena URL — avoids a
-        # network image fetch per row, which is what made expanding a large
-        # brand group feel like a freeze.
+        # ONLY the locally-cached photo file (itself sourced from this
+        # app's own DB — see _warm_photo_cache_from_db, which bulk-warms
+        # this cache for the whole catalog before the table is ever
+        # revealed) — never the remote GSM Arena/E-Katalog image_url.
+        # Falling back to a live fetch from those sites is explicitly not
+        # allowed (photos only ever come from our DB) and was also a real
+        # per-row network-latency cost that made large brand groups (and
+        # flat mode) feel like they were freezing while building.
         device_id = str(merged.get("id") or "")
         _local_photo = _photo_cache_path(device_id) if device_id else ""
         img_src = (
             _local_photo
             if _local_photo and os.path.exists(_local_photo)
-            else str(merged.get("image_url") or "")
+            else ""
         )
         thumb = (
             ft.Image(
