@@ -5397,35 +5397,19 @@ class GsmParserView:
                             _reused_rows = True
 
                     if page_devs and not _reused_rows:
-                        # Build every row right here, synchronously, in one
-                        # pass — no chunked async queue. That queue (20
-                        # rows/chunk, one Flutter patch + yield per chunk)
-                        # was built to avoid one giant patch freezing the
-                        # UI, but for a catalog that's already fully loaded
-                        # in memory (no DB round trip per row — see
-                        # _build_table_row's local photo-cache path) the
-                        # ~55 extra network round trips it added COST more
-                        # total time than one direct build + one patch,
-                        # which is what actually made toggling grouping off
-                        # feel slow. A single synchronous build blocks the
-                        # UI thread briefly for an explicit, user-initiated
-                        # action instead — the same tradeoff superadmin's
-                        # always-immediate reveal already made.
-                        built_rows = []
-                        for d in page_devs:
-                            try:
-                                built_rows.append(
-                                    self._build_table_row(
-                                        d, gsm_sz_c, ek_sz_c, gsm_dg_c, ek_dg_c
-                                    )
-                                )
-                            except Exception as row_exc:
-                                logger.error(
-                                    "[GSM] flat-mode row build failed for %s: %s",
-                                    d.get("gsm_name"), row_exc,
-                                )
-                        body_col.controls = built_rows
-                        body_container.data = "filled"
+                        # Explicit spec: load in 50-item blocks, first 50
+                        # rendered before the next 50 starts, all on the
+                        # one table/page (no separate pager) — not one
+                        # giant single-shot build. Routed through the same
+                        # queue _fill_brand_body_async already uses for
+                        # brand-expand (CHUNK=50, see its definition) so
+                        # there's exactly one row-building path in the
+                        # whole file. Critically, nothing else may be
+                        # queued at the same time (background sync, chart
+                        # preload) — competing async work on the same
+                        # thread, not chunking itself, is what made this
+                        # feel like a freeze before.
+                        _to_fill.append((body_container, page_devs))
 
                     self._brand_body_by_name["__flat__"] = body_container
                     self._flat_last_page_devs = page_devs
@@ -6313,7 +6297,7 @@ class GsmParserView:
             body_container.update()
 
         gsm_sz_c, ek_sz_c, gsm_dg_c, ek_dg_c = color_maps
-        CHUNK = 20
+        CHUNK = 50  # explicit spec: load/render in blocks of 50
         first_chunk = True
         for i in range(0, len(devs), CHUNK):
             chunk_rows = []
