@@ -1416,8 +1416,14 @@ class GsmParserView:
                     # Return value (a throwaway ft.Control) is discarded —
                     # only the _CHART_RENDER_CACHE side effect matters here.
                     # Cache-hit devices (unchanged history, see the sig
-                    # check inside) return near-instantly.
-                    self._build_adaptive_charts(did, dev)
+                    # check inside) return near-instantly. Off the UI thread
+                    # (still one device at a time, never concurrent - see
+                    # the docstring) so the matplotlib render for a
+                    # not-yet-cached device can't stall hover/click
+                    # responsiveness on anything already on screen while
+                    # this whole pass is still working through the rest of
+                    # the page in the background.
+                    await asyncio.to_thread(self._build_adaptive_charts, did, dev)
                 except Exception:
                     logger.exception(
                         "[GSM] chart preload failed for device_id=%s", did
@@ -4055,13 +4061,27 @@ class GsmParserView:
             for r in rows:
                 rid = str(r.get("id") or "")
                 label = _row_label(r) or rid
+                is_matched = bool(r.get("matched"))
 
                 def _pick(_e2, _rid=rid, _label=label):
                     page.run_task(_do_merge, _rid, _label)
 
                 results_col.controls.append(
                     ft.TextButton(
-                        content=ft.Text(label, size=12),
+                        content=ft.Row(
+                            [
+                                ft.Text(label, size=12, expand=True),
+                                ft.Text(
+                                    "вже прив'язано — перепризначити",
+                                    size=9,
+                                    color=ft.Colors.ORANGE_700,
+                                    italic=True,
+                                )
+                                if is_matched
+                                else ft.Container(width=0),
+                            ],
+                            spacing=6,
+                        ),
                         on_click=_pick,
                         style=ft.ButtonStyle(
                             padding=ft.padding.symmetric(horizontal=8, vertical=6),

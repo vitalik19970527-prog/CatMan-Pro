@@ -79,49 +79,46 @@ async def open_product_quick_view(
         await _open_view(fresh or product)
 
     def _switch_to_edit():
-        _close_current_dlg()
-        # Opening the edit dialog in the same tick as closing the view
-        # dialog can outrun Flutter's close transition — the new dialog
-        # silently fails to render and the modal just disappears ("closes,
-        # doesn't switch to edit"). Poll for the view dialog to actually
-        # leave the page's dialog stack (Flutter reports the close async,
-        # a fixed sleep isn't a real guarantee) before opening the next one.
-        if hasattr(page, "run_task"):
+        # Closing the view dialog FIRST and then opening the edit dialog
+        # raced Flutter's async close transition — a fixed sleep, and even
+        # polling page._dialogs for the close to "land", both proved
+        # unreliable: the new dialog would still sometimes fail to render,
+        # and the modal just disappeared ("closes, doesn't switch to
+        # edit"). Flet's dialog stack (page._dialogs.controls) supports
+        # more than one entry, so instead: open the EDIT dialog first
+        # (deterministic, not racing anything) and only pop the OLD view
+        # dialog once that succeeded — worst case a one-frame flash of
+        # both, never a silent close with nothing behind it.
+        if not hasattr(page, "run_task"):
+            # No page/run_task available — nothing we can safely schedule
+            # the (now async) show_product_dialog coroutine onto.
+            return
 
-            async def _delayed_open():
-                dialogs_ctrl = getattr(page, "_dialogs", None)
-                for _ in range(20):  # up to ~1s
-                    still_open = getattr(dialogs_ctrl, "controls", None)
-                    if not still_open or not any(
-                        getattr(d, "open", False) for d in still_open
-                    ):
-                        break
-                    await asyncio.sleep(0.05)
-                else:
-                    await asyncio.sleep(0.2)
-                try:
-                    await pv.show_product_dialog(product, on_switch_to_view=_switch_to_view)
-                except Exception as e:
-                    # Previously swallowed via contextlib.suppress(Exception) -
-                    # any real bug in here looked identical to the close-race
-                    # ("modal just disappears, nothing happens"), impossible
-                    # to tell apart or diagnose. Surface it instead.
-                    logger.exception(
-                        "open_product_quick_view: switch to edit failed pid=%s", pid
+        async def _open_edit_then_close_view():
+            try:
+                await pv.show_product_dialog(product, on_switch_to_view=_switch_to_view)
+            except Exception as e:
+                # Previously swallowed via contextlib.suppress(Exception) -
+                # any real bug in here looked identical to the close-race
+                # ("modal just disappears, nothing happens"), impossible to
+                # tell apart or diagnose. Surface it instead, and leave the
+                # view dialog open since the edit one never showed.
+                logger.exception(
+                    "open_product_quick_view: switch to edit failed pid=%s", pid
+                )
+                with contextlib.suppress(Exception):
+                    page.snack_bar = ft.SnackBar(
+                        ft.Text(f"Не вдалося відкрити редагування: {e}", color="white"),
+                        bgcolor="#EF4444",
+                        duration=3500,
                     )
-                    with contextlib.suppress(Exception):
-                        page.snack_bar = ft.SnackBar(
-                            ft.Text(f"Не вдалося відкрити редагування: {e}", color="white"),
-                            bgcolor="#EF4444",
-                            duration=3500,
-                        )
-                        page.snack_bar.open = True
-                        page.update()
+                    page.snack_bar.open = True
+                    page.update()
+                return
+            _close_current_dlg()
 
-            with contextlib.suppress(Exception):
-                page.run_task(_delayed_open)
-        # else: no page/run_task available — nothing we can safely schedule
-        # the (now async) show_product_dialog coroutine onto.
+        with contextlib.suppress(Exception):
+            page.run_task(_open_edit_then_close_view)
 
     async def _open_view(prod: dict) -> None:
         await pv.show_product_details_dialog(

@@ -15015,10 +15015,12 @@ class DataManager:
         self, source: str, query: str, limit: int = 20
     ) -> list[dict]:
         """SuperAdmin manual-merge picker: devices from `source` ('GSM Arena'
-        or 'E-Katalog') that have no counterpart on the other side yet — the
-        candidates a superadmin can manually link together when auto-
-        matching missed a genuinely identical device (see
-        merge_gsm_ek_devices)."""
+        or 'E-Katalog') matching `query` by name, searched across every
+        brand — including ones that already have a counterpart on the
+        other side (flagged via "matched"), not just unmatched ones. A
+        superadmin needs to find an ALREADY-wrongly-matched record too, to
+        correct it (see merge_gsm_ek_devices, which allows re-pointing an
+        existing link)."""
         if not self._use_postgres():
             return []
         q = f"%{(query or '').strip()}%"
@@ -15027,16 +15029,16 @@ class DataManager:
                 if source == "GSM Arena":
                     cur.execute(
                         """
-                        SELECT g.id, g.brand, g.device_type, g.model_name, g.image_url
+                        SELECT g.id, g.brand, g.device_type, g.model_name, g.image_url,
+                               EXISTS (
+                                 SELECT 1 FROM public.gsm_parser_devices e
+                                 WHERE e.source='E-Katalog'
+                                   AND (e.specs->>'gsm_ref_device_id') = g.id
+                               ) AS matched
                         FROM public.gsm_parser_devices g
                         WHERE g.source='GSM Arena'
                           AND g.model_name ILIKE %s
-                          AND NOT EXISTS (
-                            SELECT 1 FROM public.gsm_parser_devices e
-                            WHERE e.source='E-Katalog'
-                              AND (e.specs->>'gsm_ref_device_id') = g.id
-                          )
-                        ORDER BY g.model_name
+                        ORDER BY matched, g.model_name
                         LIMIT %s
                         """,
                         (q, limit),
@@ -15044,12 +15046,13 @@ class DataManager:
                 else:
                     cur.execute(
                         """
-                        SELECT id, brand, device_type, model_name, image_url
+                        SELECT id, brand, device_type, model_name, image_url,
+                               (specs->>'gsm_ref_device_id' IS NOT NULL
+                                AND specs->>'gsm_ref_device_id' != '') AS matched
                         FROM public.gsm_parser_devices
                         WHERE source='E-Katalog'
                           AND model_name ILIKE %s
-                          AND (specs->>'gsm_ref_device_id' IS NULL OR specs->>'gsm_ref_device_id' = '')
-                        ORDER BY model_name
+                        ORDER BY matched, model_name
                         LIMIT %s
                         """,
                         (q, limit),
@@ -15058,14 +15061,22 @@ class DataManager:
         return []
 
     def merge_gsm_ek_devices(self, gsm_device_id: str, ek_device_id: str) -> tuple[bool, str]:
-        """SuperAdmin manual override: link a standalone GSM Arena row and a
-        standalone E-Katalog row that are actually the same real device but
+        """SuperAdmin manual override: link a GSM Arena row and an
+        E-Katalog row that are actually the same real device but
         auto-matching (see _ek_name_matches in gsm_parser_runner.py) missed
-        it. Uses the exact same specs["gsm_ref_device_id"]/
-        ["gsm_ref_model_key"] link every other GSM<->EK pairing relies on
-        (get_gsm_merged_results, the results table, comparisons - all of
-        it), so a manual merge behaves identically to an automatic one from
-        that point on."""
+        it or matched the wrong pair. Uses the exact same
+        specs["gsm_ref_device_id"]/["gsm_ref_model_key"] link every other
+        GSM<->EK pairing relies on (get_gsm_merged_results, the results
+        table, comparisons - all of it), so a manual merge behaves
+        identically to an automatic one from that point on.
+
+        Either side may already be linked to something else - this always
+        WINS and overwrites: the EK row's link is re-pointed to this GSM
+        device, and if that GSM device was previously linked from a
+        DIFFERENT EK row, that old EK row's link is cleared (reverted to
+        standalone) so a GSM device is never claimed by two EK rows at
+        once, which get_gsm_merged_results would otherwise show as two
+        near-duplicate result rows for the same device."""
         if not self._use_postgres():
             return False, "PostgreSQL вимкнено"
         gsm_device_id = str(gsm_device_id or "").strip()
@@ -15088,10 +15099,28 @@ class DataManager:
                 ek_row = cur.fetchone()
                 if not ek_row or str(ek_row.get("source") or "") != "E-Katalog":
                     return False, "Запис Єкаталог не знайдено"
+
+                # Any OTHER EK row currently claiming this GSM device loses
+                # that claim — a GSM device can only be linked from one EK
+                # row at a time (see docstring).
+                cur.execute(
+                    """
+                    SELECT id, specs FROM public.gsm_parser_devices
+                    WHERE source='E-Katalog' AND (specs->>'gsm_ref_device_id') = %s
+                      AND id != %s
+                    """,
+                    (gsm_device_id, ek_device_id),
+                )
+                for other in cur.fetchall() or []:
+                    other_specs = dict(other.get("specs") or {})
+                    other_specs.pop("gsm_ref_device_id", None)
+                    other_specs.pop("gsm_ref_model_key", None)
+                    cur.execute(
+                        "UPDATE public.gsm_parser_devices SET specs=%s::jsonb, updated_at=%s WHERE id=%s",
+                        (json.dumps(other_specs, ensure_ascii=False), datetime.now(), other.get("id")),
+                    )
+
                 specs = ek_row.get("specs") if isinstance(ek_row.get("specs"), dict) else {}
-                existing_ref = str(specs.get("gsm_ref_device_id") or "").strip()
-                if existing_ref and existing_ref != gsm_device_id:
-                    return False, "Цей запис Єкаталог вже прив'язаний до іншого пристрою GSM Arena"
                 specs = dict(specs)
                 specs["gsm_ref_device_id"] = gsm_device_id
                 specs["gsm_ref_model_key"] = str(gsm_row.get("model_key") or "")
