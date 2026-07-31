@@ -1378,14 +1378,14 @@ class GsmParserView:
             self._hide_loading_overlay()
 
     async def _reveal_sync(self, page):
-        """Run when the user clicks "Показати результати" — always checks
-        for changes, unlike _background_load which only syncs when
-        _needs_reload() trips (daily boundary / a finished parse run).
-        Manual variant edits and the Xiaomi region GitHub sync don't touch
-        gsm_parser_trigger.last_parse_at, so without this an already-open
-        session could keep showing stale variants/comments all day even
-        though the DB was updated. Cheap: _sync_cache_from_db(False) only
-        pulls rows changed since the last sync, not a full re-pull."""
+        """Runs automatically every time the GSM Parser tab opens (see
+        _reveal_and_sync). Data updates once a day, from a scheduled
+        parse — so a DB round trip on every single tab visit is pure
+        overhead the rest of the day; only sync when _needs_reload() says
+        the daily boundary was actually missed (or a parse just finished),
+        same gating _background_load already uses. Otherwise this just
+        builds the table from whatever's already cached in memory/disk —
+        no DB call at all."""
         try:
             devices, _, loading = _get_cache()
             if loading:
@@ -1404,7 +1404,8 @@ class GsmParserView:
             if devices is None:
                 await self._background_load(page)
                 return
-            await asyncio.to_thread(self._sync_cache_from_db, False)
+            if not _parser_is_running() and self._needs_reload():
+                await asyncio.to_thread(self._sync_cache_from_db, False)
             self._refresh_table(fill_all_brands=True)
         except Exception as exc:
             logger.error("[GSM] _reveal_sync FAILED: %s", exc, exc_info=True)
@@ -7169,30 +7170,19 @@ class GsmParserView:
             loading,
         )
 
-        # Background load/sync always kicks off immediately for everyone,
-        # regardless of role — the cache must stay current even if the table
-        # isn't shown yet.
-        #
-        # Explicit product requirement: load everything up front behind a
-        # loading indicator, THEN reveal the table — once it's on screen
-        # every interaction (scroll, expand, sort) must be instant, "as on
-        # websites". Applies uniformly to every role now (previously
-        # superadmin skipped this and regular users didn't, which read as
-        # an unfair speed gap) and starts automatically the moment the tab
-        # opens — no button click required. Chart rendering is NOT part of
-        # this preload (see _reveal_and_sync below): pre-rendering matplotlib
-        # for the whole catalog before ever showing the table would itself
-        # take far longer than the load it's meant to hide.
-        _running = _parser_is_running()
+        # Explicit product requirement: ALL loading (disk cache, DB sync if
+        # the daily boundary needs it, building every row) happens ONE
+        # place — behind the loading indicator, during _reveal_and_sync
+        # (auto-started below, see reveal_panel) — not as a separate
+        # background task running alongside it. This used to ALSO fire
+        # self._background_load directly from here, which meant two
+        # separate scheduled tasks (this one, and _reveal_and_sync's own
+        # call into the exact same _background_load for the devices-is-
+        # None case) could race and compete for the same thread — that
+        # redundant second task, not "background loading" as a concept,
+        # is what made the tab feel like it was fighting itself. Deleted;
+        # _reveal_and_sync/_reveal_sync now fully own this responsibility.
         _should_reveal = True
-
-        if devices is None and not loading and page_ctrl:
-            page_ctrl.run_task(self._background_load, page_ctrl)
-        elif not _running and self._needs_reload() and not loading and page_ctrl:
-            logger.info(
-                "[GSM] _build_results_content: background refresh (stale cache)"
-            )
-            page_ctrl.run_task(self._background_load, page_ctrl)
 
         filtered = self._get_filtered_devices()
         page_devs = self._page_items(filtered)
