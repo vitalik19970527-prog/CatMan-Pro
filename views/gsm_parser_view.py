@@ -2204,6 +2204,49 @@ class GsmParserView:
         )
 
         _last_hover_day = {"value": data["last_date_str"]}
+        # Sweeping the cursor across the chart crosses many hotspot
+        # boundaries in a fraction of a second — each one is a genuinely
+        # DIFFERENT day, so the same-day dedup guard below doesn't skip any
+        # of them, and each one costs 4 individual Text.update() calls.
+        # That's cheap per call but adds up across a fast sweep into
+        # exactly the symptom reported live: a multi-second stall while the
+        # backlog of queued hover events works through, then the panel
+        # visibly races through several intermediate dates at once as it
+        # catches up. _pending holds whatever the CURSOR'S CURRENT position
+        # is; only one _apply_pending() is ever in flight at a time
+        # (coalescing every event that arrives while it's pending into a
+        # single real update instead of one per event), and it always
+        # applies the latest known position, not a stale queued one.
+        _pending = {"day_str": None, "lo": None, "hi": None, "sv": None, "scheduled": False}
+
+        def _apply_pending():
+            day_str = _pending["day_str"]
+            if day_str is None:
+                return
+            hover_date.value = day_str
+            hover_min.value = _fmt_price(_pending["lo"])
+            hover_max.value = _fmt_price(_pending["hi"])
+            _sv = _pending["sv"]
+            hover_shops.value = str(int(_sv)) if _sv is not None else "—"
+            # panel.update() diffs panel's WHOLE subtree (Container >
+            # Column > Text/Divider/Row[Container,Column[Text,Text]] x3)
+            # on every call — measured multiple seconds each via py-spy
+            # live process dumps, deep in Flet's own object_patch
+            # comparison, not our code. Updating just the 4 Text leaves
+            # that actually changed is a far smaller diff each (no
+            # children of their own) and is all that's visually needed.
+            for _t in (hover_date, hover_min, hover_max, hover_shops):
+                with contextlib.suppress(Exception):
+                    _t.update()
+
+        async def _apply_pending_soon():
+            # ~1-2 frames — long enough to coalesce a whole burst of
+            # same-tick hover events crossing several hotspots, short
+            # enough that a cursor that's actually still (or moving slowly)
+            # never reads as delayed.
+            await asyncio.sleep(0.03)
+            _pending["scheduled"] = False
+            _apply_pending()
 
         def _update_all(day_str, lo, hi, sv):
             # Shared by hotspots on BOTH charts — hovering either the price
@@ -2213,35 +2256,30 @@ class GsmParserView:
             def _h(e):
                 if not e.data:
                     return
-                # (Flet's page-wide auto-update-after-every-event is now
-                # disabled once, globally, in main.py — a per-handler
-                # ft.context.disable_auto_update() call here did NOT
-                # reliably stick, confirmed via a live py-spy dump still
-                # showing __auto_update() run right after this handler.)
                 # Flet's on_hover keeps firing while the mouse sits inside the
                 # SAME hotspot (not just once on entry) — without this guard
-                # every one of those repeats re-ran panel.update()'s full
-                # control-tree diff (measured multiple seconds each on a
-                # loaded page via py-spy), even though the panel's own values
-                # hadn't changed at all. Skip the update entirely when we're
-                # still on the date we already showed.
+                # every one of those repeats re-ran the update below, even
+                # though the panel's own values hadn't changed at all. Skip
+                # entirely when we're still on the date we already showed.
                 if _last_hover_day["value"] == day_str:
                     return
                 _last_hover_day["value"] = day_str
-                hover_date.value = day_str
-                hover_min.value = _fmt_price(lo)
-                hover_max.value = _fmt_price(hi)
-                hover_shops.value = str(int(sv)) if sv is not None else "—"
-                # panel.update() diffs panel's WHOLE subtree (Container >
-                # Column > Text/Divider/Row[Container,Column[Text,Text]] x3)
-                # on every call — measured multiple seconds each via py-spy
-                # live process dumps, deep in Flet's own object_patch
-                # comparison, not our code. Updating just the 4 Text leaves
-                # that actually changed is a far smaller diff each (no
-                # children of their own) and is all that's visually needed.
-                for _t in (hover_date, hover_min, hover_max, hover_shops):
+                _pending["day_str"] = day_str
+                _pending["lo"] = lo
+                _pending["hi"] = hi
+                _pending["sv"] = sv
+                if _pending["scheduled"]:
+                    return
+                _pending["scheduled"] = True
+                pg = self._get_page_safe()
+                if pg is not None:
                     with contextlib.suppress(Exception):
-                        _t.update()
+                        pg.run_task(_apply_pending_soon)
+                        return
+                # No page reference available — fall back to applying
+                # immediately rather than dropping the update entirely.
+                _pending["scheduled"] = False
+                _apply_pending()
 
             return _h
 
