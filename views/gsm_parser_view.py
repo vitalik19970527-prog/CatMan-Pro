@@ -10074,6 +10074,20 @@ class GsmParserView:
     #  Entry points                                                        #
     # ------------------------------------------------------------------ #
     def build(self):
+        # This view relies entirely on its own internal header/body scroll
+        # split (table_header stays outside the inner scroll Column — see
+        # _build_results_content) instead of the dashboard-level
+        # _view_sticky_header slot other views use — it only holds if
+        # content_area itself never scrolls, otherwise it "swallows" the
+        # inner split and drags the header away with everything else.
+        # dashboard.py's _get_or_create_cached_wrapper/_activate_cached_view
+        # already special-case "gsm_parser" for this, but this view is also
+        # reachable through a SEPARATE, independently-maintained toggle in
+        # views/extensions_view.py's Розширення panel (SuperAdmin/Admin) -
+        # rather than trust every current and future caller to keep both
+        # in sync, enforce it here unconditionally on every entry.
+        with contextlib.suppress(Exception):
+            self.content_area.scroll = None
         _th = _th_from_view(self)
         global _SOFT, _ALT, _OK_DK, _OK_BG, _TEXT, _ACCENT, _MUTED, _BORDER, _PANEL
         _SOFT = _th["soft"]
@@ -10272,6 +10286,16 @@ class GsmParserView:
         parser finished a run elsewhere since our last sync); _needs_reload()
         is the same once-a-day gate used on cold start, so returning to this
         tab many times in one day costs nothing beyond the toggle."""
+        # Re-assert on every resume too, not just build() — see build()'s
+        # comment for why this can't just trust the caller. Push it right
+        # away (not just set the Python-side property) since the function
+        # can return early below without any other update() call happening
+        # afterward.
+        with contextlib.suppress(Exception):
+            if self.content_area.scroll is not None:
+                self.content_area.scroll = None
+                if self.content_area.page:
+                    self.content_area.update()
         if not self._gsm_ui_ready:
             return
         if _parser_is_running() or self._cache_busy():
