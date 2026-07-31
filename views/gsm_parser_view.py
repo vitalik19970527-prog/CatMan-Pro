@@ -7173,21 +7173,18 @@ class GsmParserView:
         # regardless of role — the cache must stay current even if the table
         # isn't shown yet.
         #
-        # This used to force regular users (not superadmin) through a
-        # "pick a filter, click Показати результати, wait for EVERY brand
-        # + EVERY chart to fully preload" gate before showing the table at
-        # all — on a 1000+ device catalog that wait could run up to the
-        # full 2-minute cap. Meanwhile self._refresh_table() a few lines
-        # below (unconditionally, for every role) already builds the same
-        # collapsed-by-default, lazily-filled table that superadmin was
-        # seeing immediately — the gate was never actually needed to make
-        # that table correct, only to additionally pre-warm everything
-        # up front. With pagination (see _page_items/PAGE_SIZE below)
-        # keeping each render to 50 devices regardless of role, that
-        # up-front cost is no longer worth the wait. Show the table
-        # immediately for everyone, same as superadmin always did.
+        # Explicit product requirement: load everything up front behind a
+        # loading indicator, THEN reveal the table — once it's on screen
+        # every interaction (scroll, expand, sort) must be instant, "as on
+        # websites". Applies uniformly to every role now (previously
+        # superadmin skipped this and regular users didn't, which read as
+        # an unfair speed gap) and starts automatically the moment the tab
+        # opens — no button click required. Chart rendering is NOT part of
+        # this preload (see _reveal_and_sync below): pre-rendering matplotlib
+        # for the whole catalog before ever showing the table would itself
+        # take far longer than the load it's meant to hide.
         _running = _parser_is_running()
-        _should_reveal = False
+        _should_reveal = True
 
         if devices is None and not loading and page_ctrl:
             page_ctrl.run_task(self._background_load, page_ctrl)
@@ -8869,13 +8866,15 @@ class GsmParserView:
                     if not self._brand_fill_running and not self._brand_fill_queue:
                         break
                     await asyncio.sleep(0.2)
-                # Only now, with every brand's rows fully built (never
-                # concurrently with the queue above — see its own
-                # docstring), pre-render every visible device's chart too.
-                # This is the step that makes opening ANY card's chart tab
-                # afterwards instant instead of triggering a background
-                # matplotlib render on click.
-                await self._preload_charts_for_current_page()
+                # Deliberately NOT pre-rendering every device's chart here
+                # too — matplotlib per device is real work, and doing it
+                # for the WHOLE catalog (1000+) before ever showing the
+                # table would make the loading screen itself take far
+                # longer than what it's meant to hide. Charts stay
+                # click-to-render (already off the UI thread and with
+                # matplotlib's import pre-warmed at module load, so a cold
+                # first render no longer freezes anything — see
+                # _build_lazy_tab).
             except Exception as exc:
                 logger.error("[GSM] _reveal_and_sync FAILED: %s", exc, exc_info=True)
             finally:
@@ -8902,6 +8901,17 @@ class GsmParserView:
             # before the loading state is swapped out for the real table.
             if page_ctrl:
                 page_ctrl.run_task(_reveal_and_sync, page_ctrl)
+
+        # Starts loading immediately, no click required — "Оберіть
+        # фільтри та натисніть" only ever showed for the instant before
+        # this fires, so it wasn't doing anything except adding a step.
+        # Loading behind a spinner, then landing on an already-fully-
+        # built, instantly-interactive table, is the actual goal here —
+        # same as opening any regular website.
+        _reveal_choose_col.visible = False
+        _reveal_loading_col.visible = True
+        if page_ctrl:
+            page_ctrl.run_task(_reveal_and_sync, page_ctrl)
 
         reveal_panel = ft.Container(
             visible=_should_reveal,
