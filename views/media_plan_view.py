@@ -4448,9 +4448,12 @@ class MediaPlanView:
         if not manager_id:
             return
         try:
+            _from_memory = isinstance(self._workspace_state, dict) and bool(
+                self._workspace_state
+            )
             payload = (
                 self._workspace_state
-                if isinstance(self._workspace_state, dict) and self._workspace_state
+                if _from_memory
                 else (self.db.get_manager_workspace_state(manager_id) or {})
             )
             store = (
@@ -4458,10 +4461,15 @@ class MediaPlanView:
                 if isinstance(payload, dict)
                 else {}
             )
-            row = (
-                store.get(self._table_layout_state_key())
-                if isinstance(store, dict)
-                else None
+            _key = self._table_layout_state_key()
+            row = store.get(_key) if isinstance(store, dict) else None
+            # Diagnostic for the "months count keeps reverting" report — not
+            # yet reproduced live, so this stays until it fires once with
+            # the actual key/value mismatch visible.
+            _log.info(
+                "[media-plan-months] LOAD key=%s from_memory=%s row=%s store_keys=%s",
+                _key, _from_memory, row,
+                list(store.keys()) if isinstance(store, dict) else None,
             )
             if not isinstance(row, dict):
                 return
@@ -4475,7 +4483,7 @@ class MediaPlanView:
             if isinstance(raw_keys, list):
                 self._opened_archive_month_keys = [str(k) for k in raw_keys if k]
         except Exception:
-            pass
+            _log.exception("[media-plan-months] LOAD failed")
 
     def _save_month_view_settings(self) -> None:
         manager_id = self._workspace_user_id()
@@ -4492,11 +4500,16 @@ class MediaPlanView:
                 if isinstance(payload.get("media_plan_month_view"), dict)
                 else {}
             )
-            store[self._table_layout_state_key()] = {
+            _key = self._table_layout_state_key()
+            store[_key] = {
                 "visible_months_count": self._visible_months_count,
                 "pin_last_archive_month": self._pin_last_archive_month,
                 "opened_archive_month_keys": list(self._opened_archive_month_keys),
             }
+            _log.info(
+                "[media-plan-months] SAVE key=%s visible_months_count=%s",
+                _key, self._visible_months_count,
+            )
             payload["media_plan_month_view"] = store
             self._workspace_state = payload
             self._queue_workspace_state_save()

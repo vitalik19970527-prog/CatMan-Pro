@@ -91,11 +91,37 @@ async def open_product_quick_view(
 
         async def _do_switch_to_edit():
             try:
-                await pv.show_product_dialog(
-                    product,
-                    on_switch_to_view=_switch_to_view,
-                    existing_dlg=dlg_ref[0],
+                # show_product_dialog does several sequential DB round trips
+                # (access check, hydrate, acquire_edit_lock) before it ever
+                # touches the dialog — a hung/slow one of those previously
+                # looked EXACTLY like the close/reopen race ("nothing
+                # happens", no error, just an unresponsive click) with no
+                # way to tell them apart. A bounded wait turns a stuck call
+                # into a visible, actionable message instead of an
+                # indefinite silent hang.
+                await asyncio.wait_for(
+                    pv.show_product_dialog(
+                        product,
+                        on_switch_to_view=_switch_to_view,
+                        existing_dlg=dlg_ref[0],
+                    ),
+                    timeout=30,
                 )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "open_product_quick_view: switch to edit timed out pid=%s", pid
+                )
+                with contextlib.suppress(Exception):
+                    page.snack_bar = ft.SnackBar(
+                        ft.Text(
+                            "Редагування не відповідає (можливо, проблема з мережею/БД). Спробуйте ще раз.",
+                            color="white",
+                        ),
+                        bgcolor="#EF4444",
+                        duration=4000,
+                    )
+                    page.snack_bar.open = True
+                    page.update()
             except Exception as e:
                 # Previously swallowed via contextlib.suppress(Exception) -
                 # any real bug in here looked identical to a close/reopen
