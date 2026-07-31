@@ -40,6 +40,24 @@ if not logger.handlers:
     logger.setLevel(logging.ERROR)
     logger.propagate = False
 
+
+def _warm_up_matplotlib() -> None:
+    """matplotlib's FIRST import (see _build_adaptive_charts) can itself
+    take a full second or more — cheap on any later call, but on whatever
+    thread pays it first. Kicking this off once, here, at module import
+    time (this view module is imported well before a user could possibly
+    click a chart) means that cost is already paid by the time anyone
+    opens a chart, on either a background thread or the main one."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot  # noqa: F401
+    except Exception:
+        pass
+
+
+threading.Thread(target=_warm_up_matplotlib, daemon=True).start()
+
 # ---------------------------------------------------------------------------
 # Theme colour shims
 # ---------------------------------------------------------------------------
@@ -1655,12 +1673,25 @@ class GsmParserView:
         result = sorted(result, key=lambda d: (d.get("brand") or "").lower())
         return result
 
+    _PAGE_SIZE = 50
+
     def _page_items(self, filtered: list[dict]) -> list[dict]:
-        # Single page, always — the whole filtered list is shown on one
-        # scrollable page. Speed comes from brand-collapse-by-default +
-        # chunked async row fill (_fill_brand_body_async), not from splitting
-        # the catalog across pages (confusing to browse/search across).
-        return filtered
+        # Real pagination, 50 devices/page — on a 1000+ device catalog,
+        # showing "everything on one page" meant every render (including
+        # every sort click and the initial full-catalog reveal/preload)
+        # had to build/preload the ENTIRE filtered set regardless of
+        # brand-collapse or chunking. Slicing to a page up front bounds
+        # that cost to 50 devices no matter what filters/grouping/sort are
+        # active — that's what actually makes "прибрати групування" and
+        # first-time reveal fast, not the chunking alone.
+        self._last_filtered_count = len(filtered)
+        total_pages = max(1, (len(filtered) + self._PAGE_SIZE - 1) // self._PAGE_SIZE)
+        if self._page_idx >= total_pages:
+            self._page_idx = total_pages - 1
+        if self._page_idx < 0:
+            self._page_idx = 0
+        start = self._page_idx * self._PAGE_SIZE
+        return filtered[start : start + self._PAGE_SIZE]
 
     # ------------------------------------------------------------------ #
     #  Helper: show snack                                                  #
@@ -5031,34 +5062,20 @@ class GsmParserView:
             threading.Thread(target=_work, daemon=True).start()
 
         def _build_lazy_tab(key):
-            if key == "chart":
-                # Only safe to run synchronously (no background thread) when
-                # this device's detail (hist730 etc.) is ALREADY warm in
-                # _DETAIL_CACHE from the bulk sync — then it's pure in-memory
-                # lookups + a ~70-100ms matplotlib render, short enough to
-                # just block briefly instead of paying thread-handoff/GIL-
-                # contention overhead. If it's cold (never bulk-synced, or a
-                # device added since), _get_or_fetch_device_detail would do
-                # its OWN blocking DB round trip right here on the main
-                # thread instead — exactly the freeze this was meant to
-                # avoid — so fall back to the background-thread path below,
-                # same as the compat/comment/photo sections already do.
-                if _get_device_detail(device_id) is not None:
-                    try:
-                        content = ft.Column(
-                            [self._build_adaptive_charts(device_id, _compat_dev)],
-                            scroll=ft.ScrollMode.AUTO,
-                        )
-                        tab_map[key] = content
-                        if tab_state["active"] == key:
-                            body_container.content = content
-                            with contextlib.suppress(Exception):
-                                body_container.update()
-                    except Exception as exc:
-                        logger.error("[GSM] lazy tab %s failed: %s", key, exc)
-                    return
-                # else: cold cache — fall through to the threaded path below.
-
+            # Always dispatched to a background thread below, even when
+            # this device's detail is already warm in _DETAIL_CACHE. This
+            # used to special-case the warm-cache path to run
+            # _build_adaptive_charts synchronously right here on the
+            # click handler — reasoned as "just a ~70-100ms matplotlib
+            # render, short enough to block briefly" — but that estimate
+            # only holds once matplotlib has already been imported once
+            # in this process. Its FIRST import (see the `import
+            # matplotlib` inside _build_adaptive_charts) can itself take
+            # a full second or more, and that import runs on whichever
+            # thread calls it — synchronously on the main thread, that is
+            # a multi-second freeze of the entire app (nothing clickable,
+            # not even closing the modal), which is exactly what got
+            # reported. Never worth the saved thread-handoff overhead.
             body_container.content = _loading_tab()
             with contextlib.suppress(Exception):
                 body_container.update()
@@ -7076,8 +7093,45 @@ class GsmParserView:
                 break
 
     def _build_pager_controls(self) -> list:
-        # Everything is shown on one page (see _page_items) — no pager UI.
-        return []
+        total = getattr(self, "_last_filtered_count", 0)
+        if total <= self._PAGE_SIZE:
+            return []
+        total_pages = max(1, (total + self._PAGE_SIZE - 1) // self._PAGE_SIZE)
+        cur = max(0, min(self._page_idx, total_pages - 1))
+
+        def _go(delta: int):
+            def _handler(_e):
+                new_idx = max(0, min(total_pages - 1, self._page_idx + delta))
+                if new_idx != self._page_idx:
+                    self._page_idx = new_idx
+                    self._refresh_table(rebuild_filters=False)
+            return _handler
+
+        return [
+            ft.IconButton(
+                icon=ft.Icons.CHEVRON_LEFT,
+                icon_size=18,
+                disabled=cur <= 0,
+                on_click=_go(-1),
+                tooltip=self.t("gsm.pager.prev", "Попередня сторінка"),
+                style=ft.ButtonStyle(padding=ft.padding.all(4)),
+            ),
+            ft.Text(
+                self.t("gsm.pager.label", "Стор. {cur}/{total}").format(
+                    cur=cur + 1, total=total_pages
+                ),
+                size=11,
+                color=_MUTED,
+            ),
+            ft.IconButton(
+                icon=ft.Icons.CHEVRON_RIGHT,
+                icon_size=18,
+                disabled=cur >= total_pages - 1,
+                on_click=_go(1),
+                tooltip=self.t("gsm.pager.next", "Наступна сторінка"),
+                style=ft.ButtonStyle(padding=ft.padding.all(4)),
+            ),
+        ]
 
     def _sort_click(self, col: str):
         if self._sort_col != col:
@@ -7148,12 +7202,23 @@ class GsmParserView:
 
         # Background load/sync always kicks off immediately for everyone,
         # regardless of role — the cache must stay current even if the table
-        # isn't shown yet. Only the VISUAL reveal differs: superadmin sees
-        # results immediately; a regular user starts on an empty "pick a
-        # filter" panel and only renders the table once they interact —
-        # the cache underneath is already fully synced by then either way.
+        # isn't shown yet.
+        #
+        # This used to force regular users (not superadmin) through a
+        # "pick a filter, click Показати результати, wait for EVERY brand
+        # + EVERY chart to fully preload" gate before showing the table at
+        # all — on a 1000+ device catalog that wait could run up to the
+        # full 2-minute cap. Meanwhile self._refresh_table() a few lines
+        # below (unconditionally, for every role) already builds the same
+        # collapsed-by-default, lazily-filled table that superadmin was
+        # seeing immediately — the gate was never actually needed to make
+        # that table correct, only to additionally pre-warm everything
+        # up front. With pagination (see _page_items/PAGE_SIZE below)
+        # keeping each render to 50 devices regardless of role, that
+        # up-front cost is no longer worth the wait. Show the table
+        # immediately for everyone, same as superadmin always did.
         _running = _parser_is_running()
-        _should_reveal = not self.is_superadmin
+        _should_reveal = False
 
         if devices is None and not loading and page_ctrl:
             page_ctrl.run_task(self._background_load, page_ctrl)

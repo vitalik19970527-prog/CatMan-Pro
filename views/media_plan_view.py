@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta
 import flet as ft
 
 import i18n
+from logger import logger as _catlog
 from views import product_naming
 from views.async_view_build_helper import \
     create_orders_header_loading_indicator
@@ -18,6 +19,11 @@ from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
 from views.number_format import row_text_matches
 
 _log = logging.getLogger("media_plan")
+# _log (above) is NOT wired to logs/catman.log (no handler, no propagation
+# from logger.py's setup) — diagnostic logging aimed at the "months count
+# keeps reverting" report used _log exclusively and every one of those
+# calls was going nowhere visible, silently. _catlog is the shared logger
+# from logger.py that actually reaches the file.
 
 _ROW_A = "#FFFFFF"
 _ROW_B = "#F8FAFC"
@@ -4531,12 +4537,14 @@ class MediaPlanView:
             )
             _key = self._table_layout_state_key()
             row = store.get(_key) if isinstance(store, dict) else None
-            # Diagnostic for the "months count keeps reverting" report — not
-            # yet reproduced live, so this stays until it fires once with
-            # the actual key/value mismatch visible.
-            _log.info(
-                "[media-plan-months] LOAD key=%s from_memory=%s row=%s store_keys=%s",
-                _key, _from_memory, row,
+            # Diagnostic for the "months count keeps reverting" report.
+            # Previous attempt used _log (logging.getLogger("media_plan"))
+            # which has no handler and isn't wired into logs/catman.log —
+            # those calls never produced any visible evidence. _catlog is
+            # the shared, file-backed logger from logger.py.
+            _catlog.info(
+                "[media-plan-months] LOAD manager_id=%s key=%s from_memory=%s row=%s store_keys=%s",
+                manager_id, _key, _from_memory, row,
                 list(store.keys()) if isinstance(store, dict) else None,
             )
             if not isinstance(row, dict):
@@ -4551,7 +4559,7 @@ class MediaPlanView:
             if isinstance(raw_keys, list):
                 self._opened_archive_month_keys = [str(k) for k in raw_keys if k]
         except Exception:
-            _log.exception("[media-plan-months] LOAD failed")
+            _catlog.exception("[media-plan-months] LOAD failed")
 
     def _save_month_view_settings(self) -> None:
         manager_id = self._workspace_user_id()
@@ -4574,9 +4582,9 @@ class MediaPlanView:
                 "pin_last_archive_month": self._pin_last_archive_month,
                 "opened_archive_month_keys": list(self._opened_archive_month_keys),
             }
-            _log.info(
-                "[media-plan-months] SAVE key=%s visible_months_count=%s",
-                _key, self._visible_months_count,
+            _catlog.info(
+                "[media-plan-months] SAVE manager_id=%s key=%s visible_months_count=%s",
+                manager_id, _key, self._visible_months_count,
             )
             payload["media_plan_month_view"] = store
             self._workspace_state = payload

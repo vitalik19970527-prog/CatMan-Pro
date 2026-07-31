@@ -1877,11 +1877,20 @@ class ProductsView:
         page = self.content_area.page
         if not page:
             return
+        # Was missing .open=True and page.update() — the SnackBar object
+        # was built and assigned but never actually triggered client-side,
+        # making every call site a silent no-op. Any early-return path
+        # that reported its reason via this helper (category-access
+        # check, edit-lock-busy, etc.) looked exactly like "nothing
+        # happens" with zero visible feedback and zero error.
         page.snack_bar = ft.SnackBar(
             ft.Text(text, color=ft.Colors.WHITE, weight="bold"),
             bgcolor=color,
             duration=3000,
         )
+        page.snack_bar.open = True
+        with contextlib.suppress(Exception):
+            page.update()
 
     def _show_help(self) -> None:
         from views.help_utils import show_modal_help
@@ -4536,6 +4545,11 @@ class ProductsView:
         except Exception:
             _has_access = True
         if not _has_access:
+            logger.info(
+                "[edit-switch] BLOCKED: no category access pid=%s manager=%s company=%s region=%s",
+                (product or {}).get("id"), self.manager_id, self.company_id,
+                self._effective_region_id(),
+            )
             self._show_snack(
                 self.t(
                     "products.no_category_access",
@@ -4578,6 +4592,10 @@ class ProductsView:
                 ttl_seconds=180,
             )
             if not bool(lock_res.get("ok")):
+                logger.info(
+                    "[edit-switch] BLOCKED: edit lock busy pid=%s manager=%s lock_res=%s",
+                    product.get("id"), self.manager_id, lock_res,
+                )
                 self._show_snack(
                     lock_res.get("message") or self.t("products.locked_by_other", "Запис редагується іншим користувачем"),
                     "orange",

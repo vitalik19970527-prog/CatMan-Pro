@@ -55,9 +55,40 @@ async def open_product_quick_view(
 
     from views.products_view import ProductsView
 
-    pv = ProductsView(content_area, user_data, db, current_region_name="")
+    # current_region_name="" used to be hardcoded here — _effective_region_id()
+    # only resolves a region when a name is given AND the company has more
+    # than one region, so for any multi-region company this silently
+    # produced region_id=None below, which manager_has_category_access_in_region
+    # treats as "no access" unconditionally. Pull the SAME current-region
+    # value the main Товари tab uses (dashboard.py's ProductsView call) via
+    # the page's cached dashboard reference.
+    _region_name = ""
+    _dash = getattr(page, "_dashboard", None)
+    if _dash is not None:
+        with contextlib.suppress(Exception):
+            _region_name = _dash._current_region_for_query() or ""
 
-    can_edit = not bool((user_data or {}).get("subordinate_view_readonly", False))
+    pv = ProductsView(content_area, user_data, db, current_region_name=_region_name)
+
+    # Editing requires owning at least one category node in the current
+    # region (see manager_has_category_access_in_region) — a manager with
+    # view-only region access (e.g. a керівник looking at a subordinate's
+    # region) previously still saw a clickable "Редагування" tab that
+    # simply rejected the switch once clicked. Checking this up front and
+    # folding it into can_edit means those users never see a tab that
+    # doesn't work for them — only "Перегляд" is offered.
+    try:
+        _has_cat_access = await asyncio.to_thread(
+            db.manager_has_category_access_in_region,
+            _mid, company_id, pv._effective_region_id(),
+        )
+    except Exception:
+        _has_cat_access = True
+
+    can_edit = (
+        not bool((user_data or {}).get("subordinate_view_readonly", False))
+        and _has_cat_access
+    )
 
     # ONE AlertDialog object lives for the whole modal's lifetime — both
     # switch directions patch its title/content/actions in place
