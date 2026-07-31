@@ -59,50 +59,48 @@ async def open_product_quick_view(
 
     can_edit = not bool((user_data or {}).get("subordinate_view_readonly", False))
 
+    # ONE AlertDialog object lives for the whole modal's lifetime — both
+    # switch directions patch its title/content/actions in place
+    # (existing_dlg=...) instead of ever closing it and opening a second
+    # one. Closing-then-reopening raced Flet's async dialog-close
+    # transition no matter how carefully it was timed (fixed sleeps,
+    # polling page._dialogs for the close to "land" — both proved
+    # unreliable) and could silently leave nothing open at all. There is
+    # now exactly one open/close for this whole modal: the very first
+    # open below, and whatever the user does to dismiss it (Закрити/Esc/
+    # Скасувати/Зберегти) at the end.
     dlg_ref: list = [None]
 
-    def _close_current_dlg():
-        dlg = dlg_ref[0]
-        if dlg is not None:
-            try:
-                page.pop_dialog()
-            except Exception:
-                pass
-            dlg_ref[0] = None
-
-    async def _switch_to_view():
+    async def _switch_to_view(_existing_dlg=None):
+        # products_view.py's _switch_back_to_view calls this with the
+        # shared dialog object as its one argument — same object as
+        # dlg_ref[0] either way (it's never replaced), so both work; the
+        # parameter just keeps the call signature honest either way.
         # Re-fetch so any edits made just before switching back are reflected.
         try:
             fresh = await asyncio.to_thread(db.get_product_by_id, company_id, pid)
         except Exception:
             fresh = None
-        await _open_view(fresh or product)
+        await _open_view(fresh or product, existing_dlg=_existing_dlg or dlg_ref[0])
 
     def _switch_to_edit():
-        # Closing the view dialog FIRST and then opening the edit dialog
-        # raced Flutter's async close transition — a fixed sleep, and even
-        # polling page._dialogs for the close to "land", both proved
-        # unreliable: the new dialog would still sometimes fail to render,
-        # and the modal just disappeared ("closes, doesn't switch to
-        # edit"). Flet's dialog stack (page._dialogs.controls) supports
-        # more than one entry, so instead: open the EDIT dialog first
-        # (deterministic, not racing anything) and only pop the OLD view
-        # dialog once that succeeded — worst case a one-frame flash of
-        # both, never a silent close with nothing behind it.
         if not hasattr(page, "run_task"):
             # No page/run_task available — nothing we can safely schedule
             # the (now async) show_product_dialog coroutine onto.
             return
 
-        async def _open_edit_then_close_view():
+        async def _do_switch_to_edit():
             try:
-                await pv.show_product_dialog(product, on_switch_to_view=_switch_to_view)
+                await pv.show_product_dialog(
+                    product,
+                    on_switch_to_view=_switch_to_view,
+                    existing_dlg=dlg_ref[0],
+                )
             except Exception as e:
                 # Previously swallowed via contextlib.suppress(Exception) -
-                # any real bug in here looked identical to the close-race
-                # ("modal just disappears, nothing happens"), impossible to
-                # tell apart or diagnose. Surface it instead, and leave the
-                # view dialog open since the edit one never showed.
+                # any real bug in here looked identical to a close/reopen
+                # race ("modal just disappears, nothing happens"),
+                # impossible to tell apart or diagnose. Surface it instead.
                 logger.exception(
                     "open_product_quick_view: switch to edit failed pid=%s", pid
                 )
@@ -114,17 +112,16 @@ async def open_product_quick_view(
                     )
                     page.snack_bar.open = True
                     page.update()
-                return
-            _close_current_dlg()
 
         with contextlib.suppress(Exception):
-            page.run_task(_open_edit_then_close_view)
+            page.run_task(_do_switch_to_edit)
 
-    async def _open_view(prod: dict) -> None:
+    async def _open_view(prod: dict, existing_dlg=None) -> None:
         await pv.show_product_details_dialog(
             prod,
             on_switch_to_edit=_switch_to_edit if can_edit else None,
             _dlg_ref=dlg_ref,
+            existing_dlg=existing_dlg,
         )
 
     await _open_view(product)

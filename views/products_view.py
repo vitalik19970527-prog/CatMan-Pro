@@ -3974,20 +3974,38 @@ class ProductsView:
             len(getattr(page, "overlay", []) or []),
         )
 
-    async def show_product_details_dialog(self, product, on_switch_to_edit=None, _dlg_ref=None):
+    async def show_product_details_dialog(
+        self, product, on_switch_to_edit=None, _dlg_ref=None, existing_dlg=None
+    ):
         """Builds the (DB-heavy) product card dialog off the UI thread, then
         shows it. On Android, a handful of sequential blocking DB round
         trips done inline on the single Flet event loop (companies/regions/
         node-path/delivery-methods lookups) is what made this and every
         other modal take up to a minute to open — the network itself was
         fine, the event loop was just starved. Desktop's low-latency LAN
-        masked this completely."""
-        dlg = await asyncio.to_thread(
-            self._build_product_details_dialog, product, on_switch_to_edit, _dlg_ref
-        )
-        self.content_area.page.show_dialog(dlg)
+        masked this completely.
 
-    def _build_product_details_dialog(self, product, on_switch_to_edit=None, _dlg_ref=None) -> ft.AlertDialog:
+        existing_dlg: reuse this already-open AlertDialog in place (patch
+        title/content/actions, then .update()) instead of opening a new
+        one — see show_product_dialog's matching parameter for why."""
+        dlg = await asyncio.to_thread(
+            self._build_product_details_dialog,
+            product, on_switch_to_edit, _dlg_ref, existing_dlg,
+        )
+        if existing_dlg is not None:
+            with contextlib.suppress(Exception):
+                dlg.update()
+        else:
+            self.content_area.page.show_dialog(dlg)
+
+    def _build_product_details_dialog(
+        self, product, on_switch_to_edit=None, _dlg_ref=None, existing_dlg=None
+    ) -> ft.AlertDialog:
+        # Declared up front (not at construction time below) so the
+        # "Закрити" button's closure — and _dlg_ref — always target the
+        # SAME object whether it's freshly created or an already-open
+        # dialog being reused for a Редагування->Перегляд switch.
+        dlg = existing_dlg if existing_dlg is not None else ft.AlertDialog()
         product = product if isinstance(product, dict) else {}
         display_name = product.get(
             "_display_name"
@@ -4339,26 +4357,26 @@ class ProductsView:
             else None
         )
 
-        dlg = ft.AlertDialog(
-            title=(
-                ft.Row(
-                    [
-                        ft.Text(
-                            f"Картка товару: {display_name}",
-                            selectable=True,
-                            expand=True,
-                            overflow=ft.TextOverflow.ELLIPSIS,
-                            max_lines=1,
-                        ),
-                        _mode_toggle,
-                    ],
-                    spacing=8,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                )
-                if _mode_toggle
-                else ft.Text(f"Перегляд товару: {display_name}", selectable=True)
-            ),
-            content=ft.Container(
+        dlg.title = (
+            ft.Row(
+                [
+                    ft.Text(
+                        f"Картка товару: {display_name}",
+                        selectable=True,
+                        expand=True,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                        max_lines=1,
+                    ),
+                    _mode_toggle,
+                ],
+                spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            )
+            if _mode_toggle
+            else ft.Text(f"Перегляд товару: {display_name}", selectable=True)
+        )
+        dlg.content = (
+            ft.Container(
                 width=_dialog_w,
                 height=_dlg_h,
                 padding=0,
@@ -4441,9 +4459,9 @@ class ProductsView:
                     spacing=_panel_spacing,
                     vertical_alignment=ft.CrossAxisAlignment.START,
                 ),
-            ),
-            actions=[ft.TextButton(self.t("packaging.dlg.close", "Закрити"), on_click=lambda _: self._close_dlg(dlg))],
+            )
         )
+        dlg.actions = [ft.TextButton(self.t("packaging.dlg.close", "Закрити"), on_click=lambda _: self._close_dlg(dlg))]
         if isinstance(_dlg_ref, list):
             _dlg_ref[0] = dlg
         return dlg
@@ -4466,16 +4484,31 @@ class ProductsView:
         else:
             self._show_snack("Функція недоступна", "orange")
 
-    async def show_product_dialog(self, product=None, on_switch_to_view=None):
+    async def show_product_dialog(
+        self, product=None, on_switch_to_view=None, existing_dlg=None
+    ):
         """Async so the lock-acquisition/hydration/companies-list DB round
         trips below (and the dropdown-cascade population further down, see
         _on_company_change et al.) run off the UI thread — on Android these
         used to run inline on Flet's single event loop, which is what made
-        opening this dialog take up to a minute."""
+        opening this dialog take up to a minute.
+
+        existing_dlg: when the quick-view modal is switching from
+        Перегляд to Редагування, the ALREADY-OPEN AlertDialog object is
+        passed in here and reused in place (its title/content/actions
+        mutated, then .update()) instead of opening a second dialog and
+        closing the first — that close+reopen choreography raced Flet's
+        dialog transition no matter how carefully it was timed and could
+        silently leave nothing open at all. `dlg` below always refers to
+        this SAME object throughout the function (declared once, up
+        front) specifically so every closure that references `dlg` -
+        including ones defined long before the dialog's actual
+        title/content/actions are — targets the right one either way."""
         if self.read_only_subordinate:
             self._show_snack(self.t("packaging.subordinate_readonly", "У вкладці підлеглого доступний лише перегляд"), "orange")
             return
 
+        dlg = existing_dlg if existing_dlg is not None else ft.AlertDialog()
         is_edit = isinstance(product, dict) and bool((product or {}).get("id"))
         try:
             _has_access = await asyncio.to_thread(
@@ -5761,20 +5794,22 @@ class ProductsView:
 
         def _switch_back_to_view(_):
             _release_lock_once()
-            self._close_dlg(dlg)
-            # Opening the view dialog in the same tick as closing this edit
-            # dialog can outrun Flutter's close transition — the new dialog
-            # silently fails to render and the modal just disappears.
+            # Reuse the SAME already-open dialog object for the view
+            # content instead of closing this one and opening a new one -
+            # that close-then-reopen choreography raced Flet's dialog
+            # close transition no matter how it was timed and could
+            # silently leave nothing open at all. on_switch_to_view (see
+            # product_quick_view.py's _switch_to_view) takes `dlg` and
+            # passes it straight through as existing_dlg.
             _pg2 = self._page()
             if _pg2 and hasattr(_pg2, "run_task"):
 
-                async def _delayed_switch_back():
-                    await asyncio.sleep(0.2)
+                async def _do_switch_back():
                     with contextlib.suppress(Exception):
-                        await on_switch_to_view()
+                        await on_switch_to_view(dlg)
 
                 with contextlib.suppress(Exception):
-                    _pg2.run_task(_delayed_switch_back)
+                    _pg2.run_task(_do_switch_back)
             # else: no page reference available — nothing we can safely
             # schedule the (async) on_switch_to_view callback onto.
 
@@ -5913,26 +5948,30 @@ class ProductsView:
                 self.t("products.edit_help.step7", "7. Натисніть «Зберегти»."),
             ])
 
-        dlg = ft.AlertDialog(
-            title=ft.Row(
-                [
-                    ft.Text(self.t("products.dlg.edit_title", "Товар"), expand=True),
-                    *([_mode_toggle_edit] if _mode_toggle_edit else []),
-                    ft.IconButton(icon=ft.Icons.HELP_OUTLINE, icon_size=16, tooltip=self.t("common.help.tooltip", "Довідка"), on_click=_prod_help),
-                ],
-                vertical_alignment=ft.CrossAxisAlignment.CENTER, tight=True,
-            ),
-            on_dismiss=_on_dismiss,
-            content=ft.Container(
-                width=760,
-                content=ft.Column([dialog_loading, dialog_form], spacing=0),
-            ),
-            actions=[
-                ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=_cancel),
-                save_btn,
+        dlg.title = ft.Row(
+            [
+                ft.Text(self.t("products.dlg.edit_title", "Товар"), expand=True),
+                *([_mode_toggle_edit] if _mode_toggle_edit else []),
+                ft.IconButton(icon=ft.Icons.HELP_OUTLINE, icon_size=16, tooltip=self.t("common.help.tooltip", "Довідка"), on_click=_prod_help),
             ],
+            vertical_alignment=ft.CrossAxisAlignment.CENTER, tight=True,
         )
-        self.content_area.page.show_dialog(dlg)
+        dlg.on_dismiss = _on_dismiss
+        dlg.content = ft.Container(
+            width=760,
+            content=ft.Column([dialog_loading, dialog_form], spacing=0),
+        )
+        dlg.actions = [
+            ft.TextButton(self.t("common.cancel", "Скасувати"), on_click=_cancel),
+            save_btn,
+        ]
+        if existing_dlg is not None:
+            # Same dialog object, already open — just patch what changed,
+            # no close/open transition (and no second dialog) at all.
+            with contextlib.suppress(Exception):
+                dlg.update()
+        else:
+            self.content_area.page.show_dialog(dlg)
 
         def _estimate_form_height() -> int:
             """Rough px estimate of the currently-visible fields, so the
