@@ -84,12 +84,25 @@ async def open_product_quick_view(
         await _open_view(fresh or product, existing_dlg=_existing_dlg or dlg_ref[0])
 
     def _switch_to_edit():
+        # Diagnostic trail for the repeated "nothing happens" report -
+        # this confirms/rules out each link in the chain: did the click
+        # even reach here, is `page` usable, did the task actually get
+        # scheduled AND started. Two rounds of fixes based on guesses
+        # (close/reopen race, then a DB-hang timeout) didn't resolve it,
+        # so this stays until a log line pinpoints exactly which step
+        # never happens.
+        logger.info(
+            "[edit-switch] click received pid=%s has_run_task=%s",
+            pid, hasattr(page, "run_task"),
+        )
         if not hasattr(page, "run_task"):
             # No page/run_task available — nothing we can safely schedule
             # the (now async) show_product_dialog coroutine onto.
+            logger.error("[edit-switch] page has no run_task — aborting pid=%s", pid)
             return
 
         async def _do_switch_to_edit():
+            logger.info("[edit-switch] task started pid=%s", pid)
             try:
                 # show_product_dialog does several sequential DB round trips
                 # (access check, hydrate, acquire_edit_lock) before it ever
@@ -139,8 +152,16 @@ async def open_product_quick_view(
                     page.snack_bar.open = True
                     page.update()
 
-        with contextlib.suppress(Exception):
+        try:
             page.run_task(_do_switch_to_edit)
+        except Exception:
+            # This was a bare contextlib.suppress before — if page.run_task
+            # ITSELF raises synchronously (not from inside the coroutine),
+            # the click would look exactly like "nothing happens" with
+            # nothing in the log at all. Now it's at least visible.
+            logger.exception(
+                "[edit-switch] page.run_task(_do_switch_to_edit) raised pid=%s", pid
+            )
 
     async def _open_view(prod: dict, existing_dlg=None) -> None:
         await pv.show_product_details_dialog(

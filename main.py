@@ -1076,6 +1076,21 @@ def main(page: ft.Page):
                 ],
                 close_fds=True,
             )
+            # os._exit(0) alone used to leave the old window visibly open:
+            # Flet's desktop shell (flet.exe) is a genuine CHILD process
+            # (plain subprocess.Popen in flet_desktop, no detach flags) of
+            # THIS process, but os._exit() deliberately skips all Python
+            # cleanup/atexit handling — whatever normally tells that child
+            # to close along with a graceful exit never runs. taskkill /T
+            # against our own PID walks the real, currently-accurate
+            # parent/child relationship and takes the whole tree down
+            # (including flet.exe) before we self-exit as a fast fallback.
+            with suppress(Exception):
+                subprocess.Popen(
+                    ["taskkill", "/PID", str(os.getpid()), "/F", "/T"],
+                    close_fds=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
             # Important: free locks immediately so setup can replace files and relaunch cleanly.
             os._exit(0)
 

@@ -1156,6 +1156,12 @@ class OrderScheduleView:
             width=200,
             hint_text="1–24",
             keyboard_type=ft.KeyboardType.NUMBER,
+            # No on_change previously — Flet doesn't push keystroke updates
+            # back to this control's server-side .value without a
+            # registered handler, so "Зберегти" (which reads months_f.value
+            # directly) kept seeing the ORIGINAL value no matter what was
+            # typed, always falling through to look unchanged/reverted.
+            on_change=lambda e: None,
         )
         current_order_value = ",".join(
             self._ordered_schedule_right_columns(show_archive=True)
@@ -1822,6 +1828,12 @@ class OrderScheduleView:
             width=200,
             hint_text="1–24",
             keyboard_type=ft.KeyboardType.NUMBER,
+            # No on_change previously — Flet doesn't push keystroke updates
+            # back to this control's server-side .value without a
+            # registered handler, so "Зберегти" (which reads months_f.value
+            # directly) kept seeing the ORIGINAL value no matter what was
+            # typed, always falling through to look unchanged/reverted.
+            on_change=lambda e: None,
         )
         current_order_value = ",".join(
             self._ordered_schedule_right_columns(show_archive=True)

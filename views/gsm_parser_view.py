@@ -5299,6 +5299,21 @@ class GsmParserView:
         ticks) must keep the old lazy-only-visible behavior — building
         every brand's rows on every keystroke would reintroduce the exact
         freeze this laziness was added to avoid."""
+        # Every call below clears and rebuilds self._table_body_ref from
+        # scratch, orphaning whatever containers a PREVIOUS call's fill
+        # queued rows into — but the queue itself was never cleared, so
+        # those now-invisible fills kept running anyway. Harmless (if
+        # wasteful) in brand-grouped mode where _to_fill is usually just
+        # the couple of already-expanded brands, but in flat mode (see
+        # _flat_mode) _to_fill is the ENTIRE catalog every single time —
+        # a few fast clicks (e.g. re-sorting) queued that many full-catalog
+        # rebuilds back to back, which is what read as "everything
+        # disappears and hangs" (a real, if bounded, multi-refresh
+        # backlog, not an infinite one). Drop anything still queued but
+        # not yet started — it's for containers this call is about to
+        # orphan anyway. A fill already mid-chunk finishes normally; only
+        # ones that hadn't started yet are discarded.
+        self._brand_fill_queue.clear()
         try:
             devices, _, loading = _get_cache()
             logger.info(

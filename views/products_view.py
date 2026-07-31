@@ -4504,6 +4504,10 @@ class ProductsView:
         front) specifically so every closure that references `dlg` -
         including ones defined long before the dialog's actual
         title/content/actions are — targets the right one either way."""
+        logger.info(
+            "[edit-switch] show_product_dialog entered pid=%s read_only_subordinate=%s",
+            (product or {}).get("id"), self.read_only_subordinate,
+        )
         if self.read_only_subordinate:
             self._show_snack(self.t("packaging.subordinate_readonly", "У вкладці підлеглого доступний лише перегляд"), "orange")
             return
