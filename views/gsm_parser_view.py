@@ -7424,6 +7424,14 @@ class GsmParserView:
         return []
 
     def _sort_click(self, col: str, direction: bool | None = None):
+        if self._flat_mode:
+            # Disabled in flat mode — see _hdr_cell's docstring. The
+            # header buttons already don't offer this, but the "Розмір"
+            # dimension popup still uses this same entry point directly.
+            self._show_snack(
+                "Сортування недоступне в режимі без групування", ft.Colors.ORANGE
+            )
+            return
         if direction is not None:
             # Explicit А-Я/Я-А button — jump straight to the requested
             # direction in one click. Per explicit feedback: the old
@@ -9306,6 +9314,27 @@ class GsmParserView:
             )
 
         def _hdr_cell(key, width, label, sortable, txt_color):
+            # Sorting a genuinely single-page 1000+ device list costs a
+            # real, unavoidable server-side diff (Flet has to compute the
+            # patch for the whole list regardless of what changed —
+            # verified live via py-spy, not something client-side
+            # virtualization or reusing Control objects can fix) — with
+            # real pagination explicitly rejected, sort is disabled in
+            # flat mode specifically rather than shipping something that
+            # visibly hangs on every click.
+            if sortable and self._flat_mode:
+                return ft.Container(
+                    width=width,
+                    alignment=ft.Alignment(0, 0),
+                    tooltip="Сортування недоступне в режимі без групування (завелика кількість рядків на 1 сторінці)",
+                    content=ft.Text(
+                        label,
+                        size=10,
+                        weight=ft.FontWeight.W_700,
+                        color=_MUTED,
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                )
             if sortable:
                 _extra = (
                     [_dim_popup(key.split("_")[0], txt_color)]
