@@ -7423,14 +7423,22 @@ class GsmParserView:
         # Everything is shown on one page (see _page_items) — no pager UI.
         return []
 
-    def _sort_click(self, col: str):
-        if self._sort_col != col:
+    def _sort_click(self, col: str, direction: bool | None = None):
+        if direction is not None:
+            # Explicit А-Я/Я-А button — jump straight to the requested
+            # direction in one click. Per explicit feedback: the old
+            # single toggle button meant getting the direction you
+            # actually wanted could cost two clicks and two waits (each a
+            # real rebuild on a 1000+ device catalog) instead of one.
+            self._sort_col = col
+            self._sort_asc = direction
+        elif self._sort_col != col:
             self._sort_col = col
             self._sort_asc = True
         elif self._sort_asc:
             self._sort_asc = False
         else:
-            # 3rd click — reset to default
+            # 3rd click of the old toggle behavior — reset to default.
             self._sort_col = "brand"
             self._sort_asc = True
         self._page_idx = 0
@@ -9257,15 +9265,6 @@ class GsmParserView:
         _GSM_W = sum(w for _, w, _, _ in _GSM_COLS) + (len(_GSM_COLS) - 1) * 9
         _EK_W = sum(w for _, w, _, _ in _EK_COLS) + (len(_EK_COLS) - 1) * 9
 
-        def _sort_icon(key):
-            if self._sort_col != key:
-                return ft.Icons.UNFOLD_MORE
-            return (
-                ft.Icons.KEYBOARD_ARROW_UP
-                if self._sort_asc
-                else ft.Icons.KEYBOARD_ARROW_DOWN
-            )
-
         # "Розмір" expands into per-axis sort choices (Довжина/Ширина/
         # Товщина) via a small popup instead of three permanent columns —
         # inserting real extra columns would mean every row-render call
@@ -9313,33 +9312,45 @@ class GsmParserView:
                     if key in ("gsm_size", "ek_size")
                     else []
                 )
+                _active = self._sort_col == key
+                # Two direct-direction buttons instead of one toggle — per
+                # explicit feedback, picking "the direction you actually
+                # want" used to cost up to 2 real rebuilds/waits (click,
+                # see wrong direction, click again) on a 1000+ device
+                # catalog. One click now always lands on the requested
+                # direction directly via _sort_click(key, direction=...).
                 return ft.Container(
                     width=width,
                     alignment=ft.Alignment(0, 0),
                     content=ft.Row(
                         [
-                            ft.TextButton(
-                                content=ft.Row(
-                                    [
-                                        ft.Text(
-                                            label,
-                                            size=10,
-                                            weight=ft.FontWeight.W_700,
-                                            color=txt_color,
-                                        ),
-                                        ft.Icon(
-                                            _sort_icon(key),
-                                            size=12,
-                                            color=_MUTED,
-                                        ),
-                                    ],
-                                    spacing=2,
-                                    tight=True,
+                            ft.Text(
+                                label,
+                                size=10,
+                                weight=ft.FontWeight.W_700,
+                                color=txt_color,
+                            ),
+                            ft.IconButton(
+                                icon=ft.Icons.ARROW_UPWARD,
+                                icon_size=11,
+                                icon_color=(
+                                    _OK_DK if (_active and self._sort_asc) else _MUTED
                                 ),
-                                style=ft.ButtonStyle(
-                                    padding=ft.padding.symmetric(horizontal=2, vertical=2)
+                                tooltip="А-Я / 0-9",
+                                style=ft.ButtonStyle(padding=ft.padding.all(0)),
+                                width=18, height=18,
+                                on_click=lambda _, c=key: self._sort_click(c, True),
+                            ),
+                            ft.IconButton(
+                                icon=ft.Icons.ARROW_DOWNWARD,
+                                icon_size=11,
+                                icon_color=(
+                                    _OK_DK if (_active and not self._sort_asc) else _MUTED
                                 ),
-                                on_click=lambda _, c=key: self._sort_click(c),
+                                tooltip="Я-А / 9-0",
+                                style=ft.ButtonStyle(padding=ft.padding.all(0)),
+                                width=18, height=18,
+                                on_click=lambda _, c=key: self._sort_click(c, False),
                             ),
                         ]
                         + _extra,
