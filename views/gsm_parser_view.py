@@ -9351,41 +9351,49 @@ class GsmParserView:
                 return ft.Container(
                     width=width,
                     alignment=ft.Alignment(0, 0),
-                    content=ft.Row(
+                    content=ft.Column(
                         [
                             ft.Text(
                                 label,
                                 size=10,
                                 weight=ft.FontWeight.W_700,
                                 color=txt_color,
+                                text_align=ft.TextAlign.CENTER,
                             ),
-                            ft.IconButton(
-                                icon=ft.Icons.ARROW_UPWARD,
-                                icon_size=11,
-                                icon_color=(
-                                    _OK_DK if (_active and self._sort_asc) else _MUTED
-                                ),
-                                tooltip="А-Я / 0-9",
-                                style=ft.ButtonStyle(padding=ft.padding.all(0)),
-                                width=18, height=18,
-                                on_click=lambda _, c=key: self._sort_click(c, True),
+                            ft.Row(
+                                [
+                                    ft.IconButton(
+                                        icon=ft.Icons.ARROW_UPWARD,
+                                        icon_size=11,
+                                        icon_color=(
+                                            _OK_DK if (_active and self._sort_asc) else _MUTED
+                                        ),
+                                        tooltip="А-Я / 0-9",
+                                        style=ft.ButtonStyle(padding=ft.padding.all(0)),
+                                        width=18, height=18,
+                                        on_click=lambda _, c=key: self._sort_click(c, True),
+                                    ),
+                                    ft.IconButton(
+                                        icon=ft.Icons.ARROW_DOWNWARD,
+                                        icon_size=11,
+                                        icon_color=(
+                                            _OK_DK if (_active and not self._sort_asc) else _MUTED
+                                        ),
+                                        tooltip="Я-А / 9-0",
+                                        style=ft.ButtonStyle(padding=ft.padding.all(0)),
+                                        width=18, height=18,
+                                        on_click=lambda _, c=key: self._sort_click(c, False),
+                                    ),
+                                ]
+                                + _extra,
+                                spacing=0,
+                                tight=True,
+                                alignment=ft.MainAxisAlignment.CENTER,
                             ),
-                            ft.IconButton(
-                                icon=ft.Icons.ARROW_DOWNWARD,
-                                icon_size=11,
-                                icon_color=(
-                                    _OK_DK if (_active and not self._sort_asc) else _MUTED
-                                ),
-                                tooltip="Я-А / 9-0",
-                                style=ft.ButtonStyle(padding=ft.padding.all(0)),
-                                width=18, height=18,
-                                on_click=lambda _, c=key: self._sort_click(c, False),
-                            ),
-                        ]
-                        + _extra,
+                        ],
                         spacing=0,
                         tight=True,
-                        alignment=ft.MainAxisAlignment.CENTER,
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                 )
             return ft.Container(
