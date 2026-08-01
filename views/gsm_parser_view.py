@@ -7480,7 +7480,15 @@ class GsmParserView:
         )
         self._stats_ref = stats_text
 
-        _initially_loading = loading or devices is None
+        # NOT "or devices is None" anymore — that was accurate while
+        # opening the tab auto-triggered a background load (devices is
+        # None on cold start = genuinely loading), but now nothing loads
+        # until "Показати результати" is clicked, so devices is None just
+        # means "haven't clicked yet", not "loading". Showing this bar for
+        # that case was a misleading leftover from the auto-start version
+        # — `loading` alone (someone else's sync, e.g. another open
+        # session, actively in flight) is the only real signal now.
+        _initially_loading = bool(loading)
         loading_bar = ft.ProgressBar(
             visible=_initially_loading,
             color=_OK_DK,
@@ -9620,12 +9628,20 @@ class GsmParserView:
     def _build_filter_panel(self) -> ft.Control:
         devices, _, loading = _get_cache()
         if devices is None:
+            # devices is None now just means "Показати результати" hasn't
+            # been clicked yet (nothing auto-loads anymore) — filter
+            # OPTIONS (brand/type/year lists) genuinely can't be computed
+            # without the data, but a spinner + "завантажується" here
+            # would be misleading (nothing is actively happening).
             return ft.Container(
                 padding=ft.padding.symmetric(horizontal=16, vertical=12),
                 content=ft.Row(
                     [
-                        ft.ProgressRing(width=14, height=14, stroke_width=2, color=_OK_DK),
-                        ft.Text("Дані завантажуються, зачекайте…", size=12, color=_MUTED),
+                        ft.Icon(ft.Icons.INFO_OUTLINE, size=16, color=_MUTED),
+                        ft.Text(
+                            "Спочатку натисніть «Показати результати»",
+                            size=12, color=_MUTED,
+                        ),
                     ],
                     spacing=10,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
