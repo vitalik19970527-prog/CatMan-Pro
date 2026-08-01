@@ -1029,6 +1029,14 @@ class GsmParserView:
         self._reveal_rows_total: int = 0
         self._reveal_charts_done: int = 0
         self._reveal_charts_total: int = 0
+        # Device ids whose chart+photo are already warmed (either by the
+        # initial full preload, or by a later catch-up — see
+        # _catch_up_new_devices). Lets a filter change that reveals
+        # devices outside what was originally preloaded (e.g. a user who
+        # only ever filters to one device type) top up just the delta
+        # instead of assuming everything is already ready.
+        self._warm_device_ids: set[str] = set()
+        self._catch_up_running: bool = False
         self._brand_devs_by_name: dict[str, list[dict]] = {}
         self._brand_body_by_name: dict[str, ft.Container] = {}
         self._color_maps: tuple = ({}, {}, {}, {})
@@ -1498,6 +1506,10 @@ class GsmParserView:
             # covered, so no row's first paint ever falls back to fetching
             # from GSM Arena/E-Katalog directly.
             await self._warm_photo_cache_from_db()
+            with contextlib.suppress(Exception):
+                self._warm_device_ids = {
+                    str(d.get("id") or "") for d in self._get_filtered_devices()
+                }
             self._hide_loading_overlay()
             _catlog.info(
                 "[GSM] _reveal_sync completed: rows=%s/%s charts=%s/%s",
@@ -1508,20 +1520,22 @@ class GsmParserView:
             logger.error("[GSM] _reveal_sync FAILED: %s", exc, exc_info=True)
             _catlog.exception("[GSM] _reveal_sync FAILED — table may reveal only partially loaded")
 
-    async def _warm_photo_cache_from_db(self) -> None:
+    async def _warm_photo_cache_from_db(self, devices: list[dict] | None = None) -> None:
         """Bulk-warms the local disk photo cache (_photo_cache_path) from
         the DB (gsm_parser_device_photos, already 100% populated for every
         device the table can ever render — verified directly against the
-        live DB) for the whole filtered catalog. changed_ids-based
-        warming (see _sync_cache_from_db) only covers whatever a diff sync
-        just touched, so a device that was never "changed" during this
+        live DB) for the given device set (default: the whole current
+        filtered catalog). changed_ids-based warming (see
+        _sync_cache_from_db) only covers whatever a diff sync just
+        touched, so a device that was never "changed" during this
         process's lifetime could otherwise have no local file yet and hit
         _build_table_row's image_url fallback — a live fetch straight from
         GSM Arena/E-Katalog, which must never happen (photos only ever
         come from this app's own DB)."""
         try:
-            filtered = self._get_filtered_devices()
-            page_devs = self._page_items(filtered)
+            page_devs = devices if devices is not None else self._page_items(
+                self._get_filtered_devices()
+            )
         except Exception:
             logger.exception("[GSM] _warm_photo_cache_from_db: failed to compute device list")
             return
@@ -1547,20 +1561,22 @@ class GsmParserView:
                 logger.exception("[GSM] photo cache warm failed for a chunk")
             await asyncio.sleep(0)
 
-    async def _preload_charts_for_current_page(self) -> None:
-        """Pre-renders every currently-visible device's chart into
-        _CHART_RENDER_CACHE so opening ANY device's chart tab afterwards
-        hits the cache (see _build_lazy_tab) instead of running matplotlib
-        on click. Called by _reveal_and_sync strictly AFTER the brand-row
-        -fill queue has fully drained — never concurrently with it, same
-        reasoning as _queue_brand_fill: two things building
-        Flet/matplotlib work on this thread at once is what freezes the
-        app at scale. Sequential, chunked, yielding between chunks so the
-        event loop can still service other UI events during this pass."""
+    async def _preload_charts_for_current_page(self, devices: list[dict] | None = None) -> None:
+        """Pre-renders every device's chart in the given set (default: the
+        whole current filtered catalog) into _CHART_RENDER_CACHE so
+        opening ANY device's chart tab afterwards hits the cache (see
+        _build_lazy_tab) instead of running matplotlib on click. Called by
+        _reveal_and_sync strictly AFTER the brand-row-fill queue has fully
+        drained — never concurrently with it, same reasoning as
+        _queue_brand_fill: two things building Flet/matplotlib work on
+        this thread at once is what freezes the app at scale. Sequential,
+        chunked, yielding between chunks so the event loop can still
+        service other UI events during this pass."""
         CHUNK = 50  # explicit spec: load/render in blocks of 50
         try:
-            filtered = self._get_filtered_devices()
-            page_devs = self._page_items(filtered)
+            page_devs = devices if devices is not None else self._page_items(
+                self._get_filtered_devices()
+            )
         except Exception:
             logger.exception(
                 "[GSM] _preload_charts_for_current_page: failed to compute device list"
@@ -5680,8 +5696,67 @@ class GsmParserView:
                         _to_fill,
                         (gsm_sz_c, ek_sz_c, gsm_dg_c, ek_dg_c),
                     )
+
+            # Catch-up: a filter change (or search) can bring devices into
+            # view that the initial preload never touched — e.g. a user
+            # who only ever filters to one device type never needed the
+            # other ~300 devices preloaded in the first place. Top up just
+            # the delta (chart render + local photo cache) in the
+            # background, with its own visible status, instead of either
+            # assuming everything is already warm or re-running the full
+            # preload. Skipped when deferred (the reveal/manual-sync flows
+            # already do their own full warm) and while one is already
+            # running (avoid piling up redundant catch-ups on rapid
+            # filter clicks).
+            if (
+                not defer_fill_to_caller
+                and page_ctrl
+                and not self._catch_up_running
+            ):
+                _new_devs = [
+                    d for d in filtered
+                    if str(d.get("id") or "") not in self._warm_device_ids
+                ]
+                if _new_devs:
+                    page_ctrl.run_task(self._catch_up_new_devices, _new_devs)
         except Exception as exc:
             logger.error("[GSM] _refresh_table FAILED: %s", exc, exc_info=True)
+
+    async def _catch_up_new_devices(self, new_devs: list[dict]) -> None:
+        """Warms chart+photo cache for devices a filter/search change just
+        revealed that the initial (or previous) preload never covered —
+        see _refresh_table's catch-up hook."""
+        if self._catch_up_running or not new_devs:
+            return
+        self._catch_up_running = True
+        try:
+            self._reveal_charts_done = 0
+            self._reveal_charts_total = 0
+            self._update_loading_status(
+                self.t("gsm.catching_up", "Довантаження… {n} нових пристроїв").format(
+                    n=len(new_devs)
+                )
+            )
+            if self._loading_bar_ref is not None:
+                self._loading_bar_ref.visible = True
+                with contextlib.suppress(Exception):
+                    self._loading_bar_ref.update()
+            if self._loading_status_ref is not None:
+                self._loading_status_ref.visible = True
+                with contextlib.suppress(Exception):
+                    self._loading_status_ref.update()
+            await self._preload_charts_for_current_page(new_devs)
+            await self._warm_photo_cache_from_db(new_devs)
+            self._warm_device_ids.update(
+                str(d.get("id") or "") for d in new_devs
+            )
+            _catlog.info("[GSM] _catch_up_new_devices completed: %s devices", len(new_devs))
+        except Exception:
+            logger.exception("[GSM] _catch_up_new_devices FAILED")
+            _catlog.exception("[GSM] _catch_up_new_devices FAILED")
+        finally:
+            self._catch_up_running = False
+            self._hide_loading_overlay()
 
     def _empty_row(self) -> ft.Control:
         return ft.Container(
