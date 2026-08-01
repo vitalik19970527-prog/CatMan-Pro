@@ -9178,16 +9178,12 @@ class GsmParserView:
             if page_ctrl:
                 page_ctrl.run_task(_reveal_and_sync, page_ctrl)
 
-        # Starts loading immediately, no click required — "Оберіть
-        # фільтри та натисніть" only ever showed for the instant before
-        # this fires, so it wasn't doing anything except adding a step.
-        # Loading behind a spinner, then landing on an already-fully-
-        # built, instantly-interactive table, is the actual goal here —
-        # same as opening any regular website.
-        _reveal_choose_col.visible = False
-        _reveal_loading_col.visible = True
-        if page_ctrl:
-            page_ctrl.run_task(_reveal_and_sync, page_ctrl)
+        # Explicit product decision (reverted after trying auto-start):
+        # loading must NOT begin until the user clicks "Показати
+        # результати" — same behavior for every role, no is_superadmin
+        # split. _reveal_choose_col (the picker) stays as the initial
+        # visible state; _reveal_click is the only thing that starts
+        # _reveal_and_sync.
 
         reveal_panel = ft.Container(
             visible=_should_reveal,
