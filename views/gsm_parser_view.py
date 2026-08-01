@@ -1149,11 +1149,13 @@ class GsmParserView:
                 self._reveal_status_ref.update()
 
     def _update_reveal_progress_text(self) -> None:
-        """Real progress counter for the full-preload loading screen —
-        explicit product requirement over a plain spinner. Cheap enough to
-        call after every 50-item batch (row or chart)."""
-        if self._reveal_status_ref is None:
-            return
+        """Real progress counter — explicit product requirement over a
+        plain spinner. Cheap enough to call after every 50-item batch (row
+        or chart). Updates both the reveal panel's status text (initial
+        full-preload, table hidden) AND the top loading_status text (used
+        during a manual "Синхронізувати" — table stays visible, this bar
+        is the only visible sign a resync/rebuild is still in progress),
+        since either one could be the visible one depending on context."""
         parts = []
         if self._reveal_rows_total:
             parts.append(f"Рядки: {min(self._reveal_rows_done, self._reveal_rows_total)}/{self._reveal_rows_total}")
@@ -1161,9 +1163,15 @@ class GsmParserView:
             parts.append(f"Діаграми: {min(self._reveal_charts_done, self._reveal_charts_total)}/{self._reveal_charts_total}")
         if not parts:
             return
-        self._reveal_status_ref.value = "Завантаження… " + ", ".join(parts)
-        with contextlib.suppress(Exception):
-            self._reveal_status_ref.update()
+        text = "Завантаження… " + ", ".join(parts)
+        if self._reveal_status_ref is not None:
+            self._reveal_status_ref.value = text
+            with contextlib.suppress(Exception):
+                self._reveal_status_ref.update()
+        if self._loading_status_ref is not None:
+            self._loading_status_ref.value = text
+            with contextlib.suppress(Exception):
+                self._loading_status_ref.update()
 
     def _cache_busy(self) -> bool:
         """True while a cache sync is in progress. Interactions that depend on
@@ -7403,6 +7411,18 @@ class GsmParserView:
         self._loading_status_ref = loading_status
 
         async def _force_reload_async(_=None):
+            # Table stays visible the whole time (point update, not a full
+            # reveal-panel hide/show) — but the loading bar/status must
+            # stay up until the table is ACTUALLY fully rebuilt, not just
+            # until the DB sync itself returns. The old code called a bare
+            # self._refresh_table() (fire-and-forget row-fill, same as
+            # _reveal_sync used to) and hid the indicator right after —
+            # before rows/diagrams had actually finished, which is exactly
+            # why it looked done while the table kept popping in/lagging
+            # afterward. Reuses the same race-free pipeline as the initial
+            # reveal (defer_fill_to_caller + direct await + diagram
+            # preload), just without ever touching reveal_panel/
+            # table_container visibility.
             self._set_toolbar_busy(True)
             self._update_loading_status(self.t("gsm.syncing", "Синхронізація…"), 0.0)
             if self._loading_bar_ref is not None:
@@ -7413,9 +7433,26 @@ class GsmParserView:
                 self._loading_status_ref.visible = True
                 with contextlib.suppress(Exception):
                     self._loading_status_ref.update()
-            await asyncio.to_thread(self._sync_cache_from_db, True)
-            self._refresh_table()
-            self._hide_loading_overlay()
+            try:
+                await asyncio.to_thread(self._sync_cache_from_db, True)
+
+                self._reveal_rows_done = 0
+                self._reveal_rows_total = 0
+                self._reveal_charts_done = 0
+                self._reveal_charts_total = 0
+                self._refresh_table(defer_fill_to_caller=True)
+                pending = self._pending_fill
+                self._pending_fill = None
+                if pending:
+                    _to_fill, color_maps = pending
+                    self._reveal_rows_total = sum(len(devs) for _, devs in _to_fill)
+                    self._update_reveal_progress_text()
+                    await self._fill_expanded_brands_async(_to_fill, color_maps)
+
+                await self._preload_charts_for_current_page()
+                await self._warm_photo_cache_from_db()
+            finally:
+                self._hide_loading_overlay()
 
         def _force_reload(_=None):
             if page_ctrl:
