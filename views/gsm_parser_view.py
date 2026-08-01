@@ -9284,24 +9284,32 @@ class GsmParserView:
         _DIM_AXES = [("length", "Довжина"), ("width", "Ширина"), ("thickness", "Товщина")]
 
         def _dim_popup(prefix: str, txt_color: str) -> ft.PopupMenuButton:
-            def _axis_item(axis_key, axis_label):
+            # Two direct-direction rows per axis, same reasoning as the
+            # header buttons — a single PopupMenuItem can't reliably host
+            # two independently-clickable icon buttons (its own on_click
+            # would fire/close the menu regardless of which inner icon was
+            # tapped), so each direction gets its own menu row instead.
+            def _axis_item(axis_key, axis_label, direction: bool):
                 col = f"{prefix}_{axis_key}"
-                active = self._sort_col == col
-                icon = (
-                    (ft.Icons.KEYBOARD_ARROW_UP if self._sort_asc else ft.Icons.KEYBOARD_ARROW_DOWN)
-                    if active
-                    else ft.Icons.UNFOLD_MORE
-                )
+                active = self._sort_col == col and self._sort_asc == direction
+                arrow_icon = ft.Icons.ARROW_UPWARD if direction else ft.Icons.ARROW_DOWNWARD
                 return ft.PopupMenuItem(
                     content=ft.Row(
                         [
-                            ft.Text(axis_label, size=12, weight=ft.FontWeight.W_600 if active else None),
-                            ft.Icon(icon, size=14, color=_MUTED),
+                            ft.Text(
+                                axis_label,
+                                size=12,
+                                weight=ft.FontWeight.W_600 if active else None,
+                            ),
+                            ft.Icon(
+                                arrow_icon, size=14,
+                                color=_OK_DK if active else _MUTED,
+                            ),
                         ],
                         spacing=6,
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                     ),
-                    on_click=lambda _, c=col: self._sort_click(c),
+                    on_click=lambda _, c=col, d=direction: self._sort_click(c, d),
                 )
 
             return ft.PopupMenuButton(
@@ -9310,7 +9318,11 @@ class GsmParserView:
                 icon_color=txt_color,
                 tooltip="Сортувати за довжиною / шириною / товщиною",
                 padding=ft.padding.all(0),
-                items=[_axis_item(k, lbl) for k, lbl in _DIM_AXES],
+                items=[
+                    item
+                    for k, lbl in _DIM_AXES
+                    for item in (_axis_item(k, lbl, True), _axis_item(k, lbl, False))
+                ],
             )
 
         def _hdr_cell(key, width, label, sortable, txt_color):
