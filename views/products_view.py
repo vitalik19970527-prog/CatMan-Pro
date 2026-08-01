@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import os
@@ -4034,10 +4035,31 @@ class ProductsView:
             "_display_name"
         ) or self._resolve_product_display_name(product)
         company_id = product.get("company_id") or self.company_id
+        product_region_id = product.get("region_id")
+
+        # 4 independent DB reads, previously fetched one after another —
+        # this whole function already runs on a background thread (see
+        # show_product_details_dialog's asyncio.to_thread wrapper), so run
+        # them concurrently on a small local thread pool instead.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as _pool:
+            _f_companies = _pool.submit(self.db.get_all_companies)
+            _f_regions = _pool.submit(self.db.get_company_regions, company_id)
+            _f_node_path = _pool.submit(
+                self.db.get_node_path, product.get("catalog_node_id")
+            )
+            _f_delivery = _pool.submit(
+                self.db.get_effective_delivery_methods_for_manager,
+                company_id, self.manager_id, product_region_id,
+            )
+            _all_companies = _f_companies.result() or []
+            _all_regions = _f_regions.result() or []
+            _node_path_rows = _f_node_path.result() or []
+            _delivery_methods = _f_delivery.result() or []
+
         company_name = next(
             (
                 row.get("name")
-                for row in self.db.get_all_companies() or []
+                for row in _all_companies
                 if isinstance(row, dict) and row.get("id") == company_id
             ),
             "",
@@ -4045,7 +4067,7 @@ class ProductsView:
         region_name = next(
             (
                 row.get("name")
-                for row in self.db.get_company_regions(company_id) or []
+                for row in _all_regions
                 if isinstance(row, dict) and row.get("id") == product.get("region_id")
             ),
             "-",
@@ -4097,12 +4119,10 @@ class ProductsView:
                 )
 
         path_names = []
-        for node in self.db.get_node_path(product.get("catalog_node_id")) or []:
+        for node in _node_path_rows:
             if isinstance(node, dict) and node.get("name"):
                 path_names.append(node.get("name"))
         hierarchy_text = " -> ".join(path_names) if path_names else "-"
-
-        product_region_id = product.get("region_id")
 
         def _value_row(label, value):
             return ft.Column(
@@ -4128,9 +4148,7 @@ class ProductsView:
         )
         _supplier_restricted = len(_supplier_enabled_ids) > 0
         selected_delivery_ids = set()
-        for method in self.db.get_effective_delivery_methods_for_manager(
-            company_id, self.manager_id, product_region_id
-        ):
+        for method in _delivery_methods:
             if not isinstance(method, dict) or not method.get("id"):
                 continue
             if _supplier_restricted and method.get("id") not in _supplier_enabled_ids:
@@ -4537,17 +4555,42 @@ class ProductsView:
 
         dlg = existing_dlg if existing_dlg is not None else ft.AlertDialog()
         is_edit = isinstance(product, dict) and bool((product or {}).get("id"))
-        try:
-            _has_access = await asyncio.to_thread(
-                self.db.manager_has_category_access_in_region,
-                self.manager_id, self.company_id, self._effective_region_id()
-            )
-        except Exception:
-            _has_access = True
+        product = product or {}
+        lock_company_id = product.get("company_id") or self.company_id
+        _pid = str(product.get("id") or "").strip() if is_edit else ""
+
+        # Access check and hydrate don't depend on each other's result —
+        # both only need the ORIGINAL (pre-hydrate) product's id/company —
+        # so run them concurrently instead of back-to-back. Cuts the modal
+        # open time roughly in half on the common (has-access) path; the
+        # rare wasted hydrate on a no-access product is cheap compared to
+        # everyone else's win.
+        async def _check_access():
+            try:
+                return await asyncio.to_thread(
+                    self.db.manager_has_category_access_in_region,
+                    self.manager_id, self.company_id, self._effective_region_id()
+                )
+            except Exception:
+                return True
+
+        async def _hydrate():
+            if not (is_edit and _pid):
+                return None
+            try:
+                return await asyncio.to_thread(
+                    self.db.get_product_by_id, lock_company_id, _pid
+                )
+            except Exception:
+                logger.exception("Failed to hydrate product from DB for edit modal")
+                return None
+
+        _has_access, _fresh = await asyncio.gather(_check_access(), _hydrate())
+
         if not _has_access:
             logger.info(
                 "[edit-switch] BLOCKED: no category access pid=%s manager=%s company=%s region=%s",
-                (product or {}).get("id"), self.manager_id, self.company_id,
+                product.get("id"), self.manager_id, self.company_id,
                 self._effective_region_id(),
             )
             self._show_snack(
@@ -4558,28 +4601,18 @@ class ProductsView:
                 "orange",
             )
             return
-        product = product or {}
-        self.temp_image_path = None
-        edit_lock_token = ""
-        lock_company_id = product.get("company_id") or self.company_id
-        lock_released_ref = {"done": False}
-        lock_heartbeat_task_ref = {"task": None}
 
         # IMPORTANT: on edit, always hydrate from DB so the modal shows exactly what is saved.
         # UI list rows may be partial and can miss fields like supplier_id/packaging_id.
-        if is_edit:
-            pid = str((product or {}).get("id") or "").strip()
-            if pid:
-                try:
-                    fresh = await asyncio.to_thread(
-                        self.db.get_product_by_id, lock_company_id, pid
-                    )
-                    if isinstance(fresh, dict):
-                        merged = dict(product)
-                        merged.update(fresh)  # DB wins
-                        product = merged
-                except Exception:
-                    logger.exception("Failed to hydrate product from DB for edit modal")
+        if isinstance(_fresh, dict):
+            merged = dict(product)
+            merged.update(_fresh)  # DB wins
+            product = merged
+
+        self.temp_image_path = None
+        edit_lock_token = ""
+        lock_released_ref = {"done": False}
+        lock_heartbeat_task_ref = {"task": None}
 
         if is_edit:
             lock_res = await asyncio.to_thread(
@@ -4652,10 +4685,22 @@ class ProductsView:
                     edit_lock_token,
                 )
 
-        companies = (
-            await asyncio.to_thread(self.db.get_all_companies)
-            if self.is_superadmin
-            else []
+        # Independent of each other — companies list doesn't need the
+        # node path and vice versa — so fetched concurrently.
+        async def _fetch_companies():
+            if not self.is_superadmin:
+                return []
+            return await asyncio.to_thread(self.db.get_all_companies)
+
+        async def _fetch_node_path():
+            if not (is_edit and product.get("catalog_node_id")):
+                return []
+            return await asyncio.to_thread(
+                self.db.get_node_path, product.get("catalog_node_id")
+            )
+
+        companies, _node_path = await asyncio.gather(
+            _fetch_companies(), _fetch_node_path()
         )
         default_company_id = (
             product.get("company_id")
@@ -4668,13 +4713,9 @@ class ProductsView:
 
         # Build path map from leaf node for pre-filling hierarchy dropdowns on edit
         _edit_path_map = {}
-        if is_edit and product.get("catalog_node_id"):
-            _node_path = await asyncio.to_thread(
-                self.db.get_node_path, product.get("catalog_node_id")
-            )
-            for _ni in _node_path:
-                if isinstance(_ni, dict) and _ni.get("position") and _ni.get("id"):
-                    _edit_path_map[int(_ni["position"])] = _ni["id"]
+        for _ni in _node_path:
+            if isinstance(_ni, dict) and _ni.get("position") and _ni.get("id"):
+                _edit_path_map[int(_ni["position"])] = _ni["id"]
 
         company_f = ft.Dropdown(
             label="Компанія",
