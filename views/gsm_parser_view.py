@@ -7198,7 +7198,19 @@ class GsmParserView:
             ),
         )
 
+        # `key=device_id` (in addition to `data=device_id`, used elsewhere
+        # for in-place patching) lets Flet's list-diffing (object_patch.py's
+        # _compare_lists) match rows by stable logical identity across a
+        # reorder instead of falling back to raw Python-object-id matching
+        # — a live py-spy dump during a live sort-click freeze showed the
+        # main thread stuck inside exactly this diffing path
+        # (_refresh_table's self._table_body_ref.update() call), which is
+        # the whole point of reordering already-built Control objects
+        # instead of rebuilding them (see the flat-mode row-reuse cache) —
+        # that optimization only avoided rebuilding the Controls, not the
+        # cost of Flet figuring out the reorder itself without a key.
         return ft.Container(
+            key=device_id,
             data=device_id,
             border=ft.border.only(bottom=ft.BorderSide(1, _BORDER)),
             padding=ft.padding.symmetric(horizontal=10, vertical=3),
