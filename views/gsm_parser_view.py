@@ -9340,7 +9340,20 @@ class GsmParserView:
         table_body = ft.Column(row_controls, spacing=0, tight=True)
         self._table_body_ref = table_body
 
-        if page_ctrl and _to_fill:
+        # _should_reveal is always True now (see above) — the auto-started
+        # _reveal_and_sync task fires moments after this function returns
+        # and rebuilds this exact table via _refresh_table(fill_all_brands
+        # =True), while table_container stays hidden behind reveal_panel
+        # the whole time regardless. Firing this fire-and-forget fill here
+        # too was pure waste AND a real race: it could still be actively
+        # building rows into these containers when _reveal_sync's
+        # _refresh_table call replaced self._brand_body_by_name with fresh
+        # ones, orphaning that work — but _brand_fill_queue is shared, so
+        # the drain loop kept processing those now-pointless entries
+        # before ever reaching the real ones, which is what made brand-
+        # expand/charts still feel slow even after the loading screen
+        # said it was done. Skip entirely; _reveal_and_sync owns this now.
+        if page_ctrl and _to_fill and not _should_reveal:
             page_ctrl.run_task(
                 self._fill_expanded_brands_async,
                 _to_fill,
