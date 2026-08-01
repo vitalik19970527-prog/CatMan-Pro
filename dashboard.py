@@ -2695,13 +2695,19 @@ class MainDashboard:
                     self._sync_poll_started = True
                     self.page.run_task(self._sync_poll_loop)
                     self.page.run_task(self._home_auto_refresh_loop)
-                if not self._gsm_tg_flush_loop_started:
-                    self._gsm_tg_flush_loop_started = True
-                    from gsm_parser_runner import gsm_local_tg_flush_loop
-
-                    self.page.run_task(
-                        gsm_local_tg_flush_loop, self.db, self._gsm_tg_flush_permitted
-                    )
+                # gsm_local_tg_flush_loop (a local, 180s-interval flush of
+                # queued Telegram notifications) is NOT started anymore —
+                # the server-side daemon (gsm_parser_scheduler.py's
+                # run_daemon, which now runs independently of any laptop
+                # being open, per explicit product decision) already
+                # flushes the SAME queue every 30s. Both running at once
+                # raced on the same DB-backed pending queue — neither
+                # claims an item before sending it, only clears it
+                # afterward — so whichever process's tick landed near the
+                # scheduled send time could both see the same pending
+                # report and both send it, which is what caused duplicate
+                # Telegram messages for the same device. The server alone
+                # is now the single sender.
                 self.page.run_task(self._background_warmup)
                 self._refresh_workspace_tabs()
                 self.page.update()
@@ -3545,13 +3551,11 @@ class MainDashboard:
                 self._sync_poll_started = True
                 self.page.run_task(self._sync_poll_loop)
                 self.page.run_task(self._home_auto_refresh_loop)
-            if not self._gsm_tg_flush_loop_started:
-                self._gsm_tg_flush_loop_started = True
-                from gsm_parser_runner import gsm_local_tg_flush_loop
-
-                self.page.run_task(
-                    gsm_local_tg_flush_loop, self.db, self._gsm_tg_flush_permitted
-                )
+            # gsm_local_tg_flush_loop no longer started here either — see
+            # the matching comment at the other call site (removed): the
+            # server daemon alone flushes queued Telegram notifications
+            # now, avoiding the duplicate-send race two independent
+            # flushers hitting the same DB-backed queue used to cause.
 
             self._refresh_workspace_tabs()
             self.page.run_task(self._background_warmup)

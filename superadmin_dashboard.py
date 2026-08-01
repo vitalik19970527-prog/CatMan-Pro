@@ -1375,11 +1375,15 @@ class SuperAdminDashboard:
             self._sync_last_pulses = self._load_sync_snapshot()
             self._sync_poll_started = True
             self.page.run_task(self._sync_poll_loop)
-        if not self._gsm_tg_flush_loop_started:
-            self._gsm_tg_flush_loop_started = True
-            from gsm_parser_runner import gsm_local_tg_flush_loop
-
-            self.page.run_task(gsm_local_tg_flush_loop, self.db, lambda: True)
+        # gsm_local_tg_flush_loop no longer started — the server-side
+        # daemon (gsm_parser_scheduler.py's run_daemon, running
+        # independently of any laptop being open) already flushes the
+        # same DB-backed pending-notification queue every 30s. Running
+        # both raced on that queue (neither claims an item before sending
+        # it, only clears it afterward), so a report near its scheduled
+        # send time could be picked up and sent by BOTH processes —
+        # confirmed live as duplicate Telegram messages for the same
+        # device. The server alone is now the single sender.
         self._show_current_tab()
         self.page.run_task(self._background_warmup)
         # Expose callback so Settings can refresh background without restart.

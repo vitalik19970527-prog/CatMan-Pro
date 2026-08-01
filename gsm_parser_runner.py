@@ -1664,7 +1664,21 @@ def _next_time_at_or_after(now: datetime, hm: str) -> datetime:
 def _flush_due_telegram_notifications(db, log_fn: Optional[Callable[[str], None]] = None) -> None:
     """Send any queued report whose scheduled time has passed. Called before
     deciding what to do with the CURRENT run's report, so delivery stays
-    timely even when several runs in a row land inside quiet hours."""
+    timely even when several runs in a row land inside quiet hours.
+
+    Claims due items (writes them out of the pending queue) BEFORE sending
+    them, not after — sending is a real network call (Telegram HTTP API,
+    including a photo upload) that can take seconds, and this function can
+    be invoked from more than one process against the same DB-backed
+    queue (confirmed live: the desktop app's own local flush loop and the
+    server daemon's tick both called this independently, and since the
+    old code only removed an item from the queue AFTER sending it, both
+    processes could read the same still-pending item and both send it —
+    duplicate Telegram messages for the same report). Claiming first
+    still isn't a true row-level lock, but it shrinks the race window
+    from "however long every Telegram send in the batch takes" down to
+    the gap between two near-simultaneous reads, and the desktop's
+    redundant local loop has separately been removed as the real fix."""
     try:
         pending = db.get_gsm_pending_telegram_notifications() or []
     except Exception:
@@ -1674,7 +1688,7 @@ def _flush_due_telegram_notifications(db, log_fn: Optional[Callable[[str], None]
 
     now = datetime.now()
     remaining = []
-    sent_any = False
+    due = []
     for item in pending:
         try:
             send_at = datetime.fromisoformat(str(item.get("send_at") or ""))
@@ -1682,7 +1696,17 @@ def _flush_due_telegram_notifications(db, log_fn: Optional[Callable[[str], None]
             send_at = now  # malformed timestamp — send now rather than lose it
         if send_at > now:
             remaining.append(item)
-            continue
+        else:
+            due.append((item, send_at))
+
+    if not due:
+        return
+
+    # Claim now, before any network call — see docstring.
+    with contextlib.suppress(Exception):
+        db.save_gsm_pending_telegram_notifications(remaining)
+
+    for item, send_at in due:
         item_cfg = item.get("cfg") if isinstance(item.get("cfg"), dict) else {}
         item_events = item.get("events") if isinstance(item.get("events"), list) else []
         item_stats = item.get("stats") if isinstance(item.get("stats"), dict) else {}
@@ -1690,16 +1714,11 @@ def _flush_due_telegram_notifications(db, log_fn: Optional[Callable[[str], None]
             _send_telegram_detailed(db, item_cfg, item_events, item_stats)
         with contextlib.suppress(Exception):
             _send_telegram_summary(item_cfg, item_stats)
-        sent_any = True
         if log_fn:
             with contextlib.suppress(Exception):
                 log_fn(
                     f"Надіслано відкладене сповіщення (заплановано на {send_at.strftime('%d.%m %H:%M')})"
                 )
-
-    if sent_any:
-        with contextlib.suppress(Exception):
-            db.save_gsm_pending_telegram_notifications(remaining)
 
 
 def _maybe_queue_or_send_telegram(
