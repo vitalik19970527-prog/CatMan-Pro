@@ -30,6 +30,7 @@ import flet as ft
 
 import i18n
 from gsm_parser_runner import fetch_and_apply_manual_ek_url
+from logger import logger as _catlog
 
 logger = logging.getLogger("gsm_parser_view")
 if not logger.handlers:
@@ -39,6 +40,11 @@ if not logger.handlers:
     logger.addHandler(_h)
     logger.setLevel(logging.ERROR)
     logger.propagate = False
+# `logger` above has propagate=False and an ERROR-only console handler —
+# nothing it logs ever reaches logs/catman.log. _catlog is the shared,
+# file-backed logger from logger.py, used specifically for the reveal
+# flow's error path below so a failure there is actually diagnosable
+# after the fact instead of only visible (if at all) in a live console.
 
 
 def _warm_up_matplotlib() -> None:
@@ -1416,25 +1422,44 @@ class GsmParserView:
         try:
             devices, _, loading = _get_cache()
             if loading:
-                # Someone else's sync (e.g. the initial _background_load) is
-                # already running — wait for it instead of bailing out
-                # immediately, so a caller that gates a loading state on this
-                # coroutine (see _reveal_and_sync) doesn't reveal the table
-                # while that other sync is still actively changing it.
+                # Someone else's sync (e.g. a concurrently-triggered
+                # _background_load) is already running — wait for it to
+                # finish instead of returning early. Returning early here
+                # used to skip the whole pipeline below (row-fill wait,
+                # diagrams, photo cache) entirely, revealing the table on
+                # whatever partial state that other sync happened to leave
+                # behind at that exact moment — the actual cause of
+                # "loading disappears fast but the table/charts still hang".
                 for _ in range(3000):  # up to ~10 minutes — see _reveal_and_sync's cap
                     await asyncio.sleep(0.2)
-                    _, _, loading = _get_cache()
+                    devices, _, loading = _get_cache()
                     if not loading:
                         break
-                self._refresh_table(fill_all_brands=True)
-                return
-            if devices is None:
-                await self._background_load(page)
-                return
-            if not _parser_is_running() and self._needs_reload():
-                await asyncio.to_thread(self._sync_cache_from_db, False)
 
-            # Build the container/header structure now, but hand the actual
+            if devices is None:
+                # True cold start — nothing in memory yet. Load from disk
+                # inline (fast) instead of delegating to _background_load,
+                # which does its own fire-and-forget _refresh_table call
+                # and returns without ever reaching diagrams/photo-cache —
+                # that was the actual bug: on the very first load of the
+                # day (devices is always None then), this whole pipeline
+                # never ran at all.
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(_load_cache_from_disk)
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(_load_chart_cache_from_disk)
+
+            if not _parser_is_running() and self._needs_reload():
+                _set_loading(True)
+                self._set_toolbar_busy(True)
+                try:
+                    await asyncio.to_thread(self._sync_cache_from_db, False)
+                finally:
+                    _set_loading(False)
+
+            # From here down: the SAME unified pipeline runs regardless of
+            # which branch above got us here. Build the container/header
+            # structure now, but hand the actual
             # row-fill work back to us instead of letting _refresh_table
             # fire-and-forget it via page_ctrl.run_task — awaiting it
             # directly here removes the race that used to let the table
@@ -1465,8 +1490,15 @@ class GsmParserView:
             # covered, so no row's first paint ever falls back to fetching
             # from GSM Arena/E-Katalog directly.
             await self._warm_photo_cache_from_db()
+            self._hide_loading_overlay()
+            _catlog.info(
+                "[GSM] _reveal_sync completed: rows=%s/%s charts=%s/%s",
+                self._reveal_rows_done, self._reveal_rows_total,
+                self._reveal_charts_done, self._reveal_charts_total,
+            )
         except Exception as exc:
             logger.error("[GSM] _reveal_sync FAILED: %s", exc, exc_info=True)
+            _catlog.exception("[GSM] _reveal_sync FAILED — table may reveal only partially loaded")
 
     async def _warm_photo_cache_from_db(self) -> None:
         """Bulk-warms the local disk photo cache (_photo_cache_path) from
@@ -6479,12 +6511,27 @@ class GsmParserView:
         """Queue multiple brands' bodies through the same single-drainer
         path as individual toggle clicks (never concurrently — concurrent
         Flet builds contend on the global IdCounter lock and inflate build
-        time, per established project rule)."""
+        time, per established project rule).
+
+        Always returns only once the queue (including what THIS call just
+        added) is actually fully drained — critical for callers like
+        _reveal_sync that await this directly and reveal the table right
+        after. If a drain was already running when we got here (e.g. a
+        concurrent _background_load call), the old code just appended to
+        the shared queue and returned immediately without waiting for
+        that other drain to reach our items — the loading screen would
+        vanish while row-building was still actively going in the
+        background, fighting chart/photo work for the same thread. That
+        was the actual cause of "everything hangs even after the spinner
+        is gone"."""
         for body_container, devs in to_fill:
             self._brand_fill_queue.append((body_container, devs, color_maps))
         if not self._brand_fill_running:
             self._brand_fill_running = True
             await self._drain_brand_fill_queue()
+        else:
+            while self._brand_fill_running or self._brand_fill_queue:
+                await asyncio.sleep(0.05)
 
     def _build_toggle_all_brands_btn(self) -> ft.IconButton:
         """Header-row button (left of 'Бренд') to collapse/expand every brand
@@ -8978,8 +9025,10 @@ class GsmParserView:
                 await asyncio.wait_for(self._reveal_sync(page_ctrl_arg), timeout=600)
             except asyncio.TimeoutError:
                 logger.error("[GSM] _reveal_and_sync: exceeded 10-minute safety cap")
+                _catlog.error("[GSM] _reveal_and_sync: exceeded 10-minute safety cap — revealing partially loaded")
             except Exception as exc:
                 logger.error("[GSM] _reveal_and_sync FAILED: %s", exc, exc_info=True)
+                _catlog.exception("[GSM] _reveal_and_sync FAILED — table may reveal only partially loaded")
             finally:
                 _reveal_loading_col.visible = False
                 _reveal_refs["panel"].visible = False
