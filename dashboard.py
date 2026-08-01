@@ -1003,6 +1003,31 @@ class MainDashboard:
                 spacing=0,
                 horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
             )
+            if key == "gsm_parser":
+                # Flet's after_event auto-update (see flet/messaging/
+                # session.py's after_event/__auto_update) walks UP from
+                # whatever control fired an event until it finds an
+                # "isolated" ancestor, then diffs THAT control's whole
+                # subtree — and only Page itself ships isolated=True out
+                # of the box, so any event handler anywhere in the app
+                # that doesn't explicitly call .update() on something
+                # falls back to diffing the ENTIRE page tree. Since every
+                # cached tab wrapper stays alive (just hidden) for the
+                # instant-switch fast path, GSM Parser's ~1000+ built rows
+                # are part of that page tree even while some OTHER tab or
+                # dialog is what's actually being interacted with — live
+                # py-spy captures showed the main thread stuck for a long
+                # time inside Flet's own object_patch comparison for
+                # exactly this reason (confirmed live during testing:
+                # closing an unrelated dialog hung because of this).
+                # Marking this wrapper isolated makes it the stopping
+                # point for auto-update walks that pass through it, and
+                # (per Flet's diffing) an ancestor's own diff shouldn't
+                # need to recurse into an isolated descendant's subtree
+                # either — scoping the cost to whichever tab actually
+                # changed instead of the whole page.
+                with contextlib.suppress(Exception):
+                    col._isolated = True
             self._cached_view_wrappers[key] = col
             self.content_area.controls.append(col)
             # Ensure wrapper.page propagates so views can call self._page()
