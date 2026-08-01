@@ -1426,6 +1426,52 @@ class GsmParserView:
             _set_loading(False)
             self._hide_loading_overlay()
 
+    async def _load_data_for_filters(self, page) -> None:
+        """Quietly loads device DATA only (disk cache, or a DB sync if the
+        daily boundary was missed) so the filter panel has real
+        brand/type/year options to offer — without building a single row,
+        chart, or photo. That expensive work stays gated behind "Показати
+        результати" (explicit product decision); this just makes it
+        possible to actually SET a filter beforehand, since the filter
+        panel's options are derived from the loaded device list and would
+        otherwise show nothing until the very button that's supposed to
+        use those filters. Auto-started once per tab open — see
+        _build_results_content."""
+        try:
+            devices, _, loading = _get_cache()
+            if loading:
+                return  # someone else (_background_load, another session) already on it
+            if devices is None:
+                loaded_from_disk = await asyncio.to_thread(_load_cache_from_disk)
+                if not loaded_from_disk and self._needs_reload():
+                    _set_loading(True)
+                    try:
+                        await asyncio.to_thread(self._sync_cache_from_db, False)
+                    finally:
+                        _set_loading(False)
+            elif self._needs_reload() and not _parser_is_running():
+                _set_loading(True)
+                try:
+                    await asyncio.to_thread(self._sync_cache_from_db, False)
+                finally:
+                    _set_loading(False)
+            # Refresh just the filter panel (now has real options) and the
+            # "Знайдено: N" count — never the table/reveal state.
+            if self._filter_panel_ref is not None:
+                with contextlib.suppress(Exception):
+                    self._filter_panel_ref.content = self._build_filter_panel()
+                    self._filter_panel_ref.update()
+            if self._stats_ref is not None:
+                with contextlib.suppress(Exception):
+                    n = len(self._get_filtered_devices())
+                    self._stats_ref.value = self.t(
+                        "gsm.found_simple", "Знайдено: {n} пристроїв"
+                    ).format(n=n)
+                    self._stats_ref.update()
+        except Exception:
+            logger.exception("[GSM] _load_data_for_filters FAILED")
+            _catlog.exception("[GSM] _load_data_for_filters FAILED")
+
     async def _reveal_sync(self, page):
         """Runs automatically every time the GSM Parser tab opens (see
         _reveal_and_sync). Data updates once a day, from a scheduled
@@ -7444,19 +7490,18 @@ class GsmParserView:
             loading,
         )
 
-        # Explicit product requirement: ALL loading (disk cache, DB sync if
-        # the daily boundary needs it, building every row) happens ONE
-        # place — behind the loading indicator, during _reveal_and_sync
-        # (auto-started below, see reveal_panel) — not as a separate
-        # background task running alongside it. This used to ALSO fire
-        # self._background_load directly from here, which meant two
-        # separate scheduled tasks (this one, and _reveal_and_sync's own
-        # call into the exact same _background_load for the devices-is-
-        # None case) could race and compete for the same thread — that
-        # redundant second task, not "background loading" as a concept,
-        # is what made the tab feel like it was fighting itself. Deleted;
-        # _reveal_and_sync/_reveal_sync now fully own this responsibility.
+        # Building rows/charts/photos (the expensive part) stays gated
+        # behind "Показати результати" — _reveal_and_sync owns that whole
+        # pipeline, auto-started only by that click (see reveal_panel
+        # below). But the filter panel's own options (brand/type/year
+        # lists) come FROM the loaded device data, and with the click
+        # gate restored there was otherwise no way to pick a filter before
+        # clicking the very button meant to respect it — so a lightweight,
+        # UI-build-free data load (_load_data_for_filters) still auto-
+        # starts here, refreshing just the filter panel + count once done.
         _should_reveal = True
+        if page_ctrl:
+            page_ctrl.run_task(self._load_data_for_filters, page_ctrl)
 
         filtered = self._get_filtered_devices()
         page_devs = self._page_items(filtered)
