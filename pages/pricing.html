@@ -126,7 +126,7 @@
 
       <p class="tab-price-note" style="margin-top: 12px;">
         <strong data-i18n="pricing.seat.dedicated.title">Хто надає сервер — ваш вибір</strong><br>
-        <span data-i18n-html="pricing.seat.dedicated.desc">Кожен VPS-тариф — це окремий виділений сервер тільки для вашої компанії. Ми ніколи не підключаємо кілька компаній на один спільний сервер. Є свій сервер? Платите тільки за користувачів, як вище. Потрібен сервер від CatMan? Додається хостинг — <strong>+999&nbsp;₴ / <span class="price-usd">$24</span> на місяць</strong> (1 людина), <strong>+1299&nbsp;₴ / <span class="price-usd">$31.5</span></strong> (5 людей), <strong>+1599&nbsp;₴ / <span class="price-usd">$38.5</span></strong> (10 людей) або <strong>+2399&nbsp;₴ / <span class="price-usd">$58</span></strong> (15 людей), плюс разове підключення сервера <strong>1199&nbsp;₴ / <span class="price-usd">$29</span></strong>.</span>
+        <span data-i18n-html="pricing.seat.dedicated.desc">Кожен VPS-тариф — це окремий виділений сервер тільки для вашої компанії. Ми ніколи не підключаємо кілька компаній на один спільний сервер. Є свій сервер? Платите тільки за користувачів, як вище. Потрібен сервер від CatMan? Додається хостинг — <strong>+999&nbsp;₴ / <span class="price-usd">$24</span> на місяць</strong> (1 людина), <strong>+1299&nbsp;₴ / <span class="price-usd">$31.5</span></strong> (5 людей), <strong>+1599&nbsp;₴ / <span class="price-usd">$38.5</span></strong> (10 людей) або <strong>+2399&nbsp;₴ / <span class="price-usd">$58</span></strong> (15 людей), плюс разове підключення сервера <strong>1199&nbsp;₴ / <span class="price-usd">$29</span></strong>. Це попередні ціни — точна сума залежить від потрібних параметрів (обсяг SSD, потреба в резервних копіях тощо) і узгоджується індивідуально.</span>
       </p>
     </div>
   </section>
@@ -187,6 +187,7 @@
           <strong id="calcTotal">679 ₴ / $16.5</strong>
         </div>
         <p class="calc-once" id="calcOnce"></p>
+        <p class="tab-price-note" id="calcVpsNote" data-i18n="pricing.calc.vpsours.note" style="display:none;">* Вартість сервера від CatMan — попередня, залежить від параметрів і узгоджується індивідуально.</p>
       </div>
     </div>
   </section>
@@ -197,11 +198,12 @@
       <p class="eyebrow" data-i18n="pricing.setup.title">Одноразові послуги</p>
       <p class="section-lede" data-i18n="pricing.setup.lede" style="margin-bottom: 20px;">Потрібен сервер від CatMan або підключення GSM Parser? Це можна замовити окремо, для будь-якого тарифу — і локального теж.</p>
       <div class="tab-price-list">
-        <div class="tab-price-row"><span data-i18n="pricing.setup.vps">Підключення сервера від CatMan</span><span class="tab-price-value">1199&nbsp;₴ <span class="price-usd">/ $29</span> — <span data-i18n="pricing.setup.once">одноразово</span></span></div>
+        <div class="tab-price-row"><span data-i18n="pricing.setup.vps">Підключення сервера від CatMan*</span><span class="tab-price-value">1199&nbsp;₴ <span class="price-usd">/ $29</span> — <span data-i18n="pricing.setup.once">одноразово</span></span></div>
         <div class="tab-price-row"><span data-i18n="pricing.setup.gsm">Активація GSM Parser</span><span class="tab-price-value">1599&nbsp;₴ <span class="price-usd">/ $38.5</span> — <span data-i18n="pricing.setup.once">одноразово</span></span></div>
         <div class="tab-price-row"><span data-i18n="pricing.setup.ownvps">Допомога з підключенням власного VPS сервера</span><span class="tab-price-value">1099&nbsp;₴ <span class="price-usd">/ $26.5</span> — <span data-i18n="pricing.setup.once">одноразово</span></span></div>
       </div>
-      <p class="tab-price-note" style="margin-top: 8px;" data-i18n="pricing.setup.ownvps.note">За бажанням — підключити власний сервер можна й самостійно, це не обов'язково.</p>
+      <p class="tab-price-note" style="margin-top: 8px;" data-i18n="pricing.setup.vps.note">* Орієнтовна ціна — залежить від потрібних параметрів сервера (обсяг SSD, резервні копії тощо) і узгоджується індивідуально.</p>
+      <p class="tab-price-note" style="margin-top: 4px;" data-i18n="pricing.setup.ownvps.note">За бажанням — підключити власний сервер можна й самостійно, це не обов'язково.</p>
     </div>
   </section>
 
@@ -336,7 +338,7 @@
         </div>
       </div>
 
-      <p class="hero-note" style="text-align:center; margin-top: 20px;" data-i18n-html="pricing.dedicated.footnote">* Ціна «Сервер від CatMan» включає хостинг; разове підключення сервера (1199&nbsp;₴ / <span class="price-usd">$29</span>) оплачується окремо один раз при підключенні.</p>
+      <p class="hero-note" style="text-align:center; margin-top: 20px;" data-i18n-html="pricing.dedicated.footnote">* Ціна «Сервер від CatMan» — попередня і може суттєво відрізнятися залежно від потрібних параметрів (обсяг SSD, потреба в резервних копіях тощо) — точна сума узгоджується індивідуально. Також включає хостинг; разове підключення сервера (1199&nbsp;₴ / <span class="price-usd">$29</span>) оплачується окремо один раз при підключенні.</p>
       <p class="hero-note" style="text-align:center; margin-top: 8px;" data-i18n="pricing.footnote">Почали з Локально — завжди можна перейти на VPS пізніше, база даних переїде разом з вами.</p>
     </div>
   </section>
