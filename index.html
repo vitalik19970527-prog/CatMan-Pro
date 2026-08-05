@@ -15,7 +15,7 @@
       <span class="brand-mark" aria-hidden="true"></span>
       CatMan&nbsp;Pro
     </a>
-    <nav class="nav" aria-label="Основна навігація">
+    <nav class="nav" data-i18n="nav.aria_label" data-i18n-attr="aria-label" aria-label="Основна навігація">
       <a href="index.html#tabs" class="active" data-i18n="nav.features">Можливості</a>
       <a href="pages/gsm-extension.html" data-i18n="nav.gsm">Розширення</a>
       <a href="pages/company-individual.html" data-i18n="nav.company">Компанія/Користувач</a>
@@ -36,7 +36,7 @@
       </ul>
     </div>
     <a class="btn btn-primary btn-small" href="index.html#download" data-i18n="nav.download">Завантажити</a>
-    <button class="nav-toggle" id="navToggle" aria-label="Меню" aria-expanded="false">
+    <button class="nav-toggle" id="navToggle" data-i18n="nav.toggle" data-i18n-attr="aria-label" aria-label="Меню" aria-expanded="false">
       <span></span><span></span><span></span>
     </button>
   </div>
@@ -51,7 +51,7 @@
         <h1 data-i18n-html="hero.h1">Одна програма замість&nbsp;десятка таблиць і&nbsp;нотаток</h1>
         <p class="lede" data-i18n="hero.lede">
           У CatMan Pro ви записуєте замовлення постачальникам, бачите асортиментну
-          матрицю товарів і аналітику по замовленнях, а також знаєте, скільки
+          матрицю товарів і аналітику замовлень, а також знаєте, скільки
           насправді коштує кожен товар з урахуванням доставки. Все в одному
           місці — замість Excel-файлів, які кожен веде по-своєму.
         </p>
@@ -59,7 +59,7 @@
           <a class="btn btn-primary" href="#download" data-i18n="hero.cta1">Завантажити безкоштовно</a>
           <a class="btn btn-ghost" href="#tabs" data-i18n="hero.cta2">Подивитись, що вміє</a>
         </div>
-        <p class="hero-note" data-i18n="hero.note">Для Windows · спробувати можна без картки · дані вашої компанії ніхто інший не бачить</p>
+        <p class="hero-note" data-i18n="hero.note">Для Windows · спробувати можна без картки · дані вашої компанії не бачить ніхто, крім вас</p>
       </div>
       <div class="hero-shot">
         <div class="shot-frame shot-frame--wide" data-shot="hero-dashboard.png" tabindex="0" role="button">
@@ -90,7 +90,7 @@
   <section id="tabs" class="section">
     <div class="wrap">
       <p class="eyebrow center" data-i18n="features.eyebrow">Що вміє програма</p>
-      <h2 class="section-title center" data-i18n="hub.title">16 вкладок — і на кожну є своя сторінка з поясненням</h2>
+      <h2 class="section-title center" data-i18n="hub.title">16 вкладок — і для кожної є своя сторінка з поясненням</h2>
       <p class="section-lede center" data-i18n="hub.lede">Натисніть на розділ, щоб побачити скріншоти і прочитати простими словами, що там можна робити.</p>
 
       <div class="teaser-grid">
@@ -197,7 +197,7 @@
             </svg>
           </span>
           <h3 data-i18n="hub.card.gsm.title">GSM Parser — розширення</h3>
-          <p data-i18n="hub.card.gsm.desc">Можливий доступ до унікального інструменту, який дозволяє бути в курсі оновлень на ринку смартфонів, смарт-годинників і планшетів.</p>
+          <p data-i18n="hub.card.gsm.desc">Можливий доступ до унікального інструменту, який дозволяє бути в курсі новинок на ринку смартфонів, смарт-годинників і планшетів.</p>
           <div class="teaser-tabs">
             <span data-i18n="gsm.title">База цін на телефони, планшети й годинники</span>
           </div>
@@ -265,7 +265,7 @@
       <ol class="steps-plain">
         <li data-i18n-html="start.step1"><strong>Завантажте і встановіть програму</strong> — звичайний інсталятор для Windows, як і будь-яка інша програма.</li>
         <li data-i18n-html="start.step2"><strong>Оберіть, хто ви</strong> — компанія з командою чи окремий користувач. І де зберігати дані — на VPS чи локально.</li>
-        <li data-i18n-html="start.step3"><strong>Додайте постачальників і товари</strong> — вручну або Excell вигрузкою.</li>
+        <li data-i18n-html="start.step3"><strong>Додайте постачальників і товари</strong> — вручну або одразу списком з файлу, який уже є.</li>
         <li data-i18n-html="start.step4"><strong>Запросіть менеджерів</strong> (якщо ви компанія) — кожен одразу отримає свою зону відповідальності.</li>
       </ol>
     </div>
@@ -334,7 +334,7 @@
         </details>
         <details class="acc-item">
           <summary data-i18n="faq.q5">Чи є підтримка, якщо щось незрозуміло?</summary>
-          <p data-i18n="faq.a5">Так, за контактами нижче.</p>
+          <p data-i18n="faq.a5">Так, за контактами нижче — бот підтримки в Telegram, куди можна написати про баг чи ідею.</p>
         </details>
         <details class="acc-item">
           <summary data-i18n="faq.q6">Чи підходить програма одній людині без команди?</summary>
@@ -353,10 +353,14 @@
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 4h16v2H4V4zm0 4h7v10.6l-3.3-3.3-1.4 1.4L12 22.7l5.7-5.7-1.4-1.4-3.3 3.3V8h7v14H4V8z"></path></svg>
           </span>
           <span data-i18n="download.windows">Завантажити для Windows</span>
-        </a>
-      
-      </div>
-      <p class="hero-note on-dark" data-i18n="download.android_wip">Android-застосунок у розробці — найближчим часом доопрацьовуємо зручність інтерфейсу.</p>
+        </a>
+        <a class="btn btn-ghost btn-large btn-on-dark" href="https://github.com/vitalik19970527-prog/CatMan-Pro/releases/latest/download/CatManPro-android.apk">
+          <span class="dl-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M17.6 9.5l1.8-3.1a.5.5 0 0 0-.87-.5l-1.83 3.17a8.6 8.6 0 0 0-7.4 0L7.47 5.9a.5.5 0 1 0-.87.5L8.4 9.5C6.1 10.9 4.5 13.3 4.2 16h15.6c-.3-2.7-1.9-5.1-4.2-6.5zM9 14a1 1 0 1 1 0-2 1 1 0 0 1 0 2zm6 0a1 1 0 1 1 0-2 1 1 0 0 1 0 2zM4 17v4a1 1 0 0 0 2 0v-4H4zm14 0v4a1 1 0 0 0 2 0v-4h-2z"></path></svg>
+          </span>
+          <span data-i18n="download.android">Завантажити для Android</span>
+        </a>
+      </div>
       <p class="hero-note on-dark" data-i18n="download.note">Останню версію і що змінилось — дивіться тут після встановлення.</p>
     </div>
   </section>
