@@ -1,21 +1,20 @@
-import asyncio
+﻿import asyncio
 import os
 import socket
-import subprocess
 import sys
-import tempfile
 import threading
 import time
 import traceback
 import uuid
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from urllib.parse import urlparse
 
 import flet as ft
-import httpx
-from packaging.version import Version
 
+import app_storage
+import app_updater
 import i18n
 import local_pg_manager
 from admin_dashboard import AdminDashboard
@@ -117,14 +116,6 @@ def _is_superadmin_role(role):
 def _is_admin_role(role):
     normalized = (role or "").strip().lower().replace(" ", "")
     return normalized in {"адмін", "админ", "admin"}
-
-
-def _version_is_outdated(current: str, minimum: str) -> bool:
-    try:
-        return Version(current) < Version(minimum)
-    except Exception:
-        logger.exception("Version comparison failed in _version_is_outdated")
-        return False
 
 
 def _ensure_page_dialog_api_compat() -> None:
@@ -638,17 +629,65 @@ def _install_global_compact_dialogs(page: ft.Page):
                 compacted_dialog_ids.add(id(dialog))
         except Exception:
             logger.exception("Global dialog compacting failed")
+        # Dialogs are shown via page.overlay, NOT nested under whichever tab's
+        # cached wrapper is on screen — so Flet's after_event auto-update walk
+        # (see dashboard.py's _get_or_create_cached_wrapper for the full
+        # explanation of is_isolated()) climbs straight past every tab and
+        # hits the Page root, diffing the ENTIRE app tree (every cached tab's
+        # controls, e.g. GSM Parser's ~1000+ rows) on every click INSIDE a
+        # dialog — confirmed live via py-spy: clicking Save in a dialog stuck
+        # the main thread for seconds inside Flet's object_patch comparison.
+        # Marking the dialog itself isolated makes it the stopping point
+        # instead, scoping the diff to just the dialog's own small subtree.
+        with suppress(Exception):
+            dialog._isolated = True
         return original_show_dialog(dialog)
 
     page.show_dialog = _patched_show_dialog
 
 
 def main(page: ft.Page):
+    # Must run before any view computes its own cache path (they all read
+    # FLET_APP_STORAGE_DATA as their first choice) — primes it from wherever
+    # the user last moved their local storage to (see app_storage.py).
+    with suppress(Exception):
+        app_storage.apply_storage_dir_override()
+
     runtime_id = str(uuid.uuid4())[:8]
     try:
         page._runtime_id = runtime_id
     except Exception:
         pass
+
+    # Cap the event loop's default executor — every `await asyncio.to_thread(
+    # self.db.xxx, ...)` call across views/*.py (the standard way this app
+    # touches Postgres from async code) borrows a worker thread from here.
+    # database.py's _pg()/_general_pg() cache ONE connection PER THREAD ID
+    # forever (see their docstrings), so with the unbounded default pool
+    # (min(32, cpu_count+4) — up to several dozen on a many-core machine),
+    # one single active user could accumulate that many permanent Postgres
+    # connections over a session just from ordinary background polling
+    # loops fanning out across different worker threads over time — this is
+    # exactly what one real user showed up as ~49 open connections during
+    # the 2026-08 investigation. Bounding the pool to a small, fixed size
+    # bounds that same number regardless of session length or how many
+    # background loops end up running concurrently.
+    #
+    # 8 workers made the app feel slower under real use — this app runs
+    # MANY independent background loops per open tab (sync timers, pulse
+    # checks, workspace-state flushes, etc.) that all borrow from this same
+    # shared pool; 8 was tight enough that legitimate concurrent work queued
+    # up waiting for a free thread. 16 keeps the same bound (vs. an
+    # unbounded ~32-40) while giving enough headroom that ordinary
+    # concurrent background work doesn't have to wait in line.
+    with suppress(Exception):
+        try:
+            _io_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _io_loop = asyncio.get_event_loop()
+        _io_loop.set_default_executor(
+            ThreadPoolExecutor(max_workers=16, thread_name_prefix="cm-io")
+        )
 
     # Every view in this app already calls .update() explicitly and
     # precisely on whatever control actually changed (hundreds of call
@@ -977,377 +1016,6 @@ def main(page: ft.Page):
 
             await asyncio.sleep(2.0)
 
-    def show_update_required_screen(min_required: str, download_url: str):
-        page.clean()
-        update_state = {"busy": False}
-        progress_bar = ft.ProgressBar(width=320, value=0, visible=False)
-        progress_text = ft.Text(
-            "", size=12, color=ft.Colors.BLUE_GREY_700, visible=False
-        )
-        status_text = ft.Text(
-            i18n.t(
-                "app.update.blocked_notice", "Без оновлення вхід у систему заблоковано."
-            ),
-            size=13,
-            color="grey700",
-            text_align=ft.TextAlign.CENTER,
-        )
-        download_button = ft.FilledButton(
-            i18n.t("app.update.download_button", "Скачати та встановити оновлення"),
-            icon=ft.Icons.DOWNLOAD,
-        )
-
-        def _normalize_url(raw_url: str) -> str:
-            url = (raw_url or "").strip()
-            if not url:
-                return ""
-            try:
-                parsed = urlparse(url)
-                if parsed.scheme not in {"http", "https"}:
-                    url = f"https://{url}"
-            except Exception:
-                logger.exception("Failed to normalize update URL")
-            return url
-
-        def _format_bytes(num: int) -> str:
-            if num < 1024:
-                return f"{num} B"
-            if num < 1024 * 1024:
-                return f"{num / 1024:.1f} KB"
-            if num < 1024 * 1024 * 1024:
-                return f"{num / (1024 * 1024):.1f} MB"
-            return f"{num / (1024 * 1024 * 1024):.1f} GB"
-
-        async def _resolve_download_url(
-            client: httpx.AsyncClient, raw_url: str, min_required_version: str
-        ) -> str:
-            """Accept GitHub release tag URLs and convert them to direct asset URLs."""
-            normalized = _normalize_url(raw_url)
-            if not normalized:
-                return normalized
-
-            try:
-                parsed = urlparse(normalized)
-                host = (parsed.netloc or "").lower()
-                path_parts = [p for p in (parsed.path or "").split("/") if p]
-                if host not in {"github.com", "www.github.com"}:
-                    return normalized
-
-                # Expected: /<owner>/<repo>/releases/tag/<tag>
-                if (
-                    len(path_parts) >= 5
-                    and path_parts[2] == "releases"
-                    and path_parts[3] == "tag"
-                ):
-                    owner = path_parts[0]
-                    repo = path_parts[1]
-                    tag = path_parts[4]
-                    guessed_version = (
-                        min_required_version or ""
-                    ).strip() or tag.lstrip("v")
-                    candidates = [
-                        f"https://github.com/{owner}/{repo}/releases/download/{tag}/CatManPro-Setup-{guessed_version}.exe",
-                        f"https://github.com/{owner}/{repo}/releases/download/{tag}/CatManPro-Setup.exe",
-                        f"https://github.com/{owner}/{repo}/releases/download/{tag}/CatManPro.exe",
-                    ]
-
-                    for candidate in candidates:
-                        with suppress(Exception):
-                            head = await client.head(candidate)
-                            if int(getattr(head, "status_code", 0)) < 400:
-                                return candidate
-
-                    # Return the most likely direct URL so stream() gets the actual error.
-                    return candidates[0]
-            except Exception:
-                logger.exception("Failed to resolve GitHub release URL")
-
-            return normalized
-
-        def _start_installer_and_exit(installer_path: str) -> None:
-            # Visible installer gives user progress/UAC and avoids hidden silent hangs.
-            subprocess.Popen(
-                [
-                    installer_path,
-                    "/SP-",
-                    "/NORESTART",
-                    "/CLOSEAPPLICATIONS",
-                    "/FORCECLOSEAPPLICATIONS",
-                ],
-                close_fds=True,
-            )
-            # os._exit(0) alone used to leave the old window visibly open:
-            # Flet's desktop shell (flet.exe) is a genuine CHILD process
-            # (plain subprocess.Popen in flet_desktop, no detach flags) of
-            # THIS process, but os._exit() deliberately skips all Python
-            # cleanup/atexit handling — whatever normally tells that child
-            # to close along with a graceful exit never runs. taskkill /T
-            # against our own PID walks the real, currently-accurate
-            # parent/child relationship and takes the whole tree down
-            # (including flet.exe) before we self-exit as a fast fallback.
-            with suppress(Exception):
-                subprocess.Popen(
-                    ["taskkill", "/PID", str(os.getpid()), "/F", "/T"],
-                    close_fds=True,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-            # Important: free locks immediately so setup can replace files and relaunch cleanly.
-            os._exit(0)
-
-        async def _download_and_install(url: str) -> None:
-            update_state["busy"] = True
-            download_button.disabled = True
-            progress_bar.visible = True
-            progress_text.visible = True
-            progress_bar.value = 0
-            status_text.value = i18n.t(
-                "app.update.preparing", "Підготовка до завантаження..."
-            )
-            page.update()
-
-            try:
-                target_dir = os.path.join(tempfile.gettempdir(), "CatManProUpdate")
-                os.makedirs(target_dir, exist_ok=True)
-                installer_path = os.path.join(target_dir, "CatManPro-Setup-latest.exe")
-
-                timeout = httpx.Timeout(connect=20.0, read=None, write=None, pool=None)
-                async with httpx.AsyncClient(
-                    follow_redirects=True, timeout=timeout
-                ) as client:
-                    status_text.value = i18n.t(
-                        "app.update.searching", "Пошук файлу оновлення..."
-                    )
-                    page.update()
-
-                    resolved_url = await _resolve_download_url(
-                        client, url, min_required
-                    )
-
-                    async with client.stream("GET", resolved_url) as resp:
-                        resp.raise_for_status()
-
-                        content_type = (resp.headers.get("content-type") or "").lower()
-                        final_url = str(resp.url)
-                        if "text/html" in content_type:
-                            raise RuntimeError(
-                                i18n.t(
-                                    "app.update.err_not_direct_url",
-                                    "URL оновлення не є прямим посиланням на .exe. Вкажіть прямий asset URL з GitHub Releases.",
-                                )
-                            )
-
-                        total_bytes = 0
-                        try:
-                            total_bytes = int(resp.headers.get("content-length") or "0")
-                        except Exception:
-                            total_bytes = 0
-
-                        downloaded = 0
-                        last_ui_update = 0.0
-                        status_text.value = i18n.t(
-                            "app.update.downloading", "Завантаження оновлення..."
-                        )
-                        if total_bytes <= 0:
-                            progress_bar.value = None
-
-                        with open(installer_path, "wb") as f:
-                            async for chunk in resp.aiter_bytes(chunk_size=1024 * 128):
-                                if not chunk:
-                                    continue
-                                f.write(chunk)
-                                downloaded += len(chunk)
-
-                                now = time.monotonic()
-                                if now - last_ui_update >= 0.12:
-                                    if total_bytes > 0:
-                                        ratio = max(
-                                            0.0, min(1.0, downloaded / total_bytes)
-                                        )
-                                        progress_bar.value = ratio
-                                        progress_text.value = f"{int(ratio * 100)}% ({_format_bytes(downloaded)} / {_format_bytes(total_bytes)})"
-                                    else:
-                                        progress_text.value = i18n.t(
-                                            "app.update.downloaded_amount",
-                                            "Завантажено: {amount}",
-                                        ).format(amount=_format_bytes(downloaded))
-                                    page.update()
-                                    last_ui_update = now
-
-                        if total_bytes > 0:
-                            progress_bar.value = 1.0
-                            progress_text.value = f"100% ({_format_bytes(downloaded)} / {_format_bytes(total_bytes)})"
-                        else:
-                            progress_text.value = i18n.t(
-                                "app.update.downloaded_amount", "Завантажено: {amount}"
-                            ).format(amount=_format_bytes(downloaded))
-
-                        if downloaded < 1024 * 300:
-                            raise RuntimeError(
-                                i18n.t(
-                                    "app.update.err_file_too_small",
-                                    "Файл оновлення занадто малий. Перевірте, що посилання веде прямо на .exe інсталятор.",
-                                )
-                            )
-
-                        if (not final_url.lower().endswith(".exe")) and (
-                            "application/octet-stream" not in content_type
-                        ):
-                            logger.warning(
-                                "Update file may be non-executable | final_url=%s | content_type=%s",
-                                final_url,
-                                content_type,
-                            )
-
-                status_text.value = i18n.t(
-                    "app.update.installing", "Запуск установки..."
-                )
-                progress_text.value = i18n.t(
-                    "app.update.installer_launched",
-                    "Інсталятор запущено. Підтвердіть UAC і дочекайтесь завершення.",
-                )
-                page.update()
-                await asyncio.sleep(0.35)
-
-                _start_installer_and_exit(installer_path)
-            except httpx.HTTPStatusError as exc:
-                logger.exception("Update download/install failed with HTTP error")
-                status = getattr(getattr(exc, "response", None), "status_code", None)
-                req_url = str(getattr(getattr(exc, "request", None), "url", "") or "")
-                if status == 404 and "github.com" in req_url.lower():
-                    message = i18n.t(
-                        "app.update.err_github_404",
-                        "GitHub повернув 404. Ймовірно, посилання не на asset .exe "
-                        "або репозиторій приватний. Для автооновлення потрібен публічний "
-                        "прямий URL на інсталятор.",
-                    )
-                else:
-                    message = i18n.t(
-                        "app.update.err_http", "HTTP помилка {status}: {exc}"
-                    ).format(status=status or "?", exc=exc)
-
-                status_text.value = i18n.t(
-                    "app.update.err_install_failed", "Не вдалося встановити оновлення"
-                )
-                progress_text.value = message
-                page.snack_bar = ft.SnackBar(
-                    ft.Text(message),
-                    bgcolor=ft.Colors.RED_700,
-                    duration=4200,
-                )
-                page.snack_bar.open = True
-                page.update()
-                update_state["busy"] = False
-                download_button.disabled = False
-            except Exception as exc:
-                logger.exception("Update download/install failed")
-                status_text.value = i18n.t(
-                    "app.update.err_install_failed", "Не вдалося встановити оновлення"
-                )
-                progress_text.value = str(exc)
-                page.snack_bar = ft.SnackBar(
-                    ft.Text(
-                        i18n.t(
-                            "app.update.err_generic", "Помилка оновлення: {exc}"
-                        ).format(exc=exc)
-                    ),
-                    bgcolor=ft.Colors.RED_700,
-                    duration=3500,
-                )
-                page.snack_bar.open = True
-                page.update()
-                update_state["busy"] = False
-                download_button.disabled = False
-
-        async def open_download(_):
-            if update_state["busy"]:
-                return
-
-            url = _normalize_url(download_url)
-            if not url:
-                page.snack_bar = ft.SnackBar(
-                    ft.Text(
-                        i18n.t(
-                            "app.update.err_no_link", "Посилання на оновлення відсутнє"
-                        )
-                    ),
-                    bgcolor=ft.Colors.RED_700,
-                    duration=1800,
-                )
-                page.snack_bar.open = True
-                page.update()
-                return
-
-            if page.platform.is_mobile():
-                # The desktop flow below downloads the file itself and then
-                # subprocess.Popen()'s the Inno Setup installer with silent-
-                # install flags — none of that exists on Android. Handing the
-                # .apk URL to the OS instead lets it download and prompt its
-                # own "Install this app?" dialog, which is the only install
-                # path available on the platform anyway.
-                with suppress(Exception):
-                    await page.launch_url(url)
-                return
-
-            page.run_task(_download_and_install, url)
-
-        download_button.on_click = open_download
-
-        page.add(
-            ft.Container(
-                expand=True,
-                content=ft.Column(
-                    [
-                        ft.Card(
-                            ft.Container(
-                                width=560,
-                                padding=20,
-                                content=ft.Column(
-                                    [
-                                        ft.Icon(
-                                            ft.Icons.SYSTEM_UPDATE_ALT,
-                                            size=42,
-                                            color=ft.Colors.BLUE_700,
-                                        ),
-                                        ft.Text(
-                                            i18n.t(
-                                                "app.update.title",
-                                                "Потрібне оновлення застосунку",
-                                            ),
-                                            size=24,
-                                            weight="bold",
-                                        ),
-                                        ft.Text(
-                                            i18n.t(
-                                                "app.update.version_info",
-                                                "Поточна версія: {current}\nМінімально допустима: {required}",
-                                            ).format(
-                                                current=Config.APP_VERSION,
-                                                required=min_required,
-                                            ),
-                                            size=14,
-                                            text_align=ft.TextAlign.CENTER,
-                                        ),
-                                        status_text,
-                                        progress_bar,
-                                        progress_text,
-                                        ft.Row(
-                                            [download_button],
-                                            alignment=ft.MainAxisAlignment.CENTER,
-                                        ),
-                                    ],
-                                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                                    spacing=14,
-                                ),
-                            )
-                        )
-                    ],
-                    alignment=ft.MainAxisAlignment.CENTER,
-                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                ),
-            )
-        )
-        page.update()
-
     _login_transition_busy = {"value": False}
     _session_state = {
         "authenticated": False,
@@ -1646,23 +1314,21 @@ def main(page: ft.Page):
                         page.run_task(_stabilize_window_size)
                     except Exception:
                         pass
-                    # Start GSM parser local scheduler for SA
-                    try:
-                        import gsm_scheduler
-
-                        _sched_db = DataManager()
-
-                        def _get_sched_cfg() -> dict:
-                            with suppress(Exception):
-                                sched = _sched_db.get_gsm_parser_schedule()
-                                svc = _sched_db.get_parser_service_config()
-                                return {**sched, **svc}
-                            return {}
-
-                        gsm_scheduler.start(_get_sched_cfg)
-                        logger.info("[Scheduler] GSM parser scheduler started")
-                    except Exception:
-                        logger.exception("[Scheduler] Failed to start GSM scheduler")
+                    # GSM parser scheduling runs EXCLUSIVELY on the VPS now
+                    # (gsm_parser_scheduler.py --daemon, systemd-managed) —
+                    # it works whether or not any desktop app is even open,
+                    # which is the entire point of hosting it on a VPS. This
+                    # used to also start a redundant LOCAL scheduler
+                    # (gsm_scheduler.py) here that duplicated the VPS
+                    # daemon's own run_times check, but compared the SAME
+                    # UTC-intended time strings against the desktop's LOCAL
+                    # clock instead of UTC — a confirmed live bug where it
+                    # fired 3 hours off from the VPS's correctly-scheduled
+                    # run, then crashed trying to run the parser locally
+                    # (GSM_Parser/ isn't bundled into the installed build).
+                    # Removed entirely rather than fixed: two independent
+                    # schedulers racing to run the same job is the same class
+                    # of bug already fixed once for Telegram notifications.
                     return
 
                 if _is_admin_role(user_data.get("role")):
@@ -1729,30 +1395,21 @@ def main(page: ft.Page):
         page.run_task(_login_flow)
 
     async def _check_app_update_policy():
-        # Runs AFTER the login screen is already on screen. This used to be
-        # a synchronous DataManager().get_app_update_policy() call sitting
+        # Runs AFTER the login screen is already on screen — used to be a
+        # synchronous DataManager().get_app_update_policy() call sitting
         # right before show_login_screen(), i.e. a full Postgres round trip
         # (connect + schema check + query) that blocked the very first paint
         # — exactly the "довгий чорний екран" symptom. The version gate only
-        # needs to block LOGIN, not the initial render, so it now runs in the
+        # needs to block LOGIN, not the initial render, so it runs in the
         # background and swaps in the update screen if/when it resolves.
-        try:
-            policy = await asyncio.to_thread(
-                lambda: DataManager().get_app_update_policy()
-            )
-            min_required = (policy.get("min_required") or "").strip()
-            if page.platform.is_mobile():
-                download_url = (policy.get("download_url_android") or "").strip() or (
-                    policy.get("download_url") or ""
-                ).strip()
-            else:
-                download_url = (policy.get("download_url") or "").strip() or (
-                    Config.UPDATE_DOWNLOAD_URL or ""
-                ).strip()
-            if min_required and _version_is_outdated(Config.APP_VERSION, min_required):
-                show_update_required_screen(min_required, download_url)
-        except Exception:
-            logger.exception("Failed to check app update policy")
+        # See app_updater.py for the actual check/download/install logic —
+        # shared with calculator_app.py / gsm_parser_app.py / superadmin_app.py.
+        await app_updater.check_and_maybe_block(
+            page,
+            app_version=Config.APP_VERSION,
+            get_policy_fn=DataManager().get_app_update_policy,
+            exe_basename="CatManPro",
+        )
 
     try:
         show_login_screen(reason="app_boot")
@@ -1790,6 +1447,20 @@ if __name__ == "__main__":
             sys.executable,
             os.getcwd(),
         )
+        # App-wide perf fix: Flet's default auto-update walks up to the
+        # nearest isolated ancestor (in practice always the Page) after
+        # EVERY event and diffs its entire current control tree against the
+        # previous one — on tabs holding hundreds of live rows (e.g. GSM
+        # Parser's device table), that full-tree diff alone measured 90+
+        # seconds for a single click, confirmed live via py-spy (stuck
+        # inside flet/controls/object_patch.py's _compare_dataclasses/
+        # _compare_lists, not in any of our own code). The app already calls
+        # .update() explicitly and precisely wherever it changes UI state
+        # (grep the codebase — this pattern is everywhere), so disabling
+        # Flet's automatic fallback and relying entirely on those explicit,
+        # narrowly-scoped calls removes this class of freeze everywhere,
+        # not just GSM Parser.
+        ft.context.disable_auto_update()
         ft.run(main)
     finally:
         # Never leave an orphaned local Postgres process running on a

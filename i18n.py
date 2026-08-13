@@ -124,12 +124,6 @@ _HELP_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "5. «运行»启动解析器（完整/仅GSM/仅E-Katalog）。",
         "DE": "5. «Starten» startet den Parser (vollständig / nur GSM / nur E-Katalog).",
     },
-    "gsm.help.step6": {
-        "EN": "6. «Schedule launch…» in the same menu — runs the parser after a delay instead of immediately (the app must stay open).",
-        "PL": "6. «Zaplanuj uruchomienie…» w tym samym menu — uruchamia parser po opóźnieniu zamiast od razu (aplikacja musi pozostać otwarta).",
-        "ZH": "6. 同一菜单中的«计划启动…»——延迟运行解析器而不是立即运行（应用程序必须保持打开）。",
-        "DE": "6. «Start planen…» im selben Menü — startet den Parser verzögert statt sofort (die App muss geöffnet bleiben).",
-    },
     "gsm.variants_help.step1": {
         "EN": "1. Add rows for each regional Xiaomi model variant (region code + model suffix).",
         "PL": "1. Dodaj wiersze dla każdego regionalnego wariantu modelu Xiaomi (kod regionu + sufiks modelu).",
@@ -2461,24 +2455,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "返回登录时出错：{exc}",
         "DE": "Fehler beim Zurückkehren zur Anmeldung: {exc}",
     },
-    "app.offline.reconnected": {
-        "EN": "Connection restored",
-        "PL": "Połączenie przywrócone",
-        "ZH": "连接已恢复",
-        "DE": "Verbindung wiederhergestellt",
-    },
-    "app.offline.title": {
-        "EN": "No network connection",
-        "PL": "Brak połączenia z siecią",
-        "ZH": "无网络连接",
-        "DE": "Keine Netzwerkverbindung",
-    },
-    "app.parser_bar.running": {
-        "EN": "Parsing...",
-        "PL": "Parsowanie...",
-        "ZH": "解析中...",
-        "DE": "Wird geparst...",
-    },
     "app.update.blocked_notice": {
         "EN": "Login is blocked without the update.",
         "PL": "Logowanie jest zablokowane bez aktualizacji.",
@@ -2490,12 +2466,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Pobierz i zainstaluj aktualizację",
         "ZH": "下载并安装更新",
         "DE": "Update herunterladen und installieren",
-    },
-    "app.update.downloaded_amount": {
-        "EN": "Downloaded: {amount}",
-        "PL": "Pobrano: {amount}",
-        "ZH": "已下载：{amount}",
-        "DE": "Heruntergeladen: {amount}",
     },
     "app.update.downloading": {
         "EN": "Downloading update...",
@@ -2509,23 +2479,11 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "更新错误：{exc}",
         "DE": "Update-Fehler: {exc}",
     },
-    "app.update.err_http": {
-        "EN": "HTTP error {status}: {exc}",
-        "PL": "Błąd HTTP {status}: {exc}",
-        "ZH": "HTTP 错误 {status}：{exc}",
-        "DE": "HTTP-Fehler {status}: {exc}",
-    },
     "app.update.err_install_failed": {
         "EN": "Failed to install update",
         "PL": "Nie udało się zainstalować aktualizacji",
         "ZH": "更新安装失败",
         "DE": "Update konnte nicht installiert werden",
-    },
-    "app.update.err_no_link": {
-        "EN": "Update link is missing",
-        "PL": "Brak linku do aktualizacji",
-        "ZH": "缺少更新链接",
-        "DE": "Update-Link fehlt",
     },
     "app.update.installing": {
         "EN": "Starting installation...",
@@ -2642,12 +2600,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "清除已保存的账户",
         "DE": "Gespeicherte Konten löschen",
     },
-    "auth.login.default_user": {
-        "EN": "User",
-        "PL": "Użytkownik",
-        "ZH": "用户",
-        "DE": "Benutzer",
-    },
     "auth.login.err_check_fields": {
         "EN": "Please check the empty fields",
         "PL": "Sprawdź niezapełnione pola",
@@ -2696,12 +2648,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "请先输入公司名称",
         "DE": "Zuerst Firmenname eingeben",
     },
-    "auth.register.failed": {
-        "EN": "Registration error",
-        "PL": "Błąd rejestracji",
-        "ZH": "注册错误",
-        "DE": "Registrierungsfehler",
-    },
     "auth.register.go_login": {
         "EN": "Already have an account? Log in",
         "PL": "Masz już konto? Zaloguj się",
@@ -2738,12 +2684,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "适用于单个用户。您既是管理员也是用户——所有设置均由您自行配置。",
         "DE": "Für einen einzelnen Benutzer. Sie sind gleichzeitig Administrator und Benutzer — alle Einstellungen nehmen Sie selbst vor.",
     },
-    "auth.register.no_regions": {
-        "EN": "The company has no regions yet",
-        "PL": "Firma nie ma jeszcze regionów",
-        "ZH": "该公司尚无地区",
-        "DE": "Das Unternehmen hat noch keine Regionen",
-    },
     "auth.register.password_label": {
         "EN": "Password (4–8 characters)",
         "PL": "Hasło (4–8 znaków)",
@@ -2755,12 +2695,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Profil",
         "ZH": "个人资料",
         "DE": "Profil",
-    },
-    "auth.register.region_fallback": {
-        "EN": "Region",
-        "PL": "Region",
-        "ZH": "地区",
-        "DE": "Region",
     },
     "auth.register.regions_hint": {
         "EN": "Select access regions (multiple allowed)",
@@ -2823,12 +2757,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "品牌已删除",
         "DE": "Marke gelöscht",
     },
-    "categories.brand_saved": {
-        "EN": "Brand saved",
-        "PL": "Marka zapisana",
-        "ZH": "品牌已保存",
-        "DE": "Marke gespeichert",
-    },
     "categories.category_deleted": {
         "EN": "Category deleted",
         "PL": "Kategoria usunięta",
@@ -2853,71 +2781,17 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "类别",
         "DE": "Kategorie",
     },
-    "categories.dlg.series": {
-        "EN": "Series",
-        "PL": "Seria",
-        "ZH": "系列",
-        "DE": "Serie",
-    },
-    "categories.dlg.subcategory": {
-        "EN": "Subcategory",
-        "PL": "Podkategoria",
-        "ZH": "子类别",
-        "DE": "Unterkategorie",
-    },
     "categories.empty_state": {
         "EN": "No categories available in the selected context",
         "PL": "Brak dostępnych kategorii w wybranym kontekście",
         "ZH": "所选上下文中没有可用类别",
         "DE": "Keine Kategorien im gewählten Kontext verfügbar",
     },
-    "categories.err.enter_name": {
-        "EN": "Enter a name",
-        "PL": "Wprowadź nazwę",
-        "ZH": "请输入名称",
-        "DE": "Name eingeben",
-    },
-    "categories.err.save": {
-        "EN": "Failed to save",
-        "PL": "Nie udało się zapisać",
-        "ZH": "保存失败",
-        "DE": "Speichern fehlgeschlagen",
-    },
-    "categories.err.save_brand": {
-        "EN": "Error saving brand",
-        "PL": "Błąd zapisu marki",
-        "ZH": "保存品牌出错",
-        "DE": "Fehler beim Speichern der Marke",
-    },
-    "categories.err.save_category": {
-        "EN": "Error saving category",
-        "PL": "Błąd zapisu kategorii",
-        "ZH": "保存类别出错",
-        "DE": "Fehler beim Speichern der Kategorie",
-    },
-    "categories.field.brand_name": {
-        "EN": "Brand name",
-        "PL": "Nazwa marki",
-        "ZH": "品牌名称",
-        "DE": "Markenname",
-    },
     "categories.field.category_name": {
         "EN": "Category name",
         "PL": "Nazwa kategorii",
         "ZH": "类别名称",
         "DE": "Kategoriename",
-    },
-    "categories.field.series_name": {
-        "EN": "Series name",
-        "PL": "Nazwa serii",
-        "ZH": "系列名称",
-        "DE": "Serienname",
-    },
-    "categories.field.subcategory_name": {
-        "EN": "Subcategory name",
-        "PL": "Nazwa podkategorii",
-        "ZH": "子类别名称",
-        "DE": "Name der Unterkategorie",
     },
     "categories.field.target_margin": {
         "EN": "Target margin (%)",
@@ -2956,17 +2830,17 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "DE": "Kategorien",
     },
     # в”Ђв”Ђ common в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
-    "common.add": {
-        "EN": "Add",
-        "PL": "Dodaj",
-        "ZH": "添加",
-        "DE": "Hinzufügen",
-    },
     "common.all": {
         "EN": "All",
         "PL": "Wszystkie",
         "ZH": "全部",
         "DE": "Alle",
+    },
+    "common.back": {
+        "EN": "Back",
+        "PL": "Wstecz",
+        "ZH": "返回",
+        "DE": "Zurück",
     },
     "common.cancel": {
         "EN": "Cancel",
@@ -3022,12 +2896,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "此操作无法撤销。",
         "DE": "Diese Aktion kann nicht rückgängig gemacht werden.",
     },
-    "common.no": {
-        "EN": "No",
-        "PL": "Nie",
-        "ZH": "否",
-        "DE": "Nein",
-    },
     "common.reset": {
         "EN": "Reset",
         "PL": "Resetuj",
@@ -3040,132 +2908,18 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "保存",
         "DE": "Speichern",
     },
-    "common.yes": {
-        "EN": "Yes",
-        "PL": "Tak",
-        "ZH": "是",
-        "DE": "Ja",
-    },
     # в”Ђв”Ђ copy в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
-    "copy.access_denied": {
-        "EN": "Only Admin or SuperAdmin has access to the copy tab",
-        "PL": "Dostęp do zakładki kopiowania ma tylko Admin lub SuperAdmin",
-        "ZH": "只有管理员或超级管理员才能访问复制选项卡",
-        "DE": "Nur Admin oder SuperAdmin hat Zugriff auf den Kopier-Tab",
-    },
-    "copy.category_copy_done": {
-        "EN": "Category copy complete",
-        "PL": "Kopiowanie kategorii zakończone",
-        "ZH": "类别复制完成",
-        "DE": "Kategoriekopie abgeschlossen",
-    },
-    "copy.clear_all": {
-        "EN": "Clear",
-        "PL": "Wyczyść",
-        "ZH": "清除",
-        "DE": "Löschen",
-    },
-    "copy.copy_category_btn": {
-        "EN": "Copy category",
-        "PL": "Kopiuj kategorię",
-        "ZH": "复制类别",
-        "DE": "Kategorie kopieren",
-    },
-    "copy.copy_with_edits": {
-        "EN": "Copy with edits",
-        "PL": "Kopiuj ze zmianami",
-        "ZH": "带编辑复制",
-        "DE": "Mit Änderungen kopieren",
-    },
-    "copy.from_label": {
-        "EN": "From",
-        "PL": "Skąd",
-        "ZH": "来源",
-        "DE": "Von",
-    },
-    "copy.help.title": {
-        "EN": "Help — Copy",
-        "PL": "Pomoc — Kopiowanie",
-        "ZH": "帮助 — 复制",
-        "DE": "Hilfe — Kopieren",
-    },
-    "copy.mode.full": {
-        "EN": "Copy completely",
-        "PL": "Kopiuj w całości",
-        "ZH": "完整复制",
-        "DE": "Vollständig kopieren",
-    },
-    "copy.mode.partial": {
-        "EN": "Copy partially",
-        "PL": "Kopiuj częściowo",
-        "ZH": "部分复制",
-        "DE": "Teilweise kopieren",
-    },
     "copy.need_regions": {
         "EN": "At least 1 region in the company is required for copying",
         "PL": "Do kopiowania potrzebny jest co najmniej 1 region w firmie",
         "ZH": "复制需要公司中至少1个地区",
         "DE": "Zum Kopieren wird mindestens 1 Region im Unternehmen benötigt",
     },
-    "copy.need_users": {
-        "EN": "Users in the company are required for copying",
-        "PL": "Do kopiowania potrzebni są użytkownicy w firmie",
-        "ZH": "复制需要公司中有用户",
-        "DE": "Für das Kopieren werden Benutzer im Unternehmen benötigt",
-    },
-    "copy.no_items": {
-        "EN": "No items",
-        "PL": "Brak elementów",
-        "ZH": "没有项目",
-        "DE": "Keine Einträge",
-    },
-    "copy.open_categories_btn": {
-        "EN": "Open Categories",
-        "PL": "Otwórz Kategorie",
-        "ZH": "打开类别",
-        "DE": "Kategorien öffnen",
-    },
-    "copy.select_all": {
-        "EN": "All",
-        "PL": "Wszystko",
-        "ZH": "全部",
-        "DE": "Alle",
-    },
-    "copy.select_company_hint": {
-        "EN": "Select a specific company above. Copying between companies is not allowed.",
-        "PL": "Wybierz konkretną firmę powyżej. Kopiowanie między firmami jest zabronione.",
-        "ZH": "请在上方选择特定公司。不允许跨公司复制。",
-        "DE": "Oben ein bestimmtes Unternehmen auswählen. Kopieren zwischen Unternehmen ist nicht erlaubt.",
-    },
-    "copy.select_levels_hint": {
-        "EN": "Select what to transfer for each level:",
-        "PL": "Wybierz, co przenosimy na każdym poziomie:",
-        "ZH": "选择每个级别要转移的内容：",
-        "DE": "Auswählen, was für jede Ebene übertragen werden soll:",
-    },
-    "copy.select_source_dest": {
-        "EN": "Select source and destination",
-        "PL": "Wybierz źródło i cel",
-        "ZH": "选择来源和目标",
-        "DE": "Quelle und Ziel auswählen",
-    },
-    "copy.source_category_not_found": {
-        "EN": "Source category not found",
-        "PL": "Nie znaleziono kategorii-źródła",
-        "ZH": "找不到来源类别",
-        "DE": "Quellkategorie nicht gefunden",
-    },
     "copy.title": {
         "EN": "Copy",
         "PL": "Kopiowanie",
         "ZH": "复制",
         "DE": "Kopieren",
-    },
-    "copy.to_label": {
-        "EN": "Copy to",
-        "PL": "Kopiujemy do",
-        "ZH": "复制到",
-        "DE": "Kopieren nach",
     },
     # в”Ђв”Ђ cost_orders в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     "cost_orders.calculator": {
@@ -3174,29 +2928,11 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "计算器",
         "DE": "Rechner",
     },
-    "cost_orders.default_manager": {
-        "EN": "Manager",
-        "PL": "Menedżer",
-        "ZH": "经理",
-        "DE": "Manager",
-    },
     "cost_orders.err.table_settings": {
         "EN": "Table settings error",
         "PL": "Błąd ustawień tabeli",
         "ZH": "表格设置错误",
         "DE": "Fehler bei Tabelleneinstellungen",
-    },
-    "cost_orders.readonly_notice": {
-        "EN": "View mode — editing disabled",
-        "PL": "Tryb podglądu — edycja wyłączona",
-        "ZH": "查看模式 — 禁止编辑",
-        "DE": "Ansichtsmodus — Bearbeitung deaktiviert",
-    },
-    "cost_orders.sync.error_tip": {
-        "EN": "Workspace state could not be sent to DB. Click to retry.",
-        "PL": "Stan workspace nie mógł zostać przesłany do bazy danych. Kliknij, aby ponowić.",
-        "ZH": "工作区状态无法发送到数据库。点击重试。",
-        "DE": "Workspace-Status konnte nicht an die DB übertragen werden. Zum Wiederholen klicken.",
     },
     "cost_orders.sync.pending_tip": {
         "EN": "Workspace state saved locally and not yet sent to DB. Click to sync.",
@@ -3222,12 +2958,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Waluta magazynu zaktualizowana",
         "ZH": "仓库货币已更新",
         "DE": "Lagerwährung aktualisiert",
-    },
-    "cost_stock.help.title": {
-        "EN": "COGS Warehouse",
-        "PL": "KW Magazyn",
-        "ZH": "销货成本 仓库",
-        "DE": "EK Lager",
     },
     "cost_stock.order_cost_currency_updated": {
         "EN": "Order COGS currency updated",
@@ -3296,12 +3026,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "品牌和链接",
         "DE": "Marken und Links",
     },
-    "extensions.devices_tile": {
-        "EN": "Devices",
-        "PL": "Urządzenia",
-        "ZH": "设备",
-        "DE": "Geräte",
-    },
     "extensions.disable": {
         "EN": "Disable",
         "PL": "Wyłącz",
@@ -3314,42 +3038,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "启用",
         "DE": "Aktivieren",
     },
-    "extensions.err.logo_load": {
-        "EN": "Failed to load logo",
-        "PL": "Nie udało się załadować logo",
-        "ZH": "加载徽标失败",
-        "DE": "Logo konnte nicht geladen werden",
-    },
-    "extensions.err.save": {
-        "EN": "Save error",
-        "PL": "Błąd zapisu",
-        "ZH": "保存错误",
-        "DE": "Speicherfehler",
-    },
-    "extensions.err.save_brands": {
-        "EN": "Failed to save brands",
-        "PL": "Nie udało się zapisać marek",
-        "ZH": "保存品牌失败",
-        "DE": "Marken konnten nicht gespeichert werden",
-    },
-    "extensions.err.save_settings": {
-        "EN": "Failed to save settings",
-        "PL": "Nie udało się zapisać ustawień",
-        "ZH": "保存设置失败",
-        "DE": "Einstellungen konnten nicht gespeichert werden",
-    },
-    "extensions.err.state_update": {
-        "EN": "Failed to update state",
-        "PL": "Nie udało się zaktualizować stanu",
-        "ZH": "更新状态失败",
-        "DE": "Status konnte nicht aktualisiert werden",
-    },
-    "extensions.gsm_disabled": {
-        "EN": "GSM Parser is disabled for this company",
-        "PL": "GSM Parser jest wyłączony dla tej firmy",
-        "ZH": "此公司的GSM解析器已禁用",
-        "DE": "GSM Parser ist für dieses Unternehmen deaktiviert",
-    },
     "extensions.gsm_state_updated": {
         "EN": "GSM Parser state updated",
         "PL": "Stan GSM Parser zaktualizowany",
@@ -3361,18 +3049,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Pomoc — Rozszerzenia",
         "ZH": "帮助 — 扩展",
         "DE": "Hilfe — Erweiterungen",
-    },
-    "extensions.launch_subtitle": {
-        "EN": "Test run without schedule: full or separately GSM/E-Katalog.",
-        "PL": "Testowy uruchomienie bez harmonogramu: pełny lub oddzielnie GSM/E-Katalog.",
-        "ZH": "无计划测试运行：完整或分别运行GSM/E-Katalog。",
-        "DE": "Testlauf ohne Zeitplan: vollständig oder getrennt GSM/E-Katalog.",
-    },
-    "extensions.launch_title": {
-        "EN": "Launch",
-        "PL": "Uruchomienie",
-        "ZH": "启动",
-        "DE": "Start",
     },
     "extensions.logo_loaded": {
         "EN": "Logo loaded",
@@ -3398,29 +3074,11 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "打开",
         "DE": "Öffnen",
     },
-    "extensions.parser_settings_subtitle": {
-        "EN": "Base for future parser rebuild: brands, links, latest devices and anti-ban pauses.",
-        "PL": "Podstawa do przyszłej przebudowy parsera: marki, linki, najnowsze urządzenia i przerwy anty-ban.",
-        "ZH": "未来解析器重建的基础：品牌、链接、最新设备和防封禁暂停。",
-        "DE": "Grundlage für zukünftigen Parser-Umbau: Marken, Links, neueste Geräte und Anti-Ban-Pausen.",
-    },
-    "extensions.parser_settings_title": {
-        "EN": "Parse settings",
-        "PL": "Ustawienia parsowania",
-        "ZH": "解析设置",
-        "DE": "Parse-Einstellungen",
-    },
     "extensions.select_hint": {
         "EN": "Select an extension to configure.",
         "PL": "Wybierz rozszerzenie do konfiguracji.",
         "ZH": "选择要配置的扩展。",
         "DE": "Eine Erweiterung zur Konfiguration auswählen.",
-    },
-    "extensions.settings_saved": {
-        "EN": "GSM Parser settings saved",
-        "PL": "Ustawienia GSM Parser zapisane",
-        "ZH": "GSM解析器设置已保存",
-        "DE": "GSM-Parser-Einstellungen gespeichert",
     },
     "extensions.status_label": {
         "EN": "Status: ",
@@ -3463,12 +3121,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Rozszerzenia",
         "ZH": "扩展",
         "DE": "Erweiterungen",
-    },
-    "extensions.total_results": {
-        "EN": "Total results: {n}",
-        "PL": "Łączne wyniki: {n}",
-        "ZH": "总结果：{n}",
-        "DE": "Gesamtergebnisse: {n}",
     },
     # в”Ђв”Ђ files в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     "files.all_regions": {
@@ -3519,60 +3171,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "文件夹为空。",
         "DE": "Ordner ist leer.",
     },
-    "files.err.create_folder": {
-        "EN": "Error creating folder",
-        "PL": "Błąd tworzenia folderu",
-        "ZH": "创建文件夹错误",
-        "DE": "Fehler beim Erstellen des Ordners",
-    },
-    "files.err.delete": {
-        "EN": "Delete error",
-        "PL": "Błąd usuwania",
-        "ZH": "删除错误",
-        "DE": "Fehler beim Löschen",
-    },
-    "files.err.delete_file": {
-        "EN": "Error deleting file",
-        "PL": "Błąd usuwania pliku",
-        "ZH": "删除文件错误",
-        "DE": "Fehler beim Löschen der Datei",
-    },
-    "files.err.move": {
-        "EN": "Move error",
-        "PL": "Błąd przenoszenia",
-        "ZH": "移动错误",
-        "DE": "Fehler beim Verschieben",
-    },
-    "files.err.no_data": {
-        "EN": "Could not retrieve file",
-        "PL": "Nie udało się pobrać pliku",
-        "ZH": "无法获取文件",
-        "DE": "Datei konnte nicht abgerufen werden",
-    },
-    "files.err.no_other_folder": {
-        "EN": "No other folders to move to",
-        "PL": "Brak innych folderów do przeniesienia",
-        "ZH": "没有其他文件夹可移动到",
-        "DE": "Keine anderen Ordner zum Verschieben vorhanden",
-    },
-    "files.err.rename": {
-        "EN": "Rename error",
-        "PL": "Błąd zmiany nazwy",
-        "ZH": "重命名错误",
-        "DE": "Fehler beim Umbenennen",
-    },
-    "files.err.too_large": {
-        "EN": "File is too large (max. {sz})",
-        "PL": "Plik jest za duży (maks. {sz})",
-        "ZH": "文件太大（最大 {sz}）",
-        "DE": "Datei ist zu groß (max. {sz})",
-    },
-    "files.err.upload": {
-        "EN": "File upload error",
-        "PL": "Błąd przesyłania pliku",
-        "ZH": "文件上传错误",
-        "DE": "Fehler beim Hochladen der Datei",
-    },
     "files.folder_deleted": {
         "EN": "Folder deleted",
         "PL": "Folder usunięty",
@@ -3584,12 +3182,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Foldery",
         "ZH": "文件夹",
         "DE": "Ordner",
-    },
-    "files.help.title": {
-        "EN": "Help — Files",
-        "PL": "Pomoc — Pliki",
-        "ZH": "帮助 — 文件",
-        "DE": "Hilfe — Dateien",
     },
     "files.move_btn": {
         "EN": "Move",
@@ -3731,18 +3323,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "正在检查缓存…",
         "DE": "Cache wird geprüft…",
     },
-    "gsm.collapse_all_brands": {
-        "EN": "Collapse all brands",
-        "PL": "Zwiń wszystkie marki",
-        "ZH": "折叠所有品牌",
-        "DE": "Alle Marken einklappen",
-    },
-    "gsm.comment_saved": {
-        "EN": "Comment saved",
-        "PL": "Komentarz zapisany",
-        "ZH": "评论已保存",
-        "DE": "Kommentar gespeichert",
-    },
     "gsm.compare": {
         "EN": "Compare",
         "PL": "Porównaj",
@@ -3833,23 +3413,11 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "找到：{n} 台设备",
         "DE": "Gefunden: {n} Geräte",
     },
-    "gsm.help.title": {
-        "EN": "Help — GSM Parser",
-        "PL": "Pomoc — GSM Parser",
-        "ZH": "帮助 — GSM解析器",
-        "DE": "Hilfe — GSM-Parser",
-    },
     "gsm.loading_devices": {
         "EN": "Loading devices…",
         "PL": "Ładowanie urządzeń…",
         "ZH": "正在加载设备…",
         "DE": "Geräte werden geladen…",
-    },
-    "gsm.loading_wait": {
-        "EN": "Please wait, data is still loading…",
-        "PL": "Poczekaj, dane są jeszcze ładowane…",
-        "ZH": "请稍候，数据仍在加载…",
-        "DE": "Bitte warten, Daten werden noch geladen…",
     },
     "gsm.manual_ek_url_fetched": {
         "EN": "EK product loaded: {name}",
@@ -3899,12 +3467,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "下一页",
         "DE": "Nächste Seite",
     },
-    "gsm.no_data_90days": {
-        "EN": "No data for the last 90 days",
-        "PL": "Brak danych za ostatnie 90 dni",
-        "ZH": "过去90天没有数据",
-        "DE": "Keine Daten für die letzten 90 Tage",
-    },
     "gsm.no_devices_found": {
         "EN": "No devices found. Try changing filters or start parsing.",
         "PL": "Nie znaleziono urządzeń. Spróbuj zmienić filtry lub uruchom parsowanie.",
@@ -3916,12 +3478,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Nic nie znaleziono",
         "ZH": "未找到任何内容",
         "DE": "Nichts gefunden",
-    },
-    "gsm.nothing_selected": {
-        "EN": "Nothing selected",
-        "PL": "Nic nie zaznaczono",
-        "ZH": "未选择任何内容",
-        "DE": "Nichts ausgewählt",
     },
     "gsm.parser_running": {
         "EN": "Parsing…",
@@ -3953,18 +3509,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "上一页",
         "DE": "Vorherige Seite",
     },
-    "gsm.preset_saved": {
-        "EN": "Preset «{name}» saved",
-        "PL": "Preset «{name}» zapisany",
-        "ZH": "预设«{name}»已保存",
-        "DE": "Preset «{name}» gespeichert",
-    },
-    "gsm.presets_hint": {
-        "EN": "My Filters",
-        "PL": "Moje Filtry",
-        "ZH": "我的筛选器",
-        "DE": "Meine Filter",
-    },
     "gsm.record_deleted": {
         "EN": "Record deleted",
         "PL": "Rekord usunięty",
@@ -3976,168 +3520,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Zapisz filtr",
         "ZH": "保存筛选器",
         "DE": "Filter speichern",
-    },
-    "gsm.schedule.menu_item": {
-        "EN": "Schedule launch…",
-        "PL": "Zaplanuj uruchomienie…",
-        "ZH": "计划启动…",
-        "DE": "Start planen…",
-    },
-    "gsm.schedule.dialog_title": {
-        "EN": "Schedule parser launch",
-        "PL": "Zaplanuj uruchomienie parsera",
-        "ZH": "计划解析器启动",
-        "DE": "Parser-Start planen",
-    },
-    "gsm.schedule.mode_label": {
-        "EN": "Launch mode",
-        "PL": "Tryb uruchomienia",
-        "ZH": "启动模式",
-        "DE": "Startmodus",
-    },
-    "gsm.schedule.quick_label": {
-        "EN": "Quick pick:",
-        "PL": "Szybki wybór:",
-        "ZH": "快速选择：",
-        "DE": "Schnellauswahl:",
-    },
-    "gsm.schedule.quick_15m": {
-        "EN": "+15 min",
-        "PL": "+15 min",
-        "ZH": "+15分钟",
-        "DE": "+15 Min",
-    },
-    "gsm.schedule.quick_30m": {
-        "EN": "+30 min",
-        "PL": "+30 min",
-        "ZH": "+30分钟",
-        "DE": "+30 Min",
-    },
-    "gsm.schedule.quick_1h": {
-        "EN": "+1 h",
-        "PL": "+1 godz.",
-        "ZH": "+1小时",
-        "DE": "+1 Std",
-    },
-    "gsm.schedule.quick_2h": {
-        "EN": "+2 h",
-        "PL": "+2 godz.",
-        "ZH": "+2小时",
-        "DE": "+2 Std",
-    },
-    "gsm.schedule.quick_4h": {
-        "EN": "+4 h",
-        "PL": "+4 godz.",
-        "ZH": "+4小时",
-        "DE": "+4 Std",
-    },
-    "gsm.schedule.custom_label": {
-        "EN": "Or set a delay from now:",
-        "PL": "Lub ustaw opóźnienie od teraz:",
-        "ZH": "或设置从现在起的延迟：",
-        "DE": "Oder eine Verzögerung ab jetzt festlegen:",
-    },
-    "gsm.schedule.hours_label": {
-        "EN": "Hours",
-        "PL": "Godziny",
-        "ZH": "小时",
-        "DE": "Stunden",
-    },
-    "gsm.schedule.minutes_label": {
-        "EN": "Minutes",
-        "PL": "Minuty",
-        "ZH": "分钟",
-        "DE": "Minuten",
-    },
-    "gsm.schedule.confirm_btn": {
-        "EN": "Schedule",
-        "PL": "Zaplanuj",
-        "ZH": "计划",
-        "DE": "Planen",
-    },
-    "gsm.schedule.cancel_active_btn": {
-        "EN": "Cancel scheduled launch",
-        "PL": "Anuluj zaplanowane uruchomienie",
-        "ZH": "取消计划启动",
-        "DE": "Geplanten Start abbrechen",
-    },
-    "gsm.schedule.none_active": {
-        "EN": "No launch scheduled",
-        "PL": "Nic nie zaplanowano",
-        "ZH": "未计划启动",
-        "DE": "Kein Start geplant",
-    },
-    "gsm.schedule.active_status": {
-        "EN": "Scheduled for {time} (in {left})",
-        "PL": "Zaplanowano na {time} (za {left})",
-        "ZH": "计划于{time}（还有{left}）",
-        "DE": "Geplant für {time} (in {left})",
-    },
-    "gsm.schedule.scheduled_snack": {
-        "EN": "Launch scheduled in {left}",
-        "PL": "Uruchomienie zaplanowano za {left}",
-        "ZH": "已计划在{left}后启动",
-        "DE": "Start in {left} geplant",
-    },
-    "gsm.schedule.cancelled_snack": {
-        "EN": "Scheduled launch cancelled",
-        "PL": "Zaplanowane uruchomienie anulowano",
-        "ZH": "已取消计划启动",
-        "DE": "Geplanter Start abgebrochen",
-    },
-    "gsm.schedule.invalid_delay": {
-        "EN": "Set a time greater than zero",
-        "PL": "Ustaw czas większy niż zero",
-        "ZH": "请设置大于零的时间",
-        "DE": "Zeit größer als null festlegen",
-    },
-    "gsm.schedule.help_title": {
-        "EN": "Help — Scheduled launch",
-        "PL": "Pomoc — Zaplanowane uruchomienie",
-        "ZH": "帮助 — 计划启动",
-        "DE": "Hilfe — Geplanter Start",
-    },
-    "gsm.schedule.help.desc": {
-        "EN": "Lets you run the parser after a delay instead of immediately — useful when you're running it manually at night and want the changes to be recorded under tomorrow's date.",
-        "PL": "Pozwala uruchomić parser po opóźnieniu zamiast od razu — przydatne, gdy uruchamiasz go ręcznie w nocy i chcesz, aby zmiany zostały zapisane pod jutrzejszą datą.",
-        "ZH": "允许延迟运行解析器而不是立即运行——当您在夜间手动运行它并希望更改记录在明天的日期下时很有用。",
-        "DE": "Ermöglicht das verzögerte statt sofortige Starten des Parsers — nützlich, wenn Sie ihn nachts manuell starten und die Änderungen unter dem morgigen Datum erfasst werden sollen.",
-    },
-    "gsm.schedule.help.steps_title": {
-        "EN": "How to use",
-        "PL": "Jak korzystać",
-        "ZH": "使用方法",
-        "DE": "Anwendung",
-    },
-    "gsm.schedule.help.step1": {
-        "EN": "1. Choose the launch mode (full / GSM only / E-Katalog only).",
-        "PL": "1. Wybierz tryb uruchomienia (pełny / tylko GSM / tylko E-Katalog).",
-        "ZH": "1. 选择启动模式（完整/仅GSM/仅E-Katalog）。",
-        "DE": "1. Wählen Sie den Startmodus (vollständig / nur GSM / nur E-Katalog).",
-    },
-    "gsm.schedule.help.step2": {
-        "EN": "2. Click one of the quick-pick buttons, or set a delay from now in the «Hours» / «Minutes» fields (e.g. 1h 30m means «in 90 minutes», not «at 1:30»).",
-        "PL": "2. Kliknij jeden z przycisków szybkiego wyboru lub ustaw opóźnienie od teraz w polach «Godziny» / «Minuty» (np. 1 godz. 30 min oznacza «za 90 minut», a nie «o 1:30»).",
-        "ZH": "2. 点击其中一个快速选择按钮，或在«小时»/«分钟»字段中设置从现在起的延迟（例如1小时30分钟表示«90分钟后»，而不是«在1:30»）。",
-        "DE": "2. Klicken Sie auf eine der Schnellauswahl-Schaltflächen oder legen Sie eine Verzögerung ab jetzt in den Feldern «Stunden» / «Minuten» fest (z. B. bedeutet 1 Std. 30 Min. «in 90 Minuten», nicht «um 1:30»).",
-    },
-    "gsm.schedule.help.step3": {
-        "EN": "3. Click «Schedule» — a countdown will appear next to the «Run» button.",
-        "PL": "3. Kliknij «Zaplanuj» — obok przycisku «Uruchom» pojawi się odliczanie.",
-        "ZH": "3. 点击«计划»——«运行»按钮旁会出现倒计时。",
-        "DE": "3. Klicken Sie auf «Planen» — neben der Schaltfläche «Starten» erscheint ein Countdown.",
-    },
-    "gsm.schedule.help.step4": {
-        "EN": "4. The app must stay open — the launch happens automatically once the set time arrives.",
-        "PL": "4. Aplikacja musi pozostać otwarta — uruchomienie nastąpi automatycznie, gdy nadejdzie ustawiony czas.",
-        "ZH": "4. 应用程序必须保持打开——设定时间到达后将自动启动。",
-        "DE": "4. Die App muss geöffnet bleiben — der Start erfolgt automatisch, sobald die eingestellte Zeit erreicht ist.",
-    },
-    "gsm.schedule.help.step5": {
-        "EN": "5. «Cancel scheduled launch» removes the timer without running the parser.",
-        "PL": "5. «Anuluj zaplanowane uruchomienie» usuwa licznik czasu bez uruchamiania parsera.",
-        "ZH": "5. «取消计划启动»会移除计时器而不运行解析器。",
-        "DE": "5. «Geplanten Start abbrechen» entfernt den Timer, ohne den Parser zu starten.",
     },
     "gsm.search_hint": {
         "EN": "Search by brand or model…",
@@ -4285,18 +3667,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "从Excel上传",
         "DE": "Aus Excel hochladen",
     },
-    "languages.no_unsaved_changes": {
-        "EN": "No unsaved changes",
-        "PL": "Brak niezapisanych zmian",
-        "ZH": "没有未保存的更改",
-        "DE": "Keine ungespeicherten Änderungen",
-    },
-    "languages.paste_dialog_title": {
-        "EN": "Paste from clipboard — {code}",
-        "PL": "Wklej ze schowka — {code}",
-        "ZH": "从剪贴板粘贴 — {code}",
-        "DE": "Aus Zwischenablage einfügen — {code}",
-    },
     "languages.translations_saved": {
         "EN": "Translations saved.",
         "PL": "Tłumaczenia zapisane.",
@@ -4328,18 +3698,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "发布日期",
         "DE": "Veröffentlichungsdaten",
     },
-    "media.copied": {
-        "EN": "Copied",
-        "PL": "Skopiowano",
-        "ZH": "已复制",
-        "DE": "Kopiert",
-    },
-    "media.create_btn": {
-        "EN": "Create",
-        "PL": "Utwórz",
-        "ZH": "创建",
-        "DE": "Erstellen",
-    },
     "media.day.0": {"EN": "Mon", "PL": "Pon", "ZH": "周一", "DE": "Mo"},
     "media.day.1": {"EN": "Tue", "PL": "Wt", "ZH": "周二", "DE": "Di"},
     "media.day.2": {"EN": "Wed", "PL": "Śr", "ZH": "周三", "DE": "Mi"},
@@ -4347,53 +3705,11 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
     "media.day.4": {"EN": "Fri", "PL": "Pt", "ZH": "周五", "DE": "Fr"},
     "media.day.5": {"EN": "Sat", "PL": "Sob", "ZH": "周六", "DE": "Sa"},
     "media.day.6": {"EN": "Sun", "PL": "Nd", "ZH": "周日", "DE": "So"},
-    "media.dlg.col_width_height": {
-        "EN": "Column / Width / Height",
-        "PL": "Kolumna / Szerokość / Wysokość",
-        "ZH": "列 / 宽度 / 高度",
-        "DE": "Spalte / Breite / Höhe",
-    },
-    "media.dlg.cols_months": {
-        "EN": "Columns and months",
-        "PL": "Kolumny i miesiące",
-        "ZH": "列和月份",
-        "DE": "Spalten und Monate",
-    },
     "media.dlg.custom_name": {
         "EN": "Custom name",
         "PL": "Własna nazwa",
         "ZH": "自定义名称",
         "DE": "Benutzerdefinierter Name",
-    },
-    "media.dlg.new_extra_post": {
-        "EN": "New extra post",
-        "PL": "Nowy dodatkowy post",
-        "ZH": "新建额外帖子",
-        "DE": "Neuer zusätzlicher Beitrag",
-    },
-    "media.err.enter_extra_post_name": {
-        "EN": "Specify the extra post name",
-        "PL": "Podaj nazwę dodatkowego postu",
-        "ZH": "请指定额外帖子名称",
-        "DE": "Name des zusätzlichen Beitrags angeben",
-    },
-    "media.err.select_month_year": {
-        "EN": "Select month and year",
-        "PL": "Wybierz miesiąc i rok",
-        "ZH": "选择月份和年份",
-        "DE": "Monat und Jahr auswählen",
-    },
-    "media.extra_post_created": {
-        "EN": "Extra post created",
-        "PL": "Dodatkowy post utworzony",
-        "ZH": "额外帖子已创建",
-        "DE": "Zusätzlicher Beitrag erstellt",
-    },
-    "media.extra_post_deleted": {
-        "EN": "Extra post deleted",
-        "PL": "Dodatkowy post usunięty",
-        "ZH": "额外帖子已删除",
-        "DE": "Zusätzlicher Beitrag gelöscht",
     },
     "media.field.archive": {
         "EN": "Archive",
@@ -4461,30 +3777,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "已将 {n} 个产品合并为一个帖子",
         "DE": "{n} Produkte zu einem Beitrag zusammengeführt",
     },
-    "media.not_owner": {
-        "EN": "You are not the owner of this record",
-        "PL": "Nie jesteś właścicielem tego rekordu",
-        "ZH": "您不是此记录的所有者",
-        "DE": "Sie sind nicht der Eigentümer dieses Datensatzes",
-    },
-    "media.reset_sort": {
-        "EN": "Reset sort",
-        "PL": "Resetuj sortowanie",
-        "ZH": "重置排序",
-        "DE": "Sortierung zurücksetzen",
-    },
-    "media.select_merged_to_split": {
-        "EN": "Select merged rows to split",
-        "PL": "Wybierz połączone wiersze do rozdzielenia",
-        "ZH": "选择合并的行以拆分",
-        "DE": "Zusammengeführte Zeilen zum Aufteilen auswählen",
-    },
-    "media.split_rows": {
-        "EN": "Split into {n} rows",
-        "PL": "Podzielono na {n} wiersze",
-        "ZH": "拆分为 {n} 行",
-        "DE": "In {n} Zeilen aufgeteilt",
-    },
     "media.stale_filter_hint": {
         "EN": "Filter: >14 days or no publications",
         "PL": "Filtr: >14 dni lub bez publikacji",
@@ -4496,18 +3788,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Plan Mediów",
         "ZH": "媒体计划",
         "DE": "Medienplan",
-    },
-    "media.tooltip.reset_col_sort": {
-        "EN": "Reset column sort",
-        "PL": "Resetuj sortowanie kolumny",
-        "ZH": "重置列排序",
-        "DE": "Spaltensortierung zurücksetzen",
-    },
-    "media.unmerged_rows": {
-        "EN": "Split into {n} rows",
-        "PL": "Rozdzielono na {n} wiersze",
-        "ZH": "拆分为 {n} 行",
-        "DE": "In {n} Zeilen aufgeteilt",
     },
 
     # в”Ђв”Ђ nav в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
@@ -4600,18 +3880,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "KW Magazyn",
         "ZH": "销货成本 仓库",
         "DE": "EK Lager",
-    },
-    "nav.default_role": {
-        "EN": "Manager",
-        "PL": "Menedżer",
-        "ZH": "经理",
-        "DE": "Manager",
-    },
-    "nav.default_user": {
-        "EN": "User",
-        "PL": "Użytkownik",
-        "ZH": "用户",
-        "DE": "Benutzer",
     },
     "nav.extensions": {
         "EN": "Extensions",
@@ -4835,12 +4103,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "返回登录界面",
         "DE": "Zum Anmeldebildschirm zurückkehren",
     },
-    "nav.tab_default_title": {
-        "EN": "Page {n}",
-        "PL": "Strona {n}",
-        "ZH": "页面 {n}",
-        "DE": "Seite {n}",
-    },
     "nav.tab_fallback": {
         "EN": "Page",
         "PL": "Strona",
@@ -4913,30 +4175,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Nowe zamówienie",
         "ZH": "新订单",
         "DE": "Neue Bestellung",
-    },
-    "orders.empty_state": {
-        "EN": "No orders",
-        "PL": "Brak zamówień",
-        "ZH": "没有订单",
-        "DE": "Keine Bestellungen",
-    },
-    "orders.err.invoice_exists": {
-        "EN": "Invoice {inv!r} already exists in this region",
-        "PL": "Faktura {inv!r} już istnieje w tym regionie",
-        "ZH": "发票 {inv!r} 在此地区已存在",
-        "DE": "Rechnung {inv!r} existiert bereits in dieser Region",
-    },
-    "orders.err.save_failed": {
-        "EN": "Failed to save",
-        "PL": "Nie udało się zapisać",
-        "ZH": "保存失败",
-        "DE": "Speichern fehlgeschlagen",
-    },
-    "orders.err.save_local_failed": {
-        "EN": "Failed to save locally",
-        "PL": "Nie udało się zapisać lokalnie",
-        "ZH": "本地保存失败",
-        "DE": "Lokales Speichern fehlgeschlagen",
     },
     "orders.err.table_empty_export": {
         "EN": "Table is empty — nothing to export",
@@ -5028,17 +4266,17 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "发货日期",
         "DE": "Versanddatum",
     },
+    "orders.field.departed_date": {
+        "EN": "Departed date",
+        "PL": "Data odjazdu",
+        "ZH": "发运日期",
+        "DE": "Abfahrtsdatum",
+    },
     "orders.field.status": {
         "EN": "Status",
         "PL": "Status",
         "ZH": "状态",
         "DE": "Status",
-    },
-    "orders.field.supplier": {
-        "EN": "Supplier",
-        "PL": "Dostawca",
-        "ZH": "供应商",
-        "DE": "Lieferant",
     },
     "orders.field.supplier_required": {
         "EN": "Supplier *",
@@ -5070,12 +4308,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "验收月份",
         "DE": "Eingangmonat",
     },
-    "orders.filter.all_1c": {
-        "EN": "All accounting statuses",
-        "PL": "Wszystkie statusy księgowe",
-        "ZH": "所有记账状态",
-        "DE": "Alle Buchhaltungsstatus",
-    },
     "orders.filter.all_categories": {
         "EN": "All categories",
         "PL": "Wszystkie kategorie",
@@ -5099,12 +4331,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Wszystkie płatności",
         "ZH": "所有付款",
         "DE": "Alle Zahlungen",
-    },
-    "orders.filter.all_prefix": {
-        "EN": "All: {title}",
-        "PL": "Wszystkie: {title}",
-        "ZH": "所有：{title}",
-        "DE": "Alle: {title}",
     },
     "orders.filter.all_products": {
         "EN": "All products",
@@ -5189,24 +4415,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "1 zamówienie = 1 produkt",
         "ZH": "1个订单 = 1个产品",
         "DE": "1 Bestellung = 1 Produkt",
-    },
-    "orders.nbu_unavailable": {
-        "EN": "NBU unavailable — enter rate manually",
-        "PL": "NBU niedostępne — wprowadź kurs ręcznie",
-        "ZH": "NBU不可用 — 请手动输入汇率",
-        "DE": "NBU nicht verfügbar — Kurs manuell eingeben",
-    },
-    "orders.no_category": {
-        "EN": "No category",
-        "PL": "Bez kategorii",
-        "ZH": "无类别",
-        "DE": "Keine Kategorie",
-    },
-    "orders.no_supplier": {
-        "EN": "No supplier",
-        "PL": "Bez dostawcy",
-        "ZH": "无供应商",
-        "DE": "Kein Lieferant",
     },
     "orders.packing_paste_label": {
         "EN": "Paste from Excel (Ctrl+V) — packing",
@@ -5352,12 +4560,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "未保存",
         "DE": "Nicht gespeichert",
     },
-    "orders.sync.error_tip": {
-        "EN": "Changes remain local only. Click to retry sending to DB.",
-        "PL": "Zmiany pozostają tylko lokalnie. Kliknij, aby ponownie wysłać do bazy danych.",
-        "ZH": "更改仅保留在本地。点击重试发送到数据库。",
-        "DE": "Änderungen verbleiben nur lokal. Zum erneuten Senden an DB klicken.",
-    },
     "orders.sync.no_local_changes": {
         "EN": "No local changes to sync",
         "PL": "Brak lokalnych zmian do synchronizacji",
@@ -5375,12 +4577,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Dane zapisane w pamięci podręcznej i jeszcze nie przeniesione do bazy. Kliknij, aby wymusić synchronizację.",
         "ZH": "数据已保存到缓存，尚未传输到数据库。点击强制同步。",
         "DE": "Daten im Cache gespeichert und noch nicht in die DB übertragen. Zum erzwungenen Synchronisieren klicken.",
-    },
-    "orders.sync.start_failed": {
-        "EN": "Failed to start sync",
-        "PL": "Nie udało się uruchomić synchronizacji",
-        "ZH": "启动同步失败",
-        "DE": "Synchronisierung konnte nicht gestartet werden",
     },
     "orders.sync.synced": {
         "EN": "Saved",
@@ -5456,18 +4652,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
     },
 
     # в”Ђв”Ђ pack_stock в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
-    "pack_stock.count_label": {
-        "EN": "Packagings:",
-        "PL": "Opakowania:",
-        "ZH": "包装数量：",
-        "DE": "Verpackungen:",
-    },
-    "pack_stock.help.title": {
-        "EN": "Packaging warehouse",
-        "PL": "Magazyn opakowań",
-        "ZH": "包装仓库",
-        "DE": "Verpackungslager",
-    },
     "pack_stock.sync.error_tip": {
         "EN": "Update error. Click to retry.",
         "PL": "Błąd aktualizacji. Kliknij, aby ponowić.",
@@ -5492,12 +4676,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Dodaj opakowanie",
         "ZH": "添加包装",
         "DE": "Verpackung hinzufügen",
-    },
-    "packaging.base_update_failed_copy_created": {
-        "EN": "Could not update base record — your personal copy was created",
-        "PL": "Nie udało się zaktualizować rekordu bazowego — utworzono Twoją osobistą kopię",
-        "ZH": "无法更新基础记录 — 已创建您的个人副本",
-        "DE": "Basisdatensatz konnte nicht aktualisiert werden — Ihre persönliche Kopie wurde erstellt",
     },
     "packaging.card.edit_btn": {
         "EN": "Edit",
@@ -5565,12 +4743,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "删除包装？",
         "DE": "Verpackung löschen?",
     },
-    "packaging.dlg.delete_image": {
-        "EN": "Delete packaging image?",
-        "PL": "Usunąć zdjęcie opakowania?",
-        "ZH": "删除包装图片？",
-        "DE": "Verpackungsbild löschen?",
-    },
     "packaging.dlg.edit_title": {
         "EN": "Packaging",
         "PL": "Opakowanie",
@@ -5589,59 +4761,11 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "数据库错误",
         "DE": "DB-Fehler",
     },
-    "packaging.err.db_update": {
-        "EN": "DB update error",
-        "PL": "Błąd aktualizacji bazy danych",
-        "ZH": "数据库更新错误",
-        "DE": "DB-Aktualisierungsfehler",
-    },
-    "packaging.err.enter_name": {
-        "EN": "Enter a name",
-        "PL": "Wprowadź nazwę",
-        "ZH": "请输入名称",
-        "DE": "Name eingeben",
-    },
-    "packaging.err.file_not_found": {
-        "EN": "Selected file not found",
-        "PL": "Wybrany plik nie został znaleziony",
-        "ZH": "未找到所选文件",
-        "DE": "Ausgewählte Datei nicht gefunden",
-    },
-    "packaging.err.name_exists": {
-        "EN": "Packaging with this name already exists",
-        "PL": "Opakowanie o tej nazwie już istnieje",
-        "ZH": "该名称的包装已存在",
-        "DE": "Verpackung mit diesem Namen existiert bereits",
-    },
-    "packaging.err.name_exists_ui": {
-        "EN": "Packaging with this name already exists",
-        "PL": "Opakowanie o tej nazwie już istnieje",
-        "ZH": "该名称的包装已存在",
-        "DE": "Verpackung mit diesem Namen existiert bereits",
-    },
-    "packaging.err.no_price": {
-        "EN": "Packaging price not set",
-        "PL": "Cena opakowania nie jest ustawiona",
-        "ZH": "包装价格未设置",
-        "DE": "Verpackungspreis nicht festgelegt",
-    },
     "packaging.err.no_supplier": {
         "EN": "Packaging supplier not selected",
         "PL": "Dostawca opakowań nie wybrany",
         "ZH": "未选择包装供应商",
         "DE": "Verpackungslieferant nicht ausgewählt",
-    },
-    "packaging.err.select_company": {
-        "EN": "Select a company",
-        "PL": "Wybierz firmę",
-        "ZH": "选择公司",
-        "DE": "Unternehmen auswählen",
-    },
-    "packaging.err.select_user": {
-        "EN": "Select at least one user",
-        "PL": "Wybierz co najmniej jednego użytkownika",
-        "ZH": "请至少选择一个用户",
-        "DE": "Mindestens einen Benutzer auswählen",
     },
     "packaging.field.box_name": {
         "EN": "Box name",
@@ -5667,35 +4791,11 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "定制备注",
         "DE": "Anpassungsnotizen",
     },
-    "packaging.help.title": {
-        "EN": "Packaging",
-        "PL": "Opakowania",
-        "ZH": "包装",
-        "DE": "Verpackung",
-    },
-    "packaging.image_deleted": {
-        "EN": "Image deleted",
-        "PL": "Obraz usunięty",
-        "ZH": "图片已删除",
-        "DE": "Bild gelöscht",
-    },
     "packaging.loading": {
         "EN": "Loading packaging...",
         "PL": "Ładowanie opakowań...",
         "ZH": "加载包装...",
         "DE": "Verpackung wird geladen...",
-    },
-    "packaging.locked_record": {
-        "EN": "This packaging is locked by another user",
-        "PL": "To opakowanie jest zablokowane przez innego użytkownika",
-        "ZH": "此包装被其他用户锁定",
-        "DE": "Diese Verpackung ist von einem anderen Benutzer gesperrt",
-    },
-    "packaging.no_photo": {
-        "EN": "This packaging has no photo",
-        "PL": "To opakowanie nie ma zdjęcia",
-        "ZH": "此包装没有照片",
-        "DE": "Diese Verpackung hat kein Foto",
     },
     "packaging.readonly_mode_hint": {
         "EN": "Subordinate view mode: create and edit disabled",
@@ -5714,12 +4814,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Szybkie wyszukiwanie opakowań",
         "ZH": "快速搜索包装",
         "DE": "Schnelle Verpackungssuche",
-    },
-    "packaging.subordinate_readonly": {
-        "EN": "Subordinate tab: view only",
-        "PL": "Zakładka podwładnego: tylko podgląd",
-        "ZH": "下属选项卡：仅查看",
-        "DE": "Untergeordneter Tab: nur Ansicht",
     },
     "packaging.superadmin_mode_hint": {
         "EN": "Mode: All companies/regions. Click Edit for modal.",
@@ -5744,12 +4838,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Usuń obraz",
         "ZH": "删除图片",
         "DE": "Bild löschen",
-    },
-    "packaging.tooltip.locked_record": {
-        "EN": "Record locked by another user",
-        "PL": "Rekord zablokowany przez innego użytkownika",
-        "ZH": "记录被其他用户锁定",
-        "DE": "Datensatz von einem anderen Benutzer gesperrt",
     },
     "packaging.unknown_region": {
         "EN": "Unk. region",
@@ -5782,12 +4870,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "余额（供应商欠款）：",
         "DE": "Saldo (Lieferant schuldet):",
     },
-    "payments.balance.they_owe_short": {
-        "EN": "Balance (supp.):",
-        "PL": "Saldo (dost.):",
-        "ZH": "余额（供应商）：",
-        "DE": "Saldo (Lief.):",
-    },
     "payments.balance.total": {
         "EN": "Total balance",
         "PL": "Łączne saldo",
@@ -5805,12 +4887,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Saldo (my winni):",
         "ZH": "余额（我们欠）：",
         "DE": "Saldo (wir schulden):",
-    },
-    "payments.balance.zero": {
-        "EN": "Balance is zero",
-        "PL": "Saldo jest zerowe",
-        "ZH": "余额为零",
-        "DE": "Saldo ist null",
     },
     "payments.chip.all": {
         "EN": "All",
@@ -5872,23 +4948,11 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "补偿",
         "DE": "Kompensation",
     },
-    "payments.compensation_amount": {
-        "EN": "Compensation amount ({ccy})",
-        "PL": "Kwota kompensacji ({ccy})",
-        "ZH": "补偿金额（{ccy}）",
-        "DE": "Kompensationsbetrag ({ccy})",
-    },
     "payments.dlg.col_widths": {
         "EN": "Column widths, px",
         "PL": "Szerokości kolumn, px",
         "ZH": "列宽，px",
         "DE": "Spaltenbreiten, px",
-    },
-    "payments.dlg.delete_comp_title": {
-        "EN": "Delete compensation?",
-        "PL": "Usunąć kompensację?",
-        "ZH": "删除补偿？",
-        "DE": "Kompensation löschen?",
     },
     "payments.dlg.row_height": {
         "EN": "Row height, px",
@@ -5901,12 +4965,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Tabela",
         "ZH": "表格",
         "DE": "Tabelle",
-    },
-    "payments.help.title": {
-        "EN": "Settlements",
-        "PL": "Rozliczenia",
-        "ZH": "结算",
-        "DE": "Abrechnungen",
     },
     "payments.loading.orders": {
         "EN": "Orders: {n}",
@@ -5938,53 +4996,17 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "供应商：{n}",
         "DE": "Lieferanten: {n}",
     },
-    "payments.no_orders_to_show": {
-        "EN": "No orders to display",
-        "PL": "Brak zamówień do wyświetlenia",
-        "ZH": "没有可显示的订单",
-        "DE": "Keine Bestellungen zur Anzeige",
-    },
-    "payments.no_orders_with_status": {
-        "EN": "No orders with this status",
-        "PL": "Brak zamówień z takim statusem",
-        "ZH": "没有具有此状态的订单",
-        "DE": "Keine Bestellungen mit diesem Status",
-    },
     "payments.opening_balance": {
         "EN": "Opening balance",
         "PL": "Saldo początkowe",
         "ZH": "期初余额",
         "DE": "Anfangssaldo",
     },
-    "payments.opening_balance_ccy": {
-        "EN": "Opening balance ({ccy})",
-        "PL": "Saldo początkowe ({ccy})",
-        "ZH": "期初余额（{ccy}）",
-        "DE": "Anfangssaldo ({ccy})",
-    },
-    "payments.other_1c": {
-        "EN": "Other PO Accounting #",
-        "PL": "Inny Nr księgowy ZP",
-        "ZH": "其他采购单记账编号",
-        "DE": "Anderer BO Buchhaltungs-Nr.",
-    },
-    "payments.other_invoice": {
-        "EN": "Other invoice",
-        "PL": "Inna faktura",
-        "ZH": "其他发票",
-        "DE": "Andere Rechnung",
-    },
     "payments.show_all": {
         "EN": "Show all",
         "PL": "Pokaż wszystkie",
         "ZH": "显示全部",
         "DE": "Alle anzeigen",
-    },
-    "payments.show_last_15": {
-        "EN": "Show last 15",
-        "PL": "Pokaż ostatnie 15",
-        "ZH": "显示最近15条",
-        "DE": "Letzte 15 anzeigen",
     },
     "payments.stat.orders_sum": {
         "EN": "Orders sum:",
@@ -5997,12 +5019,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Opłacono:",
         "ZH": "已付：",
         "DE": "Bezahlt:",
-    },
-    "payments.supplier_colon": {
-        "EN": "Supplier: {name}",
-        "PL": "Dostawca: {name}",
-        "ZH": "供应商：{name}",
-        "DE": "Lieferant: {name}",
     },
     "payments.title": {
         "EN": "Settlements",
@@ -6077,23 +5093,11 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "删除产品失败",
         "DE": "Produkt konnte nicht gelöscht werden",
     },
-    "products.err.name_exists": {
-        "EN": "A product with this name already exists",
-        "PL": "Produkt o tej nazwie już istnieje",
-        "ZH": "该名称的产品已存在",
-        "DE": "Ein Produkt mit diesem Namen existiert bereits",
-    },
     "products.err.photo_select": {
         "EN": "Photo selection error: {ex}",
         "PL": "Błąd wyboru zdjęcia: {ex}",
         "ZH": "照片选择错误：{ex}",
         "DE": "Fotoauswahlfehler: {ex}",
-    },
-    "products.err.save": {
-        "EN": "Failed to save product",
-        "PL": "Nie udało się zapisać produktu",
-        "ZH": "保存产品失败",
-        "DE": "Produkt konnte nicht gespeichert werden",
     },
     "products.field.delete_photo_n": {
         "EN": "Delete photo {n}",
@@ -6167,18 +5171,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "加载产品...",
         "DE": "Produkte werden geladen...",
     },
-    "products.locked_by_other": {
-        "EN": "Record is being edited by another user",
-        "PL": "Rekord jest edytowany przez innego użytkownika",
-        "ZH": "记录正在被其他用户编辑",
-        "DE": "Datensatz wird von einem anderen Benutzer bearbeitet",
-    },
-    "products.no_photo": {
-        "EN": "This product has no photo",
-        "PL": "Ten produkt nie ma zdjęcia",
-        "ZH": "此产品没有照片",
-        "DE": "Dieses Produkt hat kein Foto",
-    },
     "products.no_series_to_complete": {
         "EN": "No series to complete into a product",
         "PL": "Brak serii do uzupełnienia do produktu",
@@ -6196,12 +5188,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Szukaj produktów",
         "ZH": "搜索产品",
         "DE": "Produkte suchen",
-    },
-    "products.select_series": {
-        "EN": "Select series",
-        "PL": "Wybierz serię",
-        "ZH": "选择系列",
-        "DE": "Serie auswählen",
     },
     "products.series_completed": {
         "EN": "Series completed into product",
@@ -6241,12 +5227,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "预算",
         "DE": "Budget",
     },
-    "schedule.dlg.group_items": {
-        "EN": "Group items",
-        "PL": "Pozycje w grupie",
-        "ZH": "组内项目",
-        "DE": "Gruppenelemente",
-    },
     "schedule.dlg.move_order": {
         "EN": "Move order",
         "PL": "Przenieś zamówienie",
@@ -6277,23 +5257,11 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "— 未选择 —",
         "DE": "— nicht ausgewählt —",
     },
-    "schedule.dropdown.select": {
-        "EN": "Select",
-        "PL": "Wybierz",
-        "ZH": "选择",
-        "DE": "Auswählen",
-    },
     "schedule.field.amount_actual": {
         "EN": "Actual amount",
         "PL": "Kwota rzeczywista",
         "ZH": "实际金额",
         "DE": "Tatsächlicher Betrag",
-    },
-    "schedule.field.card_height": {
-        "EN": "Card height",
-        "PL": "Wysokość karty",
-        "ZH": "卡片高度",
-        "DE": "Kartenhöhe",
     },
     "schedule.field.category_required": {
         "EN": "Category *",
@@ -6325,41 +5293,17 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "名称 *",
         "DE": "Name *",
     },
-    "schedule.field.order_archive_months": {
-        "EN": "Archive → Months",
-        "PL": "Archiwum → Miesiące",
-        "ZH": "归档 → 月份",
-        "DE": "Archiv → Monate",
-    },
-    "schedule.field.order_months_archive": {
-        "EN": "Months → Archive",
-        "PL": "Miesiące → Archiwum",
-        "ZH": "月份 → 归档",
-        "DE": "Monate → Archiv",
-    },
     "schedule.field.ordered_actual": {
         "EN": "Actual ordered",
         "PL": "Zamówiono rzeczywiście",
         "ZH": "实际订购",
         "DE": "Tatsächlich bestellt",
     },
-    "schedule.field.position": {
-        "EN": "Schedule position",
-        "PL": "Pozycja harmonogramu",
-        "ZH": "计划位置",
-        "DE": "Zeitplanposition",
-    },
     "schedule.field.production_days": {
         "EN": "Production lead time (days)",
         "PL": "Czas produkcji (dni)",
         "ZH": "生产提前期（天）",
         "DE": "Produktionsvorlaufzeit (Tage)",
-    },
-    "schedule.field.right_block_order": {
-        "EN": "Right block order",
-        "PL": "Kolejność prawego bloku",
-        "ZH": "右侧块顺序",
-        "DE": "Reihenfolge des rechten Blocks",
     },
     "schedule.field.supplier_amount": {
         "EN": "Supplier amount",
@@ -6373,18 +5317,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "单价",
         "DE": "Stückpreis",
     },
-    "schedule.field.year": {
-        "EN": "Year",
-        "PL": "Rok",
-        "ZH": "年份",
-        "DE": "Jahr",
-    },
-    "schedule.help.title": {
-        "EN": "Order Schedule",
-        "PL": "Harmonogram Zamówień",
-        "ZH": "订单计划",
-        "DE": "Bestellungsplan",
-    },
     "schedule.merge_selected": {
         "EN": "Merge selected",
         "PL": "Połącz wybrane",
@@ -6397,53 +5329,11 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "未来 {n} 个月的规划",
         "DE": "Planung für {n} Monate im Voraus",
     },
-    "schedule.snack.archive_past_only": {
-        "EN": "Only past and current months can be opened from archive",
-        "PL": "Z archiwum można otworzyć tylko minione i bieżący miesiąc",
-        "ZH": "从归档只能打开过去和当前月份",
-        "DE": "Aus dem Archiv können nur vergangene und der aktuelle Monat geöffnet werden",
-    },
-    "schedule.snack.enter_name": {
-        "EN": "Enter a name",
-        "PL": "Wprowadź nazwę",
-        "ZH": "请输入名称",
-        "DE": "Name eingeben",
-    },
-    "schedule.snack.merge_failed": {
-        "EN": "Failed to merge rows",
-        "PL": "Nie udało się połączyć wierszy",
-        "ZH": "合并行失败",
-        "DE": "Zeilen konnten nicht zusammengeführt werden",
-    },
-    "schedule.snack.merged": {
-        "EN": "Rows merged",
-        "PL": "Wiersze połączone",
-        "ZH": "行已合并",
-        "DE": "Zeilen zusammengeführt",
-    },
-    "schedule.snack.no_merged_to_split": {
-        "EN": "No merged rows to split",
-        "PL": "Brak połączonych wierszy do rozdzielenia",
-        "ZH": "没有合并的行可以拆分",
-        "DE": "Keine zusammengeführten Zeilen zum Aufteilen",
-    },
-    "schedule.snack.no_target_row": {
-        "EN": "Could not determine the target row",
-        "PL": "Nie udało się określić wiersza docelowego",
-        "ZH": "无法确定目标行",
-        "DE": "Zielzeile konnte nicht bestimmt werden",
-    },
     "schedule.snack.note_deleted": {
         "EN": "Note deleted",
         "PL": "Notatka usunięta",
         "ZH": "备注已删除",
         "DE": "Notiz gelöscht",
-    },
-    "schedule.snack.note_saved": {
-        "EN": "Note saved",
-        "PL": "Notatka zapisana",
-        "ZH": "备注已保存",
-        "DE": "Notiz gespeichert",
     },
     "schedule.snack.order_copied": {
         "EN": "Order copied",
@@ -6456,42 +5346,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Zamówienie przeniesione",
         "ZH": "订单已移动",
         "DE": "Bestellung verschoben",
-    },
-    "schedule.snack.product_deactivated": {
-        "EN": "Product moved to inactive",
-        "PL": "Produkt przeniesiony do nieaktywnych",
-        "ZH": "产品已移至非活动",
-        "DE": "Produkt zu inaktiv verschoben",
-    },
-    "schedule.snack.product_reactivated": {
-        "EN": "Product is active again",
-        "PL": "Produkt jest znowu aktywny",
-        "ZH": "产品已重新激活",
-        "DE": "Produkt ist wieder aktiv",
-    },
-    "schedule.snack.readonly_mode": {
-        "EN": "Editing is not available in view mode",
-        "PL": "Edycja jest niedostępna w trybie podglądu",
-        "ZH": "查看模式下无法编辑",
-        "DE": "Im Ansichtsmodus ist keine Bearbeitung möglich",
-    },
-    "schedule.snack.row_prep_failed": {
-        "EN": "Failed to prepare row for saving",
-        "PL": "Nie udało się przygotować wiersza do zapisu",
-        "ZH": "准备行以保存失败",
-        "DE": "Zeile konnte nicht zum Speichern vorbereitet werden",
-    },
-    "schedule.snack.select_category": {
-        "EN": "Select category",
-        "PL": "Wybierz kategorię",
-        "ZH": "请选择类别",
-        "DE": "Kategorie auswählen",
-    },
-    "schedule.snack.split_positions": {
-        "EN": "Split: {n} positions",
-        "PL": "Rozdzielono: {n} pozycji",
-        "ZH": "拆分：{n} 个位置",
-        "DE": "Aufgeteilt: {n} Positionen",
     },
     "schedule.snack.task_deleted": {
         "EN": "Task deleted",
@@ -6560,12 +5414,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "默认层级：{name}",
         "DE": "Standardhierarchie: {name}",
     },
-    "settings.dlg.delete_region": {
-        "EN": "Delete region",
-        "PL": "Usuń region",
-        "ZH": "删除地区",
-        "DE": "Region löschen",
-    },
     "settings.dlg.price_tiers": {
         "EN": "Price tiers: {name}",
         "PL": "Poziomy cen: {name}",
@@ -6577,36 +5425,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Zmień nazwę regionu",
         "ZH": "重命名地区",
         "DE": "Region umbenennen",
-    },
-    "settings.err.create_region": {
-        "EN": "Failed to create region",
-        "PL": "Nie udało się utworzyć regionu",
-        "ZH": "创建地区失败",
-        "DE": "Region konnte nicht erstellt werden",
-    },
-    "settings.err.enter_current_password": {
-        "EN": "Enter current password",
-        "PL": "Wprowadź aktualne hasło",
-        "ZH": "请输入当前密码",
-        "DE": "Aktuelles Passwort eingeben",
-    },
-    "settings.err.enter_region_name": {
-        "EN": "Enter a region name",
-        "PL": "Wprowadź nazwę regionu",
-        "ZH": "请输入地区名称",
-        "DE": "Regionsnamen eingeben",
-    },
-    "settings.err.region_exists": {
-        "EN": "This region already exists",
-        "PL": "Taki region już istnieje",
-        "ZH": "该地区已存在",
-        "DE": "Diese Region existiert bereits",
-    },
-    "settings.err.save_payment_fields": {
-        "EN": "Failed to save payment fields",
-        "PL": "Nie udało się zapisać pól płatności",
-        "ZH": "保存付款字段失败",
-        "DE": "Zahlungsfelder konnten nicht gespeichert werden",
     },
     "settings.field.current_password": {
         "EN": "Current password",
@@ -6680,12 +5498,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "地区已创建",
         "DE": "Region erstellt",
     },
-    "settings.region_deleted": {
-        "EN": "Region deleted",
-        "PL": "Region usunięty",
-        "ZH": "地区已删除",
-        "DE": "Region gelöscht",
-    },
     "settings.region_updated": {
         "EN": "Region updated",
         "PL": "Region zaktualizowany",
@@ -6741,12 +5553,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "加载供应商...",
         "DE": "Lieferanten werden geladen...",
     },
-    "suppliers.locked_by_other": {
-        "EN": "This supplier is locked by another user",
-        "PL": "Ten dostawca jest zablokowany przez innego użytkownika",
-        "ZH": "此供应商被其他用户锁定",
-        "DE": "Dieser Lieferant ist von einem anderen Benutzer gesperrt",
-    },
     "suppliers.search_hint": {
         "EN": "Quick supplier search",
         "PL": "Szybkie wyszukiwanie dostawców",
@@ -6759,29 +5565,11 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "供应商",
         "DE": "Lieferanten",
     },
-    "app.offline.body": {
-        "EN": "No connection. This window will close automatically once the internet connection is restored.",
-        "PL": "Brak połączenia. To okno zniknie automatycznie po przywróceniu internetu.",
-        "ZH": "无网络连接。互联网连接恢复后，此窗口将自动关闭。",
-        "DE": "Keine Verbindung. Dieses Fenster schließt sich automatisch, sobald die Internetverbindung wiederhergestellt ist.",
-    },
-    "app.update.err_file_too_small": {
-        "EN": "The update file is too small. Make sure the link points directly to the .exe installer.",
-        "PL": "Plik aktualizacji jest zbyt mały. Upewnij się, że link prowadzi bezpośrednio do instalatora .exe.",
-        "ZH": "更新文件过小。请确认链接直接指向.exe安装程序。",
-        "DE": "Die Update-Datei ist zu klein. Stellen Sie sicher, dass der Link direkt auf den .exe-Installer verweist.",
-    },
     "app.update.err_github_404": {
         "EN": "GitHub returned 404. The link is probably not to an .exe asset, or the repository is private. Auto-update requires a public direct URL to the installer.",
         "PL": "GitHub zwrócił błąd 404. Prawdopodobnie link nie prowadzi do zasobu .exe lub repozytorium jest prywatne. Autoaktualizacja wymaga publicznego bezpośredniego URL do instalatora.",
         "ZH": "GitHub返回404错误。链接可能未指向.exe资源，或仓库为私有。自动更新需要指向安装程序的公开直接URL。",
         "DE": "GitHub hat 404 zurückgegeben. Der Link führt wahrscheinlich nicht zu einem .exe-Asset, oder das Repository ist privat. Für die automatische Aktualisierung ist eine öffentliche direkte URL zum Installer erforderlich.",
-    },
-    "app.update.err_not_direct_url": {
-        "EN": "The update URL is not a direct link to an .exe file. Provide a direct asset URL from GitHub Releases.",
-        "PL": "URL aktualizacji nie jest bezpośrednim linkiem do pliku .exe. Podaj bezpośredni URL zasobu z GitHub Releases.",
-        "ZH": "更新URL不是指向.exe文件的直接链接。请提供来自GitHub Releases的直接资源URL。",
-        "DE": "Die Update-URL ist kein direkter Link zu einer .exe-Datei. Geben Sie eine direkte Asset-URL aus GitHub Releases an.",
     },
     "app.update.installer_launched": {
         "EN": "The installer has started. Confirm the UAC prompt and wait for it to finish.",
@@ -6813,29 +5601,11 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "仅超级管理员可留空 — 其他用户必须填写公司",
         "DE": "Nur für SuperAdmin leer lassen — andere Benutzer müssen ein Unternehmen angeben",
     },
-    "auth.login.err_auth_failed": {
-        "EN": "Authorization error. Please try again later.",
-        "PL": "Błąd autoryzacji. Spróbuj ponownie później.",
-        "ZH": "授权错误。请稍后重试。",
-        "DE": "Autorisierungsfehler. Bitte versuchen Sie es später erneut.",
-    },
-    "auth.login.err_blocked": {
-        "EN": "The account is blocked. Please contact the administrator.",
-        "PL": "Konto jest zablokowane. Skontaktuj się z administratorem.",
-        "ZH": "账户已被封锁。请联系管理员。",
-        "DE": "Das Konto ist gesperrt. Bitte wenden Sie sich an den Administrator.",
-    },
     "auth.login.err_invalid_credentials": {
         "EN": "Incorrect details entered — check them and try again!",
         "PL": "Wprowadzono nieprawidłowe dane — sprawdź je i spróbuj ponownie!",
         "ZH": "输入的信息有误，请检查后重试！",
         "DE": "Falsche Angaben eingegeben — überprüfen Sie sie und versuchen Sie es erneut!",
-    },
-    "auth.login.err_not_approved": {
-        "EN": "Access has not yet been approved by the administrator!",
-        "PL": "Dostęp nie został jeszcze zatwierdzony przez administratora!",
-        "ZH": "管理员尚未批准访问！",
-        "DE": "Der Zugriff wurde noch nicht vom Administrator genehmigt!",
     },
     "auth.login.go_register": {
         "EN": "Create a new account (Registration)",
@@ -6849,23 +5619,11 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "— 其他账户（未保存，手动输入信息）—",
         "DE": "— Anderes Konto (nicht gespeichert, Daten manuell eingeben) —",
     },
-    "auth.login.quick_cleared": {
-        "EN": "Quick login cleared. Enter your details manually and log in again.",
-        "PL": "Szybkie logowanie wyczyszczone. Wprowadź dane ręcznie i zaloguj się ponownie.",
-        "ZH": "快速登录已清除。请手动输入信息后重新登录。",
-        "DE": "Schnellanmeldung gelöscht. Geben Sie die Daten manuell ein und melden Sie sich erneut an.",
-    },
     "auth.login.quick_delete_one_tooltip": {
         "EN": "Remove the selected account from the list",
         "PL": "Usuń wybrane konto z listy",
         "ZH": "从列表中删除所选账户",
         "DE": "Ausgewähltes Konto aus der Liste entfernen",
-    },
-    "auth.login.quick_delete_none_selected": {
-        "EN": "Select a saved account to delete",
-        "PL": "Wybierz zapisane konto do usunięcia",
-        "ZH": "请选择要删除的已保存账户",
-        "DE": "Wählen Sie ein gespeichertes Konto zum Löschen aus",
     },
     "auth.login.quick_deleted_one": {
         "EN": "Account removed from the list",
@@ -6878,12 +5636,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Dostępne regiony",
         "ZH": "可用地区",
         "DE": "Verfügbare Regionen",
-    },
-    "auth.register.company_hint_sa": {
-        "EN": "Not filled in for SuperAdmin",
-        "PL": "Nie wypełnia się dla SuperAdmina",
-        "ZH": "超级管理员无需填写",
-        "DE": "Wird für SuperAdmin nicht ausgefüllt",
     },
     "auth.register.company_not_found": {
         "EN": "Company not found. Once the company is created, regions will become available for selection.",
@@ -6914,18 +5666,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Regiony i poziomy cen są ustawiane centralnie przez SuperAdmina w zarządzaniu firmą.",
         "ZH": "地区和价格等级由超级管理员在公司管理中统一设置。",
         "DE": "Regionen und Preisstufen werden zentral vom SuperAdmin in der Unternehmensverwaltung festgelegt.",
-    },
-    "auth.register.sa_no_region_limit": {
-        "EN": "For SuperAdmin, region access is not restricted",
-        "PL": "Dla SuperAdmina dostęp do regionów nie jest ograniczony",
-        "ZH": "超级管理员不受地区访问限制",
-        "DE": "Für SuperAdmin ist der Regionszugriff nicht eingeschränkt",
-    },
-    "auth.register.sa_no_region_limit_hint": {
-        "EN": "Region restrictions do not apply to SuperAdmin",
-        "PL": "Ograniczenia regionów nie dotyczą SuperAdmina",
-        "ZH": "地区限制不适用于超级管理员",
-        "DE": "Regionsbeschränkungen gelten nicht für SuperAdmin",
     },
     "auth.register.title": {
         "EN": "Registration in CatMan Pro",
@@ -6999,12 +5739,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "筛选器错误",
         "DE": "Filterfehler",
     },
-    "cost_orders.err.merge": {
-        "EN": "Merge error",
-        "PL": "Błąd łączenia",
-        "ZH": "合并错误",
-        "DE": "Fehler beim Zusammenführen",
-    },
     "cost_orders.filter.logistics_ccy": {
         "EN": "Logistics, currency",
         "PL": "Logistyka, waluta",
@@ -7029,18 +5763,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "合并",
         "DE": "Zusammenführen",
     },
-    "cost_orders.merge_count": {
-        "EN": "Merge ({n})",
-        "PL": "Połącz ({n})",
-        "ZH": "合并（{n}）",
-        "DE": "Zusammenführen ({n})",
-    },
-    "cost_orders.merge_hint_count": {
-        "EN": "Merge {n} orders",
-        "PL": "Połącz {n} zamówień",
-        "ZH": "合并{n}个订单",
-        "DE": "{n} Bestellungen zusammenführen",
-    },
     "cost_orders.merge_hint_select": {
         "EN": "Select 2+ orders to merge",
         "PL": "Wybierz 2+ zamówienia do połączenia",
@@ -7052,12 +5774,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Brak wierszy",
         "ZH": "没有行",
         "DE": "Keine Zeilen",
-    },
-    "cost_orders.tier_fallback": {
-        "EN": "Tier",
-        "PL": "Poziom",
-        "ZH": "级别",
-        "DE": "Stufe",
     },
     "cost_orders.title": {
         "EN": "Cost Price / Profitability",
@@ -7101,12 +5817,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "没有文件夹。",
         "DE": "Keine Ordner.",
     },
-    "files.renamed": {
-        "EN": "Renamed",
-        "PL": "Zmieniono nazwę",
-        "ZH": "已重命名",
-        "DE": "Umbenannt",
-    },
     "gsm.running": {
         "EN": "Parsing in progress…",
         "PL": "Trwa parsowanie…",
@@ -7125,29 +5835,11 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "仅显示至少一种语言翻译为空的条目",
         "DE": "Es werden nur Einträge angezeigt, die in mindestens einer Sprache keine Übersetzung haben",
     },
-    "languages.empty_state": {
-        "EN": "No registered text for translation yet. Keys appear automatically as soon as the corresponding app tab is opened at least once.",
-        "PL": "Nie ma jeszcze żadnego zarejestrowanego tekstu do tłumaczenia. Klucze pojawiają się automatycznie, gdy odpowiednia zakładka aplikacji zostanie otwarta choć raz.",
-        "ZH": "尚无任何已注册的待翻译文本。只要相应的应用程序标签页被打开过一次，键就会自动出现。",
-        "DE": "Es gibt noch keinen registrierten Text zur Übersetzung. Schlüssel erscheinen automatisch, sobald der entsprechende App-Tab mindestens einmal geöffnet wurde.",
-    },
-    "languages.err.save_some_failed": {
-        "EN": "Failed to save some translations",
-        "PL": "Nie udało się zapisać niektórych tłumaczeń",
-        "ZH": "部分翻译保存失败",
-        "DE": "Einige Übersetzungen konnten nicht gespeichert werden",
-    },
     "languages.no_empty": {
         "EN": "All translations are filled in for all languages 🎉",
         "PL": "Wszystkie tłumaczenia są uzupełnione dla wszystkich języków 🎉",
         "ZH": "所有语言的翻译均已填写完成 🎉",
         "DE": "Alle Übersetzungen sind für alle Sprachen ausgefüllt 🎉",
-    },
-    "languages.no_matches": {
-        "EN": "Nothing found for this query.",
-        "PL": "Nie znaleziono nic dla tego zapytania.",
-        "ZH": "未找到与此查询匹配的内容。",
-        "DE": "Für diese Anfrage wurde nichts gefunden.",
     },
     "languages.search_hint": {
         "EN": "Search by key or Ukrainian text",
@@ -7161,23 +5853,11 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "左侧 — 板块菜单（商品、订单、仓库等），可通过«汉堡»按钮隐藏/显示。右上方 — 计算器、记事本、主页、设置、语言切换器和退出按钮。中间 — 当前日期和时间。右键点击菜单项可在新窗口中打开。",
         "DE": "Links — das Bereichsmenü (Produkte, Bestellungen, Lager usw.), über die «Hamburger»-Schaltfläche ein-/ausblendbar. Oben rechts — Rechner, Notizbuch, Startseite, Einstellungen, Sprachumschalter und Abmelde-Schaltfläche. In der Mitte — aktuelles Datum und Uhrzeit. Ein Rechtsklick auf einen Menüpunkt öffnet ihn in einem neuen Fenster.",
     },
-    "nav.help_body_admin": {
-        "EN": "At the top — admin section buttons (requests, users, categories, suppliers, packaging, copying, extensions, settings, product from template). On the right — company/region selection, the «Overview» button returns to the home screen, there is a language switcher and a logout button.",
-        "PL": "U góry — przyciski sekcji administracyjnych (wnioski, użytkownicy, kategorie, dostawcy, opakowania, kopiowanie, rozszerzenia, ustawienia, produkt z szablonu). Po prawej — wybór firmy/regionu, przycisk «Przegląd» wraca do ekranu głównego, jest przełącznik języka i przycisk wylogowania.",
-        "ZH": "顶部 — 管理板块按钮（申请、用户、类别、供应商、包装、复制、扩展、设置、按模板建品）。右侧 — 公司/地区选择，«概览»按钮返回主屏幕，有语言切换器和退出按钮。",
-        "DE": "Oben — Schaltflächen der Verwaltungsbereiche (Anträge, Benutzer, Kategorien, Lieferanten, Verpackung, Kopieren, Erweiterungen, Einstellungen, Produkt aus Vorlage). Rechts — Auswahl von Unternehmen/Region, die Schaltfläche «Übersicht» kehrt zum Startbildschirm zurück, es gibt einen Sprachumschalter und eine Abmelde-Schaltfläche.",
-    },
     "nav.help_body_sa": {
         "EN": "At the top — superadmin section buttons (requests, users, company, updates, extensions, languages, settings). On the right — company selection, the «Overview» button returns to the home screen, there is a language switcher and a logout button. The «Languages» section lets you manage interface translations for all users.",
         "PL": "U góry — przyciski sekcji superadministratora (wnioski, użytkownicy, firma, aktualizacje, rozszerzenia, języki, ustawienia). Po prawej — wybór firmy, przycisk «Przegląd» wraca do ekranu głównego, jest przełącznik języka i przycisk wylogowania. Sekcja «Języki» pozwala zarządzać tłumaczeniami interfejsu dla wszystkich użytkowników.",
         "ZH": "顶部 — 超级管理员板块按钮（申请、用户、公司、更新、扩展、语言、设置）。右侧 — 公司选择，«概览»按钮返回主屏幕，有语言切换器和退出按钮。«语言»板块可为所有用户管理界面翻译。",
         "DE": "Oben — Schaltflächen der Superadmin-Bereiche (Anträge, Benutzer, Unternehmen, Updates, Erweiterungen, Sprachen, Einstellungen). Rechts — Unternehmensauswahl, die Schaltfläche «Übersicht» kehrt zum Startbildschirm zurück, es gibt einen Sprachumschalter und eine Abmelde-Schaltfläche. Der Bereich «Sprachen» ermöglicht die Verwaltung der Oberflächenübersetzungen für alle Benutzer.",
-    },
-    "nav.logout_done": {
-        "EN": "Logged out. Restart the app to log in.",
-        "PL": "Wylogowano. Uruchom ponownie aplikację, aby się zalogować.",
-        "ZH": "已退出登录。请重启应用程序以重新登录。",
-        "DE": "Abmeldung erfolgt. Starten Sie die App neu, um sich anzumelden.",
     },
     "nav.switch_account_confirm_body": {
         "EN": "You will be taken to the login screen. The current session will be ended.",
@@ -7281,12 +5961,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "搜索商品...",
         "DE": "Produkt suchen...",
     },
-    "stock.no_products": {
-        "EN": "No products",
-        "PL": "Brak produktów",
-        "ZH": "没有商品",
-        "DE": "Keine Produkte",
-    },
     "payments.status.production": {
         "EN": "Production",
         "PL": "Produkcja",
@@ -7304,12 +5978,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "PL": "Wal.",
         "ZH": "币种",
         "DE": "Währ.",
-    },
-    "orders.nbu_unavailable_body": {
-        "EN": "NBU unavailable — enter rate manually",
-        "PL": "NBU niedostępny — wprowadź kurs ręcznie",
-        "ZH": "乌克兰国家银行汇率不可用 — 请手动输入汇率",
-        "DE": "NBU nicht verfügbar — Kurs manuell eingeben",
     },
     "auth.role.закупівельник": {
         "EN": "Buyer",
@@ -7809,6 +6477,211 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
         "ZH": "保存计算",
         "DE": "Berechnung speichern",
     },
+    # в”Ђв”Ђ calc.* (views/calculators_view.py calculators: basic/cost/cost_clo/profit/turnover) в”Ђв”Ђ
+    "calc.action.calculate": {"EN": "Calculate", "PL": "Oblicz", "ZH": "计算", "DE": "Berechnen"},
+    "calc.basic.error": {"EN": "Error", "PL": "Błąd", "ZH": "错误", "DE": "Fehler"},
+    "calc.basic.kb_hint": {
+        "EN": "Click a calculator button to activate the keyboard",
+        "PL": "Kliknij przycisk kalkulatora, aby aktywować klawiaturę",
+        "ZH": "点击计算器按钮以启用键盘输入",
+        "DE": "Klicken Sie auf eine Rechner-Taste, um die Tastatur zu aktivieren",
+    },
+    "calc.basic.title": {"EN": "Basic", "PL": "Zwykły", "ZH": "普通", "DE": "Einfach"},
+    "calc.compare.add_tooltip": {
+        "EN": "Add a panel to compare (up to {n})",
+        "PL": "Dodaj panel do porównania (do {n})",
+        "ZH": "添加比较面板（最多 {n} 个）",
+        "DE": "Panel zum Vergleichen hinzufügen (bis zu {n})",
+    },
+    "calc.compare.help_note": {
+        "EN": "The \"+\" button adds another comparison panel (up to 5) — only the entered values are copied, not the result.",
+        "PL": "Przycisk „+” dodaje kolejny panel porównawczy (do 5) — kopiowane są tylko wprowadzone wartości, a nie wynik.",
+        "ZH": "点击“+”按钮可添加另一个比较面板（最多 5 个）——仅复制已输入的数值，不复制结果。",
+        "DE": "Die Schaltfläche „+“ fügt ein weiteres Vergleichspanel hinzu (bis zu 5) — es werden nur die eingegebenen Werte kopiert, nicht das Ergebnis.",
+    },
+    "calc.compare.remove_panel": {"EN": "Remove panel", "PL": "Usuń panel", "ZH": "移除面板", "DE": "Panel entfernen"},
+    "calc.cost.add_delivery_method": {"EN": "Add delivery method", "PL": "Dodaj metodę dostawy", "ZH": "添加配送方式", "DE": "Liefermethode hinzufügen"},
+    "calc.cost.cost_currency": {"EN": "Cost currency", "PL": "Waluta kosztu", "ZH": "成本货币", "DE": "Kostenwährung"},
+    "calc.cost.delivery_generic_name": {"EN": "Delivery {n}", "PL": "Dostawa {n}", "ZH": "配送方式 {n}", "DE": "Lieferung {n}"},
+    "calc.cost.delivery_name_hint": {"EN": "Delivery name", "PL": "Nazwa dostawy", "ZH": "配送名称", "DE": "Liefername"},
+    "calc.cost.formula": {
+        "EN": "Cost = Purchase price + Packaging + (Weight × Delivery rate)",
+        "PL": "Koszt = Cena zakupu + Opakowanie + (Waga × Stawka dostawy)",
+        "ZH": "成本 = 采购价 + 包装费 + （重量 × 运费单价）",
+        "DE": "Selbstkosten = Einkaufspreis + Verpackung + (Gewicht × Lieferpreis)",
+    },
+    "calc.cost.no_delivery_methods": {
+        "EN": "No delivery methods configured for this region",
+        "PL": "Brak skonfigurowanych metod dostawy dla tego regionu",
+        "ZH": "该地区尚未配置配送方式",
+        "DE": "Für diese Region sind keine Liefermethoden konfiguriert",
+    },
+    "calc.cost.no_price_tiers": {
+        "EN": "No sale prices configured for this region",
+        "PL": "Brak skonfigurowanych cen sprzedaży dla tego regionu",
+        "ZH": "该地区尚未配置销售价格",
+        "DE": "Für diese Region sind keine Verkaufspreise konfiguriert",
+    },
+    "calc.cost.pkg_price": {"EN": "Packaging price", "PL": "Cena opakowania", "ZH": "包装价格", "DE": "Verpackungspreis"},
+    "calc.cost.purchase_price": {"EN": "Purchase price *", "PL": "Cena zakupu *", "ZH": "采购价 *", "DE": "Einkaufspreis *"},
+    "calc.cost.section.cost_currency": {"EN": "Cost currency", "PL": "Waluta kosztu własnego", "ZH": "成本货币", "DE": "Kostenwährung"},
+    "calc.cost.section.delivery_methods": {
+        "EN": "Delivery methods  (✓ — select, rate — editable)",
+        "PL": "Metody dostawy  (✓ — wybierz, stawka — edytowalna)",
+        "ZH": "配送方式（✓ — 勾选，单价可编辑）",
+        "DE": "Liefermethoden  (✓ — auswählen, Tarif bearbeitbar)",
+    },
+    "calc.cost.section.price_tiers": {"EN": "Sale prices (optional)", "PL": "Ceny sprzedaży (opcjonalnie)", "ZH": "销售价格（可选）", "DE": "Verkaufspreise (optional)"},
+    "calc.cost.section.purchase": {"EN": "Purchase", "PL": "Zakup", "ZH": "采购", "DE": "Einkauf"},
+    "calc.cost.tariff_per_kg": {"EN": "rate/kg", "PL": "stawka/kg", "ZH": "单价/千克", "DE": "Tarif/kg"},
+    "calc.cost.title": {"EN": "Cost price", "PL": "Cena kosztowa", "ZH": "成本价", "DE": "Selbstkosten"},
+    "calc.cost.weight": {"EN": "Weight, kg *", "PL": "Waga, kg *", "ZH": "重量，千克 *", "DE": "Gewicht, kg *"},
+    "calc.cost_clo.duty_rate": {"EN": "Duty rate, % *", "PL": "Stawka cła, % *", "ZH": "关税税率，% *", "DE": "Zollsatz, % *"},
+    "calc.cost_clo.err.enter_duty_rate": {"EN": "Enter the duty rate", "PL": "Podaj stawkę cła", "ZH": "请输入关税税率", "DE": "Geben Sie den Zollsatz ein"},
+    "calc.cost_clo.err.enter_freight_coef": {
+        "EN": "Enter the duty coefficient (CLA)",
+        "PL": "Podaj współczynnik naliczania cła (CLA)",
+        "ZH": "请输入关税计算系数 (CLA)",
+        "DE": "Geben Sie den Zollberechnungsfaktor (CLA) ein",
+    },
+    "calc.cost_clo.formula": {
+        "EN": "Cost with duty = Cost + Duty rate% × (Cost ÷ Duty coefficient (CLA))",
+        "PL": "Koszt z cłem = Koszt + Stawka cła% × (Koszt ÷ Współczynnik naliczania cła (CLA))",
+        "ZH": "含税成本 = 成本 + 关税税率% × （成本 ÷ 关税计算系数 (CLA)）",
+        "DE": "Selbstkosten mit Zoll = Selbstkosten + Zollsatz% × (Selbstkosten ÷ Zollberechnungsfaktor (CLA))",
+    },
+    "calc.cost_clo.freight_coef": {"EN": "Duty coefficient (CLA) *", "PL": "Współcz. naliczania cła (CLA) *", "ZH": "关税计算系数 (CLA) *", "DE": "Zollberechnungsfaktor (CLA) *"},
+    "calc.cost_clo.help1": {
+        "EN": "Duty is charged only on the portion of the delivery outside the EU (up to the EU border) — the duty coefficient (CLA) already accounts for that share.",
+        "PL": "Cło jest naliczane tylko od tej części dostawy, która przebiega poza UE (do granicy z krajami UE) — współczynnik naliczania cła (CLA) już uwzględnia ten udział.",
+        "ZH": "关税仅按运输中在欧盟境外（到欧盟边境为止）的部分计算——关税计算系数 (CLA) 已经计入该比例。",
+        "DE": "Der Zoll wird nur auf den Teil der Lieferung außerhalb der EU (bis zur EU-Grenze) berechnet — der Zollberechnungsfaktor (CLA) berücksichtigt diesen Anteil bereits.",
+    },
+    "calc.cost_clo.help2": {
+        "EN": "Formula: Duty = Duty rate% × (Cost without duty ÷ Duty coefficient (CLA)).",
+        "PL": "Wzór: Cło = Stawka cła% × (Koszt bez cła ÷ Współczynnik naliczania cła (CLA)).",
+        "ZH": "公式：关税 = 关税税率% × （不含税成本 ÷ 关税计算系数 (CLA)）。",
+        "DE": "Formel: Zoll = Zollsatz% × (Selbstkosten ohne Zoll ÷ Zollberechnungsfaktor (CLA)).",
+    },
+    "calc.cost_clo.help3": {
+        "EN": "Example: invoice 2 + logistics 1 = 3, rate 9.7%, coefficient 1.2 (80% outside EU / 20% within EU) → duty = 9.7% × (3 ÷ 1.2) = 0.2425.",
+        "PL": "Przykład: faktura 2 + logistyka 1 = 3, stawka 9,7%, współczynnik 1,2 (80% poza UE / 20% w UE) → cło = 9,7% × (3 ÷ 1,2) = 0,2425.",
+        "ZH": "示例：发票 2 + 物流 1 = 3，税率 9.7%，系数 1.2（80% 在欧盟境外 / 20% 在欧盟境内）→ 关税 = 9.7% × （3 ÷ 1.2） = 0.2425。",
+        "DE": "Beispiel: Rechnung 2 + Logistik 1 = 3, Satz 9,7 %, Koeffizient 1,2 (80 % außerhalb der EU / 20 % innerhalb der EU) → Zoll = 9,7 % × (3 ÷ 1,2) = 0,2425.",
+    },
+    "calc.cost_clo.help4": {
+        "EN": "The resulting cost with duty is then used for profitability and comparison with sale prices — same as in the regular Cost price calculator.",
+        "PL": "Ostateczny koszt z cłem jest następnie wykorzystywany do rentowności i porównania z cenami sprzedaży — tak samo jak w zwykłym kalkulatorze kosztu własnego.",
+        "ZH": "最终的含税成本随后用于计算盈利能力并与销售价格比较——与普通的成本价计算器相同。",
+        "DE": "Die resultierenden Selbstkosten mit Zoll werden dann für die Rentabilität und den Vergleich mit Verkaufspreisen verwendet — genauso wie im normalen Selbstkosten-Rechner.",
+    },
+    "calc.cost_clo.result.cost_no_duty": {"EN": "Cost without duty:", "PL": "Koszt bez cła:", "ZH": "不含税成本：", "DE": "Selbstkosten ohne Zoll:"},
+    "calc.cost_clo.result.cost_with_duty": {"EN": "Cost with duty:", "PL": "Koszt z cłem:", "ZH": "含税成本：", "DE": "Selbstkosten mit Zoll:"},
+    "calc.cost_clo.result.duty_short": {"EN": "Duty", "PL": "Cło", "ZH": "关税", "DE": "Zoll"},
+    "calc.cost_clo.result.duty_line": {
+        "EN": "Duty ({rate:.1f}% ÷ {coef:g}):",
+        "PL": "Cło ({rate:.1f}% ÷ {coef:g}):",
+        "ZH": "关税（{rate:.1f}% ÷ {coef:g}）：",
+        "DE": "Zoll ({rate:.1f}% ÷ {coef:g}):",
+    },
+    "calc.cost_clo.section.duty": {
+        "EN": "Duty (rate × (Cost ÷ adjustment coef.))",
+        "PL": "Cło (stawka × (Koszt ÷ współcz. korekty))",
+        "ZH": "关税（税率 × （成本 ÷ 调整系数））",
+        "DE": "Zoll (Satz × (Selbstkosten ÷ Korrekturfaktor))",
+    },
+    "calc.cost_clo.title": {"EN": "Cost price with duty", "PL": "Cena kosztowa z cłem", "ZH": "含税成本价", "DE": "Selbstkosten mit Zoll"},
+    "calc.err.choose_delivery_method": {
+        "EN": "Choose at least one delivery method",
+        "PL": "Wybierz przynajmniej jedną metodę dostawy",
+        "ZH": "请至少选择一种配送方式",
+        "DE": "Wählen Sie mindestens eine Liefermethode",
+    },
+    "calc.err.enter_purchase_price": {"EN": "Enter the purchase price", "PL": "Podaj cenę zakupu", "ZH": "请输入采购价", "DE": "Geben Sie den Einkaufspreis ein"},
+    "calc.err.enter_weight": {"EN": "Enter the weight", "PL": "Podaj wagę", "ZH": "请输入重量", "DE": "Geben Sie das Gewicht ein"},
+    "calc.err.no_rate": {"EN": "No exchange rate {a} → {b}", "PL": "Brak kursu {a} → {b}", "ZH": "没有汇率 {a} → {b}", "DE": "Kein Wechselkurs {a} → {b}"},
+    "calc.err.rates_not_loaded": {
+        "EN": "(rates not loaded yet — try again in a few seconds)",
+        "PL": "(kursy jeszcze się nie załadowały — spróbuj ponownie za kilka sekund)",
+        "ZH": "（汇率尚未加载——请几秒后重试）",
+        "DE": "(Kurse noch nicht geladen — versuchen Sie es in ein paar Sekunden erneut)",
+    },
+    "calc.err.region_switch": {
+        "EN": "⚠ Error switching region: {region}",
+        "PL": "⚠ Błąd przełączania regionu: {region}",
+        "ZH": "⚠ 切换地区出错：{region}",
+        "DE": "⚠ Fehler beim Wechseln der Region: {region}",
+    },
+    "calc.field.choose_placeholder": {"EN": "— choose —", "PL": "— wybierz —", "ZH": "— 请选择 —", "DE": "— auswählen —"},
+    "calc.field.currency": {"EN": "Currency", "PL": "Waluta", "ZH": "货币", "DE": "Währung"},
+    "calc.field.optional_suffix": {"EN": "(opt.)", "PL": "(opc.)", "ZH": "（选填）", "DE": "(opt.)"},
+    "calc.field.region": {"EN": "Region", "PL": "Region", "ZH": "地区", "DE": "Region"},
+    "calc.field.rent_pct": {"EN": "Profitability, %", "PL": "Rentowność, %", "ZH": "利润率，%", "DE": "Rentabilität, %"},
+    "calc.field.rent_pct_optional": {"EN": "Profitability (optional)", "PL": "Rentowność (opcjonalnie)", "ZH": "利润率（可选）", "DE": "Rentabilität (optional)"},
+    "calc.profit.cost": {"EN": "Cost *", "PL": "Koszt *", "ZH": "成本 *", "DE": "Selbstkosten *"},
+    "calc.profit.cost_section": {"EN": "Cost", "PL": "Koszt", "ZH": "成本", "DE": "Selbstkosten"},
+    "calc.profit.err.enter_cost": {"EN": "Enter the cost", "PL": "Podaj koszt", "ZH": "请输入成本", "DE": "Geben Sie die Selbstkosten ein"},
+    "calc.profit.formula": {
+        "EN": "Price = Cost ÷ (1 − Profitability%)  |  Profitability% = (Price − Cost) ÷ Price × 100",
+        "PL": "Cena = Koszt ÷ (1 − Rentowność%)  |  Rentowność% = (Cena − Koszt) ÷ Cena × 100",
+        "ZH": "价格 = 成本 ÷ （1 − 利润率%）｜利润率% = （价格 − 成本）÷ 价格 × 100",
+        "DE": "Preis = Selbstkosten ÷ (1 − Rentabilität%)  |  Rentabilität% = (Preis − Selbstkosten) ÷ Preis × 100",
+    },
+    "calc.profit.result.cost_line": {"EN": "Cost ({ccy}):", "PL": "Koszt ({ccy}):", "ZH": "成本（{ccy}）：", "DE": "Selbstkosten ({ccy}):"},
+    "calc.profit.title": {"EN": "Profitability", "PL": "Rentowność", "ZH": "盈利能力", "DE": "Rentabilität"},
+    "calc.result.breakdown_title": {"EN": "Share, %", "PL": "Udział, %", "ZH": "占比，%", "DE": "Anteil, %"},
+    "calc.result.cost": {"EN": "Cost:", "PL": "Koszt:", "ZH": "成本：", "DE": "Selbstkosten:"},
+    "calc.result.delivery_line": {
+        "EN": "Delivery ({weight} kg × {tariff} {ccy}/kg):",
+        "PL": "Dostawa ({weight} kg × {tariff} {ccy}/kg):",
+        "ZH": "运费（{weight} 千克 × {tariff} {ccy}/千克）：",
+        "DE": "Lieferung ({weight} kg × {tariff} {ccy}/kg):",
+    },
+    "calc.result.delivery_short": {"EN": "Delivery", "PL": "Dostawa", "ZH": "配送", "DE": "Lieferung"},
+    "calc.result.packaging": {"EN": "Packaging:", "PL": "Opakowanie:", "ZH": "包装：", "DE": "Verpackung:"},
+    "calc.result.price_at_rent": {
+        "EN": "Price at {pct:.0f}% profitability:",
+        "PL": "Cena przy rent. {pct:.0f}%:",
+        "ZH": "利润率 {pct:.0f}% 时的价格：",
+        "DE": "Preis bei {pct:.0f}% Rentabilität:",
+    },
+    "calc.result.purchase_price": {"EN": "Purchase price:", "PL": "Cena zakupu:", "ZH": "采购价：", "DE": "Einkaufspreis:"},
+    "calc.saved.empty": {"EN": "No saved calculations", "PL": "Brak zapisanych obliczeń", "ZH": "没有已保存的计算", "DE": "Keine gespeicherten Berechnungen"},
+    "calc.saved.open": {"EN": "Open", "PL": "Otwórz", "ZH": "打开", "DE": "Öffnen"},
+    "calc.saved.title": {"EN": "Saved calculations", "PL": "Zapisane obliczenia", "ZH": "已保存的计算", "DE": "Gespeicherte Berechnungen"},
+    "calc.tier.add_level": {"EN": "Add price level", "PL": "Dodaj poziom ceny", "ZH": "添加价格等级", "DE": "Preisstufe hinzufügen"},
+    "calc.tier.custom_name": {"EN": "Tier name", "PL": "Nazwa poziomu", "ZH": "价格等级名称", "DE": "Stufenname"},
+    "calc.tier.custom_price": {"EN": "Tier price", "PL": "Cena poziomu", "ZH": "价格等级价格", "DE": "Stufenpreis"},
+    "calc.tier.custom_section": {
+        "EN": "Additional price tier (manual)",
+        "PL": "Dodatkowy poziom ceny (ręcznie)",
+        "ZH": "附加价格等级（手动）",
+        "DE": "Zusätzliche Preisstufe (manuell)",
+    },
+    "calc.turnover.coverage_label": {"EN": "Coverage:", "PL": "Zabezpieczenie:", "ZH": "保障天数：", "DE": "Deckung:"},
+    "calc.turnover.cost": {"EN": "Cost of goods sold *", "PL": "Koszt sprzedanych towarów *", "ZH": "已售商品成本 *", "DE": "Kosten der verkauften Waren *"},
+    "calc.turnover.days": {"EN": "Number of days in period *", "PL": "Liczba dni w okresie *", "ZH": "期间天数 *", "DE": "Anzahl der Tage im Zeitraum *"},
+    "calc.turnover.days_unit": {"EN": "days", "PL": "dni", "ZH": "天", "DE": "Tage"},
+    "calc.turnover.end": {"EN": "Stock at end *", "PL": "Stan magazynu na koniec *", "ZH": "期末库存 *", "DE": "Lagerbestand Ende *"},
+    "calc.turnover.err.cost_zero": {"EN": "Cost = 0", "PL": "Koszt = 0", "ZH": "成本 = 0", "DE": "Selbstkosten = 0"},
+    "calc.turnover.err.fill_all": {"EN": "Fill in all fields", "PL": "Wypełnij wszystkie pola", "ZH": "请填写所有字段", "DE": "Füllen Sie alle Felder aus"},
+    "calc.turnover.formula1": {
+        "EN": "Turnover = ((Start + End) / 2 × Days) / Cost",
+        "PL": "Obrót = ((Początek + Koniec) / 2 × Dni) / Koszt",
+        "ZH": "周转率 = ((期初 + 期末) / 2 × 天数) / 成本",
+        "DE": "Umschlag = ((Anfang + Ende) / 2 × Tage) / Selbstkosten",
+    },
+    "calc.turnover.formula2": {
+        "EN": "Coverage = (End × Days) / Cost",
+        "PL": "Zabezpieczenie = (Koniec × Dni) / Koszt",
+        "ZH": "保障天数 = (期末 × 天数) / 成本",
+        "DE": "Deckung = (Ende × Tage) / Selbstkosten",
+    },
+    "calc.turnover.start": {"EN": "Stock at start *", "PL": "Stan magazynu na początek *", "ZH": "期初库存 *", "DE": "Lagerbestand Anfang *"},
+    "calc.turnover.title": {"EN": "Turnover / Coverage", "PL": "Obrót / Zabezpieczenie", "ZH": "周转 / 保障", "DE": "Umsatz / Deckung"},
+    "calc.turnover.turnover_label": {"EN": "Turnover:", "PL": "Obrót:", "ZH": "周转率：", "DE": "Umschlag:"},
+    "calc.type.cost_clo": {"EN": "Cost + duty", "PL": "Cena kosztowa z cłem", "ZH": "含税成本", "DE": "Selbstkosten + Zoll"},
+    "nav.calculator_access": {"EN": "Calculator", "PL": "Kalkulator", "ZH": "计算器", "DE": "Rechner"},
     "calc.type.basic": {
         "EN": "Basic",
         "PL": "Zwykły",
@@ -8045,6 +6918,8 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
     "orders.col.submission": {"EN": "Data Entry", "PL": "Wprowadzanie danych", "ZH": "数据录入", "DE": "Dateneingabe"},
     "orders.col.date_prod_end": {"EN": "Ready", "PL": "Gotowe", "ZH": "已完成", "DE": "Fertig"},
     "orders.col.dur_prod": {"EN": "Prod. Term", "PL": "Czas produkcji", "ZH": "生产周期", "DE": "Produktionsfrist"},
+    "orders.col.date_departed": {"EN": "Departed", "PL": "Wysłano", "ZH": "已发货", "DE": "Versendet"},
+    "orders.col.dur_wait": {"EN": "Wait Term", "PL": "Czas oczekiwania", "ZH": "等待周期", "DE": "Wartefrist"},
     "orders.col.date_wh": {"EN": "In Stock", "PL": "W magazynie", "ZH": "入库", "DE": "Auf Lager"},
     "orders.col.dur_deliv": {"EN": "Delivery Term", "PL": "Czas dostawy", "ZH": "交货期", "DE": "Lieferfrist"},
     "orders.col.date_1c": {"EN": "Receiving", "PL": "Odbiór", "ZH": "收货验收", "DE": "Wareneingang"},
@@ -8090,9 +6965,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
     "pack_stock.col.zp": {"EN": "Acct. No.", "PL": "Nr księg.", "ZH": "记账号", "DE": "Buchh.-Nr."},
     "pack_stock.col.inv": {"EN": "Invoice", "PL": "Faktura", "ZH": "发票", "DE": "Rechnung"},
     "pack_stock.col.cmt": {"EN": "Comment", "PL": "Komentarz", "ZH": "备注", "DE": "Kommentar"},
-    "pack_stock.toggle.bal_pack": {"EN": "Balance (pack.)", "PL": "Saldo (opak.)", "ZH": "结余(包装)", "DE": "Saldo (Verp.)"},
-    "pack_stock.toggle.bal_goods": {"EN": "Balance (goods)", "PL": "Saldo (towar)", "ZH": "结余(货品)", "DE": "Saldo (Ware)"},
-    "pack_stock.toggle.del": {"EN": "Delete", "PL": "Usuwanie", "ZH": "删除", "DE": "Löschen"},
     # payments.col.* — Взаєморозрахунки (views/payments_view.py)
     "payments.col.invoice": {"EN": "Invoice", "PL": "Faktura", "ZH": "发票", "DE": "Rechnung"},
     "payments.col.status": {"EN": "Status", "PL": "Status", "ZH": "状态", "DE": "Status"},
@@ -8128,11 +7000,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
     "settings.users_table.col.approved": {"EN": "Approved", "PL": "Zatwierdzono", "ZH": "已批准", "DE": "Bestätigt"},
     "settings.users_table.col.access": {"EN": "Access", "PL": "Dostęp", "ZH": "权限", "DE": "Zugriff"},
     # extensions.gsm_log.col.* — Розширення → GSM Parser run log (views/extensions_view.py)
-    "extensions.gsm_log.col.source": {"EN": "Source", "PL": "Źródło", "ZH": "来源", "DE": "Quelle"},
-    "extensions.gsm_log.col.brand": {"EN": "Brand", "PL": "Marka", "ZH": "品牌", "DE": "Marke"},
-    "extensions.gsm_log.col.type": {"EN": "Type", "PL": "Typ", "ZH": "类型", "DE": "Typ"},
-    "extensions.gsm_log.col.model": {"EN": "Model", "PL": "Model", "ZH": "型号", "DE": "Modell"},
-    "extensions.gsm_log.col.last_seen": {"EN": "Last Date", "PL": "Ostatnia data", "ZH": "最后日期", "DE": "Letztes Datum"},
     # gsm.device_modal.col.* — GSM Parser device card regional-variant sub-table
     "gsm.device_modal.col.variation": {"EN": "Variant", "PL": "Wariant", "ZH": "变体", "DE": "Variante"},
     "gsm.device_modal.col.color": {"EN": "Color", "PL": "Kolor", "ZH": "颜色", "DE": "Farbe"},
@@ -8213,12 +7080,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
     "extensions.msg_editor.upload_photo": {"EN": "Upload photo", "PL": "Prześlij zdjęcie", "ZH": "上传照片", "DE": "Foto hochladen"},
     "extensions.msg_editor.badge_header": {"EN": "Header", "PL": "Nagłówek", "ZH": "标题", "DE": "Überschrift"},
     "extensions.msg_editor.badge_card": {"EN": "Device card", "PL": "Karta urządzenia", "ZH": "设备卡片", "DE": "Gerätekarte"},
-    "extensions.msg_editor.no_blocks": {
-        "EN": "No blocks yet — add a header or a device card.",
-        "PL": "Brak bloków — dodaj nagłówek lub kartę urządzenia.",
-        "ZH": "暂无区块——添加标题或设备卡片。",
-        "DE": "Noch keine Blöcke — fügen Sie eine Überschrift oder eine Gerätekarte hinzu.",
-    },
     "extensions.msg_editor.add_header": {"EN": "+ Header", "PL": "+ Nagłówek", "ZH": "+ 标题", "DE": "+ Überschrift"},
     "extensions.msg_editor.add_card": {"EN": "+ Device card", "PL": "+ Karta urządzenia", "ZH": "+ 设备卡片", "DE": "+ Gerätekarte"},
     "extensions.msg_editor.category_blocks_intro": {
@@ -8458,7 +7319,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
     "gsm.help.step3": {"EN": "3. Clicking a row opens the device card (specs, compatibility, price chart).", "PL": "3. Kliknięcie wiersza otwiera kartę urządzenia (specyfikacje, kompatybilność, wykres cen).", "ZH": "3. 点击一行可打开设备卡片（规格、兼容性、价格图表）。", "DE": "3. Ein Klick auf eine Zeile öffnet die Gerätekarte (Spezifikationen, Kompatibilität, Preisdiagramm)."},
     "gsm.help.step4": {"EN": "4. \"Sync\" refreshes the cache from the database.", "PL": "4. \"Synchronizacja\" odświeża pamięć podręczną z bazy danych.", "ZH": "4.“同步”从数据库刷新缓存。", "DE": "4. \"Synchronisierung\" aktualisiert den Cache aus der Datenbank."},
     "gsm.help.step5": {"EN": "5. \"Run\" starts the parser (full / GSM only / E-Katalog only).", "PL": "5. \"Uruchom\" uruchamia parser (pełny / tylko GSM / tylko E-Katalog).", "ZH": "5.“运行”启动解析器（完整 / 仅 GSM / 仅 E-Katalog）。", "DE": "5. \"Starten\" startet den Parser (vollständig / nur GSM / nur E-Katalog)."},
-    "gsm.help.step6": {"EN": "6. \"Schedule run…\" in the same menu starts the parser after a set delay instead of right away (the app must stay open).", "PL": "6. \"Zaplanuj uruchomienie…\" w tym samym menu uruchamia parser po określonym czasie zamiast od razu (aplikacja musi pozostać otwarta).", "ZH": "6. 同一菜单中的“计划运行…”会在设定的延迟后启动解析器，而不是立即启动（应用需保持打开）。", "DE": "6. \"Start planen…\" im selben Menü startet den Parser nach einer festgelegten Verzögerung statt sofort (die App muss geöffnet bleiben)."},
     "gsm.help.steps_title": {"EN": "How to use", "PL": "Jak korzystać", "ZH": "使用方法", "DE": "So verwenden Sie es"},
     "gsm.help.title": {"EN": "Help — GSM Parser", "PL": "Pomoc — GSM Parser", "ZH": "帮助——GSM 解析器", "DE": "Hilfe — GSM Parser"},
     "gsm.loading_wait": {"EN": "Please wait, data is still loading…", "PL": "Poczekaj, dane wciąż się ładują…", "ZH": "请稍候，数据仍在加载中…", "DE": "Bitte warten, Daten werden noch geladen…"},
@@ -8468,17 +7328,6 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
     "gsm.nothing_selected": {"EN": "Nothing selected", "PL": "Nic nie wybrano", "ZH": "未选择任何内容", "DE": "Nichts ausgewählt"},
     "gsm.preset_saved": {"EN": "Preset \"{name}\" saved", "PL": "Preset \"{name}\" zapisany", "ZH": "预设“{name}”已保存", "DE": "Preset \"{name}\" gespeichert"},
     "gsm.presets_hint": {"EN": "My Filters", "PL": "Moje filtry", "ZH": "我的筛选", "DE": "Meine Filter"},
-    "gsm.schedule.cancel_active_btn": {"EN": "Cancel scheduled run", "PL": "Anuluj zaplanowane uruchomienie", "ZH": "取消已计划的运行", "DE": "Geplanten Start abbrechen"},
-    "gsm.schedule.cancelled_snack": {"EN": "Scheduled run cancelled", "PL": "Zaplanowane uruchomienie anulowane", "ZH": "已计划的运行已取消", "DE": "Geplanter Start abgebrochen"},
-    "gsm.schedule.help.desc": {"EN": "Lets you start the parser after a set delay instead of right away — handy if you run parsing manually at night and want the changes locked in by tomorrow.", "PL": "Pozwala uruchomić parser po określonym czasie zamiast od razu — przydatne, jeśli uruchamiasz parsowanie ręcznie w nocy i chcesz, aby zmiany zostały zapisane już następnego dnia.", "ZH": "允许在设定的延迟后而非立即启动解析器——如果您在夜间手动运行解析并希望变更在明天生效，这会很方便。", "DE": "Ermöglicht den Start des Parsers nach einer festgelegten Verzögerung statt sofort — praktisch, wenn Sie das Parsing nachts manuell starten und die Änderungen bis morgen übernommen sein sollen."},
-    "gsm.schedule.help.step1": {"EN": "1. Choose the run mode (full / GSM only / E-Katalog only).", "PL": "1. Wybierz tryb uruchomienia (pełny / tylko GSM / tylko E-Katalog).", "ZH": "1. 选择运行模式（完整 / 仅 GSM / 仅 E-Katalog）。", "DE": "1. Wählen Sie den Startmodus (vollständig / nur GSM / nur E-Katalog)."},
-    "gsm.schedule.help.step2": {"EN": "2. Click one of the quick-select buttons or set a delay from now in the \"Hours\" / \"Minutes\" fields (e.g. 1h 30m — starts in an hour and a half, not at 1:30).", "PL": "2. Kliknij jeden z przycisków szybkiego wyboru albo ustaw opóźnienie od teraz w polach \"Godziny\" / \"Minuty\" (np. 1 godz. 30 min — start za półtorej godziny, a nie o 1:30).", "ZH": "2. 点击快速选择按钮之一，或在“小时”/“分钟”字段中设置从现在起的延迟（例如 1 小时 30 分钟——表示一个半小时后启动，而非在 1:30 启动）。", "DE": "2. Klicken Sie auf eine der Schnellauswahl-Schaltflächen oder legen Sie eine Verzögerung ab jetzt in den Feldern \"Stunden\" / \"Minuten\" fest (z. B. 1 Std. 30 Min. — startet in eineinhalb Stunden, nicht um 1:30 Uhr)."},
-    "gsm.schedule.help.step3": {"EN": "3. Click \"Schedule\" — a countdown will appear next to the \"Run\" button.", "PL": "3. Kliknij \"Zaplanuj\" — obok przycisku \"Uruchom\" pojawi się odliczanie.", "ZH": "3. 点击“计划”——“运行”按钮旁会出现倒计时。", "DE": "3. Klicken Sie auf \"Planen\" — neben der Schaltfläche \"Starten\" erscheint ein Countdown."},
-    "gsm.schedule.help.step4": {"EN": "4. The app must stay open — the run will start automatically once the set time arrives.", "PL": "4. Aplikacja musi pozostać otwarta — uruchomienie nastąpi automatycznie, gdy nadejdzie ustawiony czas.", "ZH": "4. 应用需保持打开——到达设定时间后将自动启动运行。", "DE": "4. Die App muss geöffnet bleiben — der Start erfolgt automatisch, sobald die festgelegte Zeit erreicht ist."},
-    "gsm.schedule.help.step5": {"EN": "5. \"Cancel scheduled run\" removes the timer without starting the parser.", "PL": "5. \"Anuluj zaplanowane uruchomienie\" usuwa licznik bez uruchamiania parsera.", "ZH": "5.“取消已计划的运行”会移除计时器而不启动解析器。", "DE": "5. \"Geplanten Start abbrechen\" entfernt den Timer, ohne den Parser zu starten."},
-    "gsm.schedule.help.steps_title": {"EN": "How to use", "PL": "Jak korzystać", "ZH": "使用方法", "DE": "So verwenden Sie es"},
-    "gsm.schedule.help_title": {"EN": "Help — Scheduled run", "PL": "Pomoc — Zaplanowane uruchomienie", "ZH": "帮助——计划运行", "DE": "Hilfe — Geplanter Start"},
-    "gsm.schedule.invalid_delay": {"EN": "Specify a time greater than zero", "PL": "Podaj czas większy niż zero", "ZH": "请指定大于零的时间", "DE": "Geben Sie eine Zeit größer als null an"},
     "home.display_help.step1": {"EN": "1. Check the metrics you want displayed in the table.", "PL": "1. Zaznacz wskaźniki, które chcesz wyświetlić w tabeli.", "ZH": "1. 勾选要在表格中显示的指标。", "DE": "1. Wählen Sie die Kennzahlen aus, die in der Tabelle angezeigt werden sollen."},
     "home.display_help.step2": {"EN": "2. Click \"Save\".", "PL": "2. Kliknij \"Zapisz\".", "ZH": "2. 点击“保存”。", "DE": "2. Klicken Sie auf \"Speichern\"."},
     "languages.add_lang_help.step1": {"EN": "1. Enter the language name and its code (e.g. FR, ES).", "PL": "1. Wpisz nazwę języka i jego kod (np. FR, ES).", "ZH": "1. 输入语言名称及其代码（例如 FR、ES）。", "DE": "1. Geben Sie den Sprachnamen und dessen Code ein (z. B. FR, ES)."},
@@ -8788,7 +7637,7 @@ _UI_SEEDS: dict[str, dict[str, str]] = {
 
 def seed_ui_translations_if_new(db=None) -> None:
     """Seed non-UA UI translations into the DB (DO NOTHING on conflict).
-    Safe to call every app start вЂ” never overwrites admin edits."""
+    Safe to call every app start — never overwrites admin edits."""
     _db = db or _DB
     if _db is None or not hasattr(_db, "seed_translation_values_bulk_if_new"):
         return
@@ -8799,6 +7648,22 @@ def seed_ui_translations_if_new(db=None) -> None:
                 by_lang.setdefault(lang, {})[key] = value
         for lang_code, values in by_lang.items():
             _db.seed_translation_values_bulk_if_new(lang_code, values)
+
+
+def get_static_seed_translations(lang_code: str) -> dict[str, str]:
+    """Same key->value data as seed_ui_translations_if_new()/
+    seed_help_translations_if_new(), but returned directly in-memory instead
+    of written to Postgres — for standalone/no-DB contexts (e.g. the portable
+    calculator exe) that have no public.translation_values table to seed."""
+    lang = str(lang_code or "").upper()
+    out: dict[str, str] = {}
+    for key, lang_map in _HELP_SEEDS.items():
+        if lang in lang_map:
+            out[key] = lang_map[lang]
+    for key, lang_map in _UI_SEEDS.items():
+        if lang in lang_map:
+            out[key] = lang_map[lang]
+    return out
 
 
 
@@ -8908,8 +7773,32 @@ def _register_key_if_new(key: str, uk_text: str) -> None:
         return
     _known_keys.add(key)
     if _DB is not None:
-        with contextlib.suppress(Exception):
-            _DB.register_translation_key(key, uk_text)
+        # register_translation_key() is a real Postgres round-trip
+        # (_ensure_i18n_tables + INSERT + commit) — t() is called from
+        # synchronous UI-building code (calculator panels, etc.), so doing
+        # this inline used to block the whole dialog open for however long
+        # that took, once per brand-new key. A screen with a couple dozen
+        # keys never seen before (e.g. right after adding a new
+        # calculator's worth of translations) turned into several seconds
+        # of frozen UI the first time it was opened in a running process.
+        # The registration itself has no UI-visible effect, so it can run
+        # fully in the background — _known_keys already marks it "seen"
+        # above, so a rapid second call for the same key won't double-fire.
+        _db = _DB
+
+        def _register_bg():
+            with contextlib.suppress(Exception):
+                _db.register_translation_key(key, uk_text)
+
+        # threading.Thread(...).start() everywhere except the browser (this
+        # module is also used by calculator_web_app.py's Flet/Pyodide web
+        # build, which runs single-threaded — real OS thread creation isn't
+        # available there and raises "can't start new thread"). Falls back
+        # to calling it synchronously in that case.
+        try:
+            threading.Thread(target=_register_bg, daemon=True).start()
+        except Exception:
+            _register_bg()
 
 
 def _ensure_lang_values_loaded(lang_code: str) -> None:

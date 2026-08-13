@@ -279,15 +279,16 @@ def _sync_order_schedule_tasks(db, diary: dict, company_id: str, mid: str) -> bo
     if not company_id:
         return False
     try:
-        tasks = (
-            db.get_order_schedule_tasks(company_id, mid, include_archived=False) or []
-        )
         # Archived tasks still exist (just parked) and must not be treated as
         # deleted below, even though they're excluded from the main loop so
-        # they don't keep generating fresh reminders.
+        # they don't keep generating fresh reminders. `tasks` (non-archived)
+        # is always a subset of `all_tasks` — one query + a Python filter
+        # instead of two identical round trips that only differ by an
+        # `archived=FALSE` clause.
         all_tasks = (
             db.get_order_schedule_tasks(company_id, mid, include_archived=True) or []
         )
+        tasks = [t for t in all_tasks if isinstance(t, dict) and not t.get("archived")]
         groups = db.get_order_schedule_groups(company_id, mid) or []
     except Exception:
         logger.exception("[notebook] order-schedule sync fetch failed")

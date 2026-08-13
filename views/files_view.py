@@ -103,18 +103,32 @@ class FilesView:
     def build(self):
         """Build layout once; subsequent calls just refresh data."""
         if self._layout_built:
-            self._reload_tree()
+            self._schedule_reload_tree()
             return
         self._layout_built = True
         self._build_layout()
-        self._reload_tree()
+        self._schedule_reload_tree()
 
     def resume(self):
         """Called when tab becomes active — only refresh data, no layout rebuild."""
         if self._layout_built:
-            self._reload_tree()
+            self._schedule_reload_tree()
         else:
             self.build()
+
+    def _schedule_reload_tree(self) -> None:
+        """Run the folder-tree fetch off-thread instead of blocking the event
+        loop — _reload_tree_async (already used by set_region) already does
+        this correctly with a loading stub; build()/resume() just called the
+        blocking self._reload_tree() directly instead of reusing it."""
+        page = self._page()
+        if page and hasattr(page, "run_task"):
+            with contextlib.suppress(Exception):
+                page.run_task(self._reload_tree_async)
+                return
+        # No page yet (shouldn't normally happen) — fall back to the
+        # blocking fetch rather than silently loading nothing.
+        self._reload_tree()
 
     async def set_region(self, region_id: str, region_label: str) -> None:
         """Called by dashboard on region change. No layout rebuild — only the

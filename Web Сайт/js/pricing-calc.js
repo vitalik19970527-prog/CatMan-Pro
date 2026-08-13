@@ -45,6 +45,7 @@
     var modeSel = document.getElementById("calcMode");
     var totalEl = document.getElementById("calcTotal");
     var onceEl = document.getElementById("calcOnce");
+    var vpsNoteEl = document.getElementById("calcVpsNote");
     if (!peopleSel || !modeSel || !totalEl) return;
 
     var tierIndex = TIERS.indexOf(Number(peopleSel.value));
@@ -74,6 +75,9 @@
     if (mode === "vpsours") {
       total += HOSTING_FEE[tierIndex];
       once += HOSTING_SETUP;
+    }
+    if (vpsNoteEl) {
+      vpsNoteEl.style.display = mode === "vpsours" ? "" : "none";
     }
 
     total = roundUpTo9(total);

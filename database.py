@@ -5,7 +5,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import bcrypt
@@ -131,6 +131,29 @@ class DataManager:
         self._general_pg_conns: dict[int, psycopg.Connection] = {}
         self._general_pg_conns_last_used: dict[int, float] = {}
         self._general_schema_ready: bool = False
+        # Guards _ensure_general_schema()'s DDL batch — the check-then-run of
+        # _general_schema_ready below used to race across threads with no
+        # synchronization at all ("harmless, DDL is idempotent" — it isn't:
+        # confirmed live via a real Postgres deadlock storm). Several
+        # background threads opening their FIRST general-DB connection at
+        # once (e.g. right after a superadmin account switch triggers a
+        # burst of concurrent tab reconnects) each ran the same
+        # multi-statement ALTER TABLE/CREATE INDEX batch simultaneously;
+        # concurrent DDL transactions touching the same tables in a
+        # different order deadlock in Postgres even though each statement
+        # is individually IF-NOT-EXISTS-safe. This crashed the whole app.
+        # RLock, not Lock: _general_pg() itself acquires this same lock on its
+        # own first call (to run _ensure_general_schema()) — and every
+        # _ensure_*_table() function below ALSO wraps its body in this lock
+        # before calling self._general_pg() internally for its cursor. With a
+        # plain Lock that inner _general_pg() call deadlocks instantly and
+        # silently (same thread re-blocking on a lock it already holds) the
+        # very first time one of those functions is the first DB touch of a
+        # process — confirmed live as the exact cause of a black-screen hang
+        # on app boot (i18n's t() -> _ensure_i18n_tables() was that first
+        # touch). RLock allows the same thread to reacquire it, which is
+        # exactly what's needed here; cross-thread exclusion is unaffected.
+        self._general_schema_lock = threading.RLock()
         # Per-company connections — each company has its OWN dedicated Postgres
         # database (connection info stored in public.companies on the general DB).
         # Cached by "company_id::manager_id::t<thread-id>" so switching companies
@@ -169,6 +192,13 @@ class DataManager:
         # Session-scoped in-memory cache for expensive, rarely-changing queries.
         # Keyed by arbitrary string; values never expire during the process lifetime.
         self._session_cache: dict = {}
+        # See _reap_dead_thread_pg_connections(): rate-gates how often we sweep
+        # _company_conns/_general_pg_conns for entries whose owning thread has
+        # already exited (one-shot threading.Thread/ThreadPoolExecutor workers
+        # that touched the DB once and died — their cached connection would
+        # otherwise sit open on the server forever, since nothing else is keyed
+        # to that dead thread id to ever notice or reuse it).
+        self._last_conn_reap_ts: float = 0.0
 
     def _cached_list(self, cache_key: str, force_refresh: bool, fetch_fn):
         """Session-scoped cache-aside helper for expensive reference-data
@@ -294,6 +324,58 @@ class DataManager:
                 _conn.close()
         self._company_conns.clear()
 
+    def _reap_dead_thread_pg_connections(self) -> None:
+        """Close and evict cached connections whose owning thread has already
+        exited.
+
+        _pg()/_general_pg() cache one psycopg connection per THREAD ID
+        forever (see their docstrings) — correct for the long-lived threads
+        behind asyncio.to_thread's shared executor, but every one-shot
+        `threading.Thread(...).start()` or ad-hoc `ThreadPoolExecutor(...)`
+        call site that touches the DB gets its OWN never-reused thread id.
+        That thread dies right after, but its connection stays cached and
+        open on the server — nothing is keyed to a dead thread id, so it can
+        never be picked up and reused, only leaked. A single active user
+        doing many such one-shot actions over a session accumulates dozens of
+        these; multiplied across every logged-in machine this is what
+        exhausted Postgres's max_connections while real concurrent usage was
+        only 1-2 people (see 2026-08 connection-exhaustion incident).
+
+        A thread id absent from threading.enumerate() is guaranteed dead —
+        Python drops a thread from that registry the moment its run()
+        returns — so the connection cached under that id can never be in use
+        by anyone and is always safe to close here.
+
+        Rate-gated to run at most every 15s (called from the hot _pg()/
+        _general_pg() path) so the threading.enumerate() sweep itself stays
+        cheap.
+        """
+        now = time.monotonic()
+        if (now - self._last_conn_reap_ts) < 15.0:
+            return
+        self._last_conn_reap_ts = now
+        alive_tids = {t.ident for t in threading.enumerate() if t.ident is not None}
+
+        for tid, conn in list(self._general_pg_conns.items()):
+            if tid in alive_tids:
+                continue
+            with contextlib.suppress(Exception):
+                conn.close()
+            self._general_pg_conns.pop(tid, None)
+            self._general_pg_conns_last_used.pop(tid, None)
+
+        for cache_key, conn in list(self._company_conns.items()):
+            try:
+                tid = int(cache_key.rsplit("::t", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            if tid in alive_tids:
+                continue
+            with contextlib.suppress(Exception):
+                conn.close()
+            self._company_conns.pop(cache_key, None)
+            self._company_conns_last_used.pop(cache_key, None)
+
     # ----------------- mode -----------------
     def _use_postgres(self) -> bool:
         return bool(self._pg_dsn)
@@ -389,6 +471,7 @@ class DataManager:
         """
         if not self._use_postgres():
             raise RuntimeError("Postgres mode is not enabled (missing DATABASE_URL)")
+        self._reap_dead_thread_pg_connections()
         tid = threading.get_ident()
         conn = self._general_pg_conns.get(tid)
         if conn is not None and not conn.closed:
@@ -412,17 +495,31 @@ class DataManager:
             )
             self._general_pg_conns[tid] = conn
             # Kept in sync so _ensure_general_schema() (and the tmp_dm
-            # migration helper) can keep reading a single attribute — schema
-            # bootstrap is idempotent DDL, so it's harmless if two threads'
-            # first connections race to set this.
+            # migration helper) can keep reading a single attribute.
             self._general_pg_conn = conn
-            self._general_schema_ready = False
+            # NOTE: do NOT reset _general_schema_ready here. Schema
+            # readiness is a property of the DATABASE, not of any one
+            # thread's connection to it — resetting it every time a new
+            # thread opened its first connection meant every background
+            # thread that raced in (e.g. a burst of concurrent tab
+            # reconnects right after a superadmin account switch) re-ran
+            # the whole multi-statement DDL migration again. Individually
+            # each ALTER TABLE/CREATE INDEX is IF-NOT-EXISTS-safe, but
+            # concurrent DDL transactions touching the same tables in a
+            # different order can still deadlock in Postgres — confirmed
+            # live as a real deadlock storm that crashed the app. Real
+            # invalidation happens only in _evict_general_connections()
+            # (DSN actually changed — Local<->VPS switch, restore).
         if not self._general_schema_ready:
-            try:
-                self._ensure_general_schema()
-                self._general_schema_ready = True
-            except Exception:
-                logger.exception("_ensure_general_schema failed")
+            with self._general_schema_lock:
+                # Re-check inside the lock: another thread may have just
+                # finished the migration while we were waiting for it.
+                if not self._general_schema_ready:
+                    try:
+                        self._ensure_general_schema()
+                        self._general_schema_ready = True
+                    except Exception:
+                        logger.exception("_ensure_general_schema failed")
         self._general_pg_conns_last_used[tid] = time.monotonic()
         return conn
 
@@ -553,6 +650,7 @@ class DataManager:
         """
         if not self._use_postgres():
             raise RuntimeError("Postgres mode is not enabled (missing DATABASE_URL)")
+        self._reap_dead_thread_pg_connections()
         cid = self._active_company_id
         if not cid:
             raise RuntimeError("No active company selected — call set_company() first")
@@ -692,16 +790,17 @@ class DataManager:
         ]
 
     def _ensure_packaging_supply_tables(self) -> None:
-        if not self._use_postgres():
-            return
-        conn = self._pg()
-        try:
-            with conn.cursor() as cur:
-                for stmt in self._ddl_packaging_supply_tables():
-                    cur.execute(stmt)
-        except Exception:
-            logger.exception("ensure_packaging_supply_tables failed")
-            raise
+        with self._general_schema_lock:
+            if not self._use_postgres():
+                return
+            conn = self._pg()
+            try:
+                with conn.cursor() as cur:
+                    for stmt in self._ddl_packaging_supply_tables():
+                        cur.execute(stmt)
+            except Exception:
+                logger.exception("ensure_packaging_supply_tables failed")
+                raise
 
     def _pg_with_packaging_supply_schema(self):
         conn = self._pg()
@@ -825,6 +924,25 @@ class DataManager:
             "ALTER TABLE public.managers ADD COLUMN IF NOT EXISTS is_blocked boolean NOT NULL DEFAULT FALSE;",
             "ALTER TABLE public.gsm_parser_devices ADD COLUMN IF NOT EXISTS device_order integer NOT NULL DEFAULT 0;",
             "CREATE INDEX IF NOT EXISTS ix_gsm_parser_devices_order ON public.gsm_parser_devices USING btree (brand, device_order);",
+            # Manually-deleted GSM Arena/E-Katalog devices — kept in the main
+            # schema-ensure batch (run once, lock-guarded — see
+            # _general_schema_ready) rather than its own lazy per-call
+            # CREATE TABLE IF NOT EXISTS: a background parse run and the UI
+            # thread hitting that unconditionally on every add_gsm_excluded/
+            # is_gsm_device_excluded call raced against other concurrent
+            # queries and reproduced the exact same deadlock the schema lock
+            # was built to prevent in the first place.
+            """
+            CREATE TABLE IF NOT EXISTS public.gsm_parser_excluded_devices (
+              source        character varying NOT NULL,
+              model_key     character varying NOT NULL,
+              brand         character varying,
+              model_name    character varying,
+              excluded_by   character varying,
+              excluded_at   timestamp without time zone NOT NULL,
+              PRIMARY KEY (source, model_key)
+            );
+            """,
             # Global GSM Parser config (company_id='__global__' row) — shared across all companies.
             """
             CREATE TABLE IF NOT EXISTS public.company_extensions (
@@ -1557,15 +1675,21 @@ class DataManager:
             )
 
             # Entity owners backfill from legacy single-owner columns.
-            for entity_type, table_name in (
-                ("product", "products"),
-                ("supplier", "suppliers"),
-                ("packaging", "packaging"),
-                ("order", "orders"),
-                ("media_plan", "media_plan_entries"),
-                ("schedule_group", "order_schedule_groups"),
-                ("schedule_task", "order_schedule_tasks"),
-            ):
+            #
+            # Suppliers/packaging are intentionally additive/shared (see
+            # recompute_entity_owners_for_scope) — blind backfill is correct
+            # there. All other entity types are node-ownership-derived and
+            # single-owner: once recompute_entity_owners_for_scope has written
+            # a real owner row for an entity, this backfill must NOT also
+            # insert its legacy `manager_id` (often a stale pre-transfer
+            # author) as a second owner — that silently resurrected removed
+            # shared-access rows on every fresh connection/process start,
+            # even after a transfer correctly reduced the entity to one
+            # owner. The legacy manager_id column itself is left untouched
+            # (still needed for settlement/authorship history) — only the
+            # backfill's blind re-insert into entity_owners is scoped down to
+            # entities that have no owner row at all yet.
+            for entity_type, table_name in (("supplier", "suppliers"), ("packaging", "packaging")):
                 cur.execute(
                     f"""
                     INSERT INTO entity_owners (company_id, entity_type, entity_id, manager_id, created_at)
@@ -1575,6 +1699,29 @@ class DataManager:
                     ON CONFLICT DO NOTHING
                     """,
                     (entity_type, now),
+                )
+            for entity_type, table_name in (
+                ("product", "products"),
+                ("order", "orders"),
+                ("media_plan", "media_plan_entries"),
+                ("schedule_group", "order_schedule_groups"),
+                ("schedule_task", "order_schedule_tasks"),
+            ):
+                cur.execute(
+                    f"""
+                    INSERT INTO entity_owners (company_id, entity_type, entity_id, manager_id, created_at)
+                    SELECT t.company_id, %s, t.id, t.manager_id, %s
+                    FROM {table_name} t
+                    WHERE COALESCE(t.manager_id, '') <> ''
+                      AND NOT EXISTS (
+                          SELECT 1 FROM entity_owners eo
+                          WHERE eo.company_id = t.company_id
+                            AND eo.entity_type = %s
+                            AND eo.entity_id = t.id
+                      )
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (entity_type, now, entity_type),
                 )
 
     # ----------------- tiny admin helpers -----------------
@@ -1818,14 +1965,26 @@ class DataManager:
         return ""
 
     def _hash_password(self, password: str) -> str:
-        pw = (password or "").encode("utf-8")
+        # .strip() here (not just at some call sites) matters: some
+        # password-setting paths (reset_manager_password) already stripped
+        # before calling this, others (create_manager, restore_company_
+        # manager_account, ...) passed the raw value straight through. A
+        # password with accidental leading/trailing whitespace (copy-paste
+        # from a chat/password manager is the common source) then hashed
+        # differently depending on which path created the account — the
+        # brand-new user's login (typed without the invisible whitespace)
+        # failed with "невірні дані" until an admin reset the password via
+        # the one path that stripped. Normalizing here (and in
+        # _verify_password below) makes every caller consistent regardless.
+        pw = str(password or "").strip().encode("utf-8")
         salt = bcrypt.gensalt(rounds=12)
         return bcrypt.hashpw(pw, salt).decode("utf-8")
 
     def _verify_password(self, password: str, password_hash: str) -> bool:
         try:
             return bcrypt.checkpw(
-                (password or "").encode("utf-8"), (password_hash or "").encode("utf-8")
+                str(password or "").strip().encode("utf-8"),
+                (password_hash or "").encode("utf-8"),
             )
         except Exception:
             return False
@@ -2182,6 +2341,15 @@ class DataManager:
         if not cid or not sc:
             return
         actor = str(changed_by or "").strip() or "system"
+        if sc == "orders":
+            with contextlib.suppress(Exception):
+                import inspect
+
+                _caller = inspect.stack()[1]
+                logger.warning(
+                    "[orders pulse] _pulse('orders', company_id=%s) called from %s:%d in %s()",
+                    cid, _caller.filename, _caller.lineno, _caller.function,
+                )
         # Use a strictly monotonic integer timestamp per (company_id, scope).
         # UI compares pulses with ">" so duplicates in the same second must be avoided.
         # This runs after nearly every write in the app — collapsed from
@@ -2739,7 +2907,15 @@ class DataManager:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = os.path.join(dest_dir, f"catman_backup_{safe_name}_{stamp}.dump")
 
-        lock_id = self._acquire_backup_lock(company_id, f"Бекап компанії {info['name']}")
+        # Deliberately NO _acquire_backup_lock here (unlike import/restore
+        # below) — pg_dump is a read-only, MVCC-consistent snapshot that's
+        # explicitly designed to run safely against a live, actively-used
+        # database; it never needs other sessions kicked out. It used to
+        # share the same lock as restore, which meant every ordinary backup
+        # EXPORT force-logged-out every other active session in the company
+        # for no real reason — confirmed live as the cause of users randomly
+        # getting kicked to the login screen with no logout/switch-user
+        # click of their own.
         try:
             pg_migration_tools.dump_database(
                 host=info["host"], port=info["port"], user=info["user"],
@@ -2762,8 +2938,6 @@ class DataManager:
                 if os.path.exists(out_path):
                     os.remove(out_path)
             return False, f"Помилка збереження бекапу: {exc}"
-        finally:
-            self._release_backup_lock(lock_id)
 
     def read_backup_manifest(self, dump_file: str) -> dict | None:
         return self._read_backup_manifest(dump_file)
@@ -2884,7 +3058,11 @@ class DataManager:
         info = self._get_general_db_conn_info()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = os.path.join(dest_dir, f"catman_{label}_{stamp}.dump")
-        lock_id = self._acquire_backup_lock(None, f"Бекап {label}")
+        # Deliberately NO _acquire_backup_lock here — see export_company_backup's
+        # comment: a read-only pg_dump doesn't need other sessions kicked out,
+        # and this is the GLOBAL-scope export (company_id=None), so sharing
+        # the restore's lock here force-logged-out literally every user in
+        # every company on every routine general-tables backup.
         try:
             pg_migration_tools.dump_database_tables(
                 host=info["host"], port=info["port"], user=info["user"],
@@ -2902,8 +3080,6 @@ class DataManager:
                 if os.path.exists(out_path):
                     os.remove(out_path)
             return False, f"Помилка збереження бекапу: {exc}"
-        finally:
-            self._release_backup_lock(lock_id)
 
     def _import_general_db_tables(self, input_file: str, label: str = "general") -> tuple[bool, str]:
         import pg_migration_tools
@@ -4230,6 +4406,7 @@ class DataManager:
         region_id: str | None = None,
         manager_id: str | None = None,
         archived: bool | None = False,
+        force_refresh: bool | None = None,
     ):
         if not self._use_postgres():
             return (
@@ -4244,7 +4421,11 @@ class DataManager:
         manager_id = str(manager_id or "").strip()
         if manager_id:
             return self.get_accessible_categories(
-                company_id, manager_id, (region_id or None), archived=archived
+                company_id,
+                manager_id,
+                (region_id or None),
+                archived=archived,
+                force_refresh=force_refresh,
             )
         archived_clause = (
             "" if archived is None else ("AND is_archived=TRUE" if archived else "AND is_archived=FALSE")
@@ -5303,6 +5484,63 @@ class DataManager:
             )
             return cur.fetchall() or []
 
+    def get_category_level_nodes_by_parents(
+        self,
+        category_id: str,
+        position: int,
+        parent_node_ids: list,
+        archived: bool | None = False,
+    ):
+        """Batched sibling of get_category_level_nodes() — one query for ALL
+        given parents at this position instead of one query per parent.
+
+        Added for ProductsView._pending_series_candidates(), which used to
+        call get_category_level_nodes() once per parent node per hierarchy
+        level (and again once per leaf just to check for children) — with
+        many categories/levels this was hundreds of individual round trips
+        to build the Home tab's pending-series KPI, a real contributor to
+        the "build_sync timed out after 60s" reports. Same "root" marker
+        convention as get_category_level_nodes()."""
+        if not self._use_postgres():
+            out: list = []
+            for pid in parent_node_ids or []:
+                out.extend(
+                    self._get(
+                        "/level_nodes/by_category_position",
+                        {
+                            "category_id": category_id,
+                            "position": position,
+                            "parent_node_id": pid or "",
+                        },
+                    )
+                    or []
+                )
+            return out
+        cat_id = str(category_id or "").strip()
+        try:
+            pos = int(position or 0)
+        except Exception:
+            pos = 0
+        parents = list(
+            {str(p or "").strip() or "root" for p in (parent_node_ids or [])}
+        )
+        if not cat_id or pos < 1 or pos > 6 or not parents:
+            return []
+        archived_clause = (
+            "" if archived is None else ("AND is_archived=TRUE" if archived else "AND is_archived=FALSE")
+        )
+        with self._pg().cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, category_id, position, parent_node_id, name, data, created_at, updated_at
+                FROM level_nodes
+                WHERE category_id=%s AND position=%s AND parent_node_id = ANY(%s) {archived_clause}
+                ORDER BY name ASC
+                """,
+                (cat_id, pos, parents),
+            )
+            return cur.fetchall() or []
+
     def update_level_node(self, node_id: str, name: str) -> bool:
         """
         Updates a level node name in `level_nodes`.
@@ -6274,6 +6512,17 @@ class DataManager:
         if catalog_node_id and mid and cid:
             with contextlib.suppress(Exception):
                 self._assign_owner_to_nodes(mid, cid, [catalog_node_id])
+            with contextlib.suppress(Exception):
+                # If this node/level is under shared access (2+ owners),
+                # a brand-new product's supplier/packaging must become
+                # visible to EVERY co-owner right away, not just the one
+                # who happened to create it — otherwise the other owner's
+                # product/supplier dropdowns don't resolve it and they end
+                # up creating a duplicate supplier with the same name
+                # instead of reusing this one. This reuses the exact same
+                # accumulate-only supplier/packaging grant as a category
+                # transfer (see recompute_entity_owners_for_scope).
+                self.recompute_entity_owners_for_scope(cid, [catalog_node_id])
         return True
 
     def update_product(
@@ -6402,7 +6651,15 @@ class DataManager:
                 )
         if cid:
             self._pulse(cid, "products")
-            self._pulse(cid, "orders")
+            # NOT also "orders" — Orders already refreshes product-dependent
+            # display data (name, production term) via the lighter
+            # get_reference_data_pulse() path (suppliers/products/packaging/
+            # categories), which just re-renders in place instead of doing a
+            # full DB reload. Pulsing "orders" here too meant literally any
+            # product edit anywhere (including the GSM Parser's own
+            # background price-sync updates) forced a full, disruptive
+            # Orders tab reload for every open session, even though nothing
+            # about any actual order had changed.
             self._invalidate_product_scope_cache(cid)
         catalog_node_id = str(
             payload.get("catalog_node_id") or merged.get("catalog_node_id") or ""
@@ -6411,6 +6668,13 @@ class DataManager:
         if catalog_node_id and _effective_mid and cid:
             with contextlib.suppress(Exception):
                 self._assign_owner_to_nodes(_effective_mid, cid, [catalog_node_id])
+            if _new_supplier_id != _old_supplier_id or _packaging_changed:
+                with contextlib.suppress(Exception):
+                    # Same reasoning as add_product: if this level is under
+                    # shared access, a newly-picked supplier/packaging on an
+                    # EXISTING product must reach every co-owner right away
+                    # too, not just whoever happened to edit the product.
+                    self.recompute_entity_owners_for_scope(cid, [catalog_node_id])
         return True
 
     def archive_product(
@@ -6740,8 +7004,16 @@ class DataManager:
                 q += " AND (data->>'supplier_id')=%s"
                 params.append(supplier_id)
             if manager_id:
-                q += " AND manager_id=%s"
-                params.append(manager_id)
+                # Same reasoning as supplier_name_exists: a co-owner granted
+                # via entity_owners is never the raw manager_id creator, so
+                # checking manager_id alone would miss the existing row and
+                # let a co-owner create a colliding physical duplicate.
+                q += (
+                    " AND (manager_id=%s OR id IN "
+                    "(SELECT entity_id FROM entity_owners "
+                    "WHERE company_id=%s AND manager_id=%s AND entity_type='packaging'))"
+                )
+                params.extend([manager_id, company_id, manager_id])
             if exclude_packaging_id:
                 q += " AND id<>%s"
                 params.append(exclude_packaging_id)
@@ -7380,6 +7652,29 @@ class DataManager:
             row = cur.fetchone()
         return dict(row) if isinstance(row, dict) else None
 
+    def get_packaging_supply_openings_bulk(self, context_ids: list) -> dict:
+        """Batched form of get_packaging_supply_opening for many contexts at
+        once (one query instead of one per context — Склад Пакувань loads
+        hundreds of contexts per tab open). Returns {context_id: row_dict}."""
+        ids = sorted({str(x).strip() for x in (context_ids or []) if str(x or "").strip()})
+        if not ids or not self._use_postgres():
+            return {}
+        with self._pg().cursor() as cur:
+            cur.execute(
+                """
+                SELECT context_id, stock_packaging_supplier_qty, stock_goods_supplier_qty, balance_amount, balance_currency,
+                       opening_shipped_goods_qty, balance_paid_amount, comment, updated_at
+                FROM packaging_supply_openings WHERE context_id = ANY(%s)
+                """,
+                (ids,),
+            )
+            rows = cur.fetchall() or []
+        return {
+            str(r.get("context_id")): dict(r)
+            for r in rows
+            if isinstance(r, dict) and r.get("context_id")
+        }
+
     def save_packaging_supply_opening(
         self,
         *,
@@ -7612,44 +7907,56 @@ class DataManager:
         rid = str(region_id or "").strip()
         try:
             with self._pg().cursor() as cur:
-                # The table is otherwise only ever created lazily by
-                # add_packaging_writeoff() on the first write -- a company
-                # that only ever READS this (e.g. just opening the view)
-                # before anyone has recorded a single write-off would hit
-                # UndefinedTable here. Ensure it exists on the read path too.
-                with contextlib.suppress(Exception):
-                    cur.execute(
-                        """
-                        CREATE TABLE IF NOT EXISTS packaging_writeoffs (
-                            id          uuid DEFAULT gen_random_uuid() PRIMARY KEY,
-                            context_id  text NOT NULL,
-                            product_id  text NOT NULL,
-                            seq_no      int  NOT NULL DEFAULT 1,
-                            qty         float8 NOT NULL DEFAULT 0,
-                            pack_qty    float8 NOT NULL DEFAULT 0,
-                            goods_qty   float8 NOT NULL DEFAULT 0,
-                            order_date  date,
-                            invoice_no  text NOT NULL DEFAULT '',
-                            comment     text NOT NULL DEFAULT 'Списання',
-                            manager_id  text NOT NULL DEFAULT '',
-                            region_id   text NOT NULL DEFAULT '',
-                            company_id  text NOT NULL DEFAULT '',
-                            created_at  timestamptz NOT NULL DEFAULT now(),
-                            updated_at  timestamptz NOT NULL DEFAULT now(),
-                            UNIQUE (context_id, product_id, seq_no, manager_id, region_id)
-                        )
-                        """
-                    )
-                # Ensure new columns exist before reading them (idempotent, cheap DDL)
-                for _col, _def in (
-                    ("pack_qty", "float8 NOT NULL DEFAULT 0"),
-                    ("goods_qty", "float8 NOT NULL DEFAULT 0"),
-                    ("order_date", "date"),
-                ):
+                # The table/columns used to be (re)ensured via CREATE TABLE
+                # IF NOT EXISTS + ALTER TABLE ADD COLUMN IF NOT EXISTS on
+                # EVERY call — cheap individually, but this is called once
+                # per packaging context per tab load (can be hundreds), so it
+                # meant hundreds of DDL round-trips per screen open. DDL only
+                # needs to run once per physical company connection; once the
+                # table/columns exist they stay for the process lifetime.
+                # NOTE: must read via __dict__, not getattr() — DataManager
+                # defines __getattr__ as a compat shim that returns a
+                # callable stub (never the getattr() default) for any name
+                # that was never actually set on the instance.
+                _ready = self.__dict__.get("_packaging_writeoffs_schema_ready")
+                if _ready is None:
+                    _ready = set()
+                    self._packaging_writeoffs_schema_ready = _ready
+                _cid_key = str(self._active_company_id or "")
+                if _cid_key not in _ready:
                     with contextlib.suppress(Exception):
                         cur.execute(
-                            f"ALTER TABLE packaging_writeoffs ADD COLUMN IF NOT EXISTS {_col} {_def}"
+                            """
+                            CREATE TABLE IF NOT EXISTS packaging_writeoffs (
+                                id          uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+                                context_id  text NOT NULL,
+                                product_id  text NOT NULL,
+                                seq_no      int  NOT NULL DEFAULT 1,
+                                qty         float8 NOT NULL DEFAULT 0,
+                                pack_qty    float8 NOT NULL DEFAULT 0,
+                                goods_qty   float8 NOT NULL DEFAULT 0,
+                                order_date  date,
+                                invoice_no  text NOT NULL DEFAULT '',
+                                comment     text NOT NULL DEFAULT 'Списання',
+                                manager_id  text NOT NULL DEFAULT '',
+                                region_id   text NOT NULL DEFAULT '',
+                                company_id  text NOT NULL DEFAULT '',
+                                created_at  timestamptz NOT NULL DEFAULT now(),
+                                updated_at  timestamptz NOT NULL DEFAULT now(),
+                                UNIQUE (context_id, product_id, seq_no, manager_id, region_id)
+                            )
+                            """
                         )
+                    for _col, _def in (
+                        ("pack_qty", "float8 NOT NULL DEFAULT 0"),
+                        ("goods_qty", "float8 NOT NULL DEFAULT 0"),
+                        ("order_date", "date"),
+                    ):
+                        with contextlib.suppress(Exception):
+                            cur.execute(
+                                f"ALTER TABLE packaging_writeoffs ADD COLUMN IF NOT EXISTS {_col} {_def}"
+                            )
+                    _ready.add(_cid_key)
                 cur.execute(
                     """
                     SELECT id, context_id, product_id, seq_no,
@@ -7681,6 +7988,105 @@ class DataManager:
         except Exception:
             logger.exception("get_packaging_writeoffs failed")
             return []
+
+    def get_packaging_writeoffs_bulk(
+        self, context_region_pairs: list, manager_id: str = ""
+    ) -> dict:
+        """Batched form of get_packaging_writeoffs for many contexts at once
+        (one query instead of one-plus-DDL per context — this was the single
+        biggest freeze cause on Склад Пакувань). Takes (context_id, region_id)
+        pairs — some legacy writeoff rows share a context_id across more than
+        one region_id, so context_id alone is not always a safe partition key
+        (confirmed against live data); the exact (context_id, region_id, "
+        manager_id) match from the original single-context call is preserved
+        via a composite-key join. Returns {context_id: [row_dict, ...]}."""
+        pairs = [
+            (str(c).strip(), str(r or "").strip())
+            for c, r in (context_region_pairs or [])
+            if str(c or "").strip()
+        ]
+        ids = sorted({c for c, _ in pairs})
+        out: dict[str, list[dict]] = {cid: [] for cid in ids}
+        if not pairs or not self._use_postgres():
+            return out
+        mid = str(manager_id or "").strip()
+        composite_keys = [f"{c}\x1f{r}" for c, r in pairs]
+        try:
+            with self._pg().cursor() as cur:
+                # NOTE: must read via __dict__, not getattr() — DataManager
+                # defines __getattr__ as a compat shim that returns a
+                # callable stub (never the getattr() default) for any name
+                # that was never actually set on the instance.
+                _ready = self.__dict__.get("_packaging_writeoffs_schema_ready")
+                if _ready is None:
+                    _ready = set()
+                    self._packaging_writeoffs_schema_ready = _ready
+                _cid_key = str(self._active_company_id or "")
+                if _cid_key not in _ready:
+                    with contextlib.suppress(Exception):
+                        cur.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS packaging_writeoffs (
+                                id          uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+                                context_id  text NOT NULL,
+                                product_id  text NOT NULL,
+                                seq_no      int  NOT NULL DEFAULT 1,
+                                qty         float8 NOT NULL DEFAULT 0,
+                                pack_qty    float8 NOT NULL DEFAULT 0,
+                                goods_qty   float8 NOT NULL DEFAULT 0,
+                                order_date  date,
+                                invoice_no  text NOT NULL DEFAULT '',
+                                comment     text NOT NULL DEFAULT 'Списання',
+                                manager_id  text NOT NULL DEFAULT '',
+                                region_id   text NOT NULL DEFAULT '',
+                                company_id  text NOT NULL DEFAULT '',
+                                created_at  timestamptz NOT NULL DEFAULT now(),
+                                updated_at  timestamptz NOT NULL DEFAULT now(),
+                                UNIQUE (context_id, product_id, seq_no, manager_id, region_id)
+                            )
+                            """
+                        )
+                    for _col, _def in (
+                        ("pack_qty", "float8 NOT NULL DEFAULT 0"),
+                        ("goods_qty", "float8 NOT NULL DEFAULT 0"),
+                        ("order_date", "date"),
+                    ):
+                        with contextlib.suppress(Exception):
+                            cur.execute(
+                                f"ALTER TABLE packaging_writeoffs ADD COLUMN IF NOT EXISTS {_col} {_def}"
+                            )
+                    _ready.add(_cid_key)
+                cur.execute(
+                    """
+                    SELECT id, context_id, product_id, seq_no,
+                           qty, pack_qty, goods_qty, order_date,
+                           invoice_no, comment, manager_id, region_id,
+                           created_at, updated_at
+                    FROM packaging_writeoffs
+                    WHERE (context_id || chr(31) || region_id) = ANY(%s)
+                      AND manager_id=%s
+                    ORDER BY context_id, seq_no
+                    """,
+                    (composite_keys, mid),
+                )
+                rows = cur.fetchall() or []
+        except Exception:
+            logger.exception("get_packaging_writeoffs_bulk failed")
+            return out
+        for r in rows:
+            d = dict(r)
+            d["pack_qty"] = float(d.get("pack_qty") or d.get("qty") or 0)
+            d["goods_qty"] = float(d.get("goods_qty") or 0)
+            _od = d.get("order_date")
+            d["order_date"] = (
+                str(_od.isoformat())
+                if hasattr(_od, "isoformat")
+                else (str(_od)[:10] if _od else None)
+            )
+            cid = str(d.get("context_id") or "")
+            if cid:
+                out.setdefault(cid, []).append(d)
+        return out
 
     def packaging_writeoff_next_seq(
         self,
@@ -7797,6 +8203,44 @@ class DataManager:
             except Exception:
                 if isinstance(r, dict):
                     out.append(r)
+        return out
+
+    def list_packaging_supply_orders_bulk(self, context_ids: list) -> dict:
+        """Batched form of list_packaging_supply_orders for many contexts at
+        once. Returns {context_id: [row_dict, ...]}."""
+        ids = sorted({str(x).strip() for x in (context_ids or []) if str(x or "").strip()})
+        out: dict[str, list[dict]] = {cid: [] for cid in ids}
+        if not ids or not self._use_postgres():
+            return out
+        with self._pg().cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, context_id, seq_no, order_date, qty_ordered, status, cost_amount, paid_amount,
+                       shipped_goods_supplier_qty, zp_1c, invoice_no, comment, row_kind, linked_order_id, linked_order_line_key,
+                       created_at, updated_at
+                FROM packaging_supply_orders
+                WHERE context_id = ANY(%s) AND row_kind IN ('supply','goods')
+                ORDER BY context_id,
+                         order_date ASC NULLS LAST,
+                         COALESCE(invoice_no,'') ASC,
+                         CASE WHEN row_kind = 'goods' THEN 0 ELSE 1 END,
+                         seq_no ASC,
+                         COALESCE(linked_order_line_key,'') ASC,
+                         created_at ASC
+                """,
+                (ids,),
+            )
+            rows = cur.fetchall() or []
+        for r in rows or []:
+            try:
+                d = dict(r)
+            except Exception:
+                d = r if isinstance(r, dict) else None
+            if not d:
+                continue
+            cid = str(d.get("context_id") or "")
+            if cid:
+                out.setdefault(cid, []).append(d)
         return out
 
     def add_packaging_supply_order(self, payload: dict) -> str:
@@ -8329,8 +8773,17 @@ class DataManager:
                 """]
             params: list[Any] = [cid, rid, normalized_name]
             if mid:
-                sql.append("AND manager_id=%s")
-                params.append(mid)
+                # A co-owner (granted via entity_owners, e.g. through shared
+                # access or a category transfer) never becomes the raw
+                # `manager_id` creator of the row — checking manager_id alone
+                # lets a co-owner "not see" the existing supplier and create
+                # a colliding physical duplicate. Count entity_owners too.
+                sql.append(
+                    "AND (manager_id=%s OR id IN "
+                    "(SELECT entity_id FROM entity_owners "
+                    "WHERE company_id=%s AND manager_id=%s AND entity_type='supplier'))"
+                )
+                params.extend([mid, cid, mid])
             if exclude_id:
                 sql.append("AND id<>%s")
                 params.append(exclude_id)
@@ -8361,6 +8814,26 @@ class DataManager:
             manager_id=(manager_id or None),
         ):
             return ""
+        # TEMP DIAGNOSTIC (remove once the live "GuNice duplicated across
+        # managers" report is root-caused): if this exact name already
+        # exists for a DIFFERENT manager in this company/region, log who
+        # called this and from where, so the next live repro pins the
+        # actual call site instead of more guessing.
+        with contextlib.suppress(Exception):
+            if self.supplier_name_exists(company_id, name, region_id=region_id):
+                import inspect
+
+                _stack_lines = [
+                    f"{f.filename}:{f.lineno} in {f.function}()"
+                    for f in inspect.stack()[1:6]
+                ]
+                logger.warning(
+                    "[supplier-dup-diag] add_supplier creating NEW supplier "
+                    "name=%r for manager_id=%s company_id=%s region_id=%s "
+                    "while the SAME name already exists for a DIFFERENT "
+                    "manager. Call stack (nearest first): %s",
+                    name, manager_id, company_id, region_id, _stack_lines,
+                )
         sid = uuid.uuid4().hex
         now = self._now_ts()
         # Store full supplier fields inside jsonb `data` as well, so searches work.
@@ -8467,7 +8940,9 @@ class DataManager:
             self._pulse(company_id, "suppliers")
             self._pulse(company_id, "products")
             self._pulse(company_id, "packaging")
-            self._pulse(company_id, "orders")
+            # NOT "orders" — see the matching comment in update_product();
+            # Orders already picks up a supplier name/currency change via the
+            # lighter get_reference_data_pulse() path.
             self._pulse(company_id, "payments")
             self.invalidate_suppliers_cache(company_id)
             self.invalidate_products_cache(company_id)
@@ -8494,7 +8969,7 @@ class DataManager:
             self._pulse(company_id, "suppliers")
             self._pulse(company_id, "products")
             self._pulse(company_id, "packaging")
-            self._pulse(company_id, "orders")
+            # NOT "orders" — see the matching comment in update_product().
             self._pulse(company_id, "payments")
             self.invalidate_suppliers_cache(company_id)
             self.invalidate_products_cache(company_id)
@@ -8517,7 +8992,7 @@ class DataManager:
             self._pulse(company_id, "suppliers")
             self._pulse(company_id, "products")
             self._pulse(company_id, "packaging")
-            self._pulse(company_id, "orders")
+            # NOT "orders" — see the matching comment in update_product().
             self._pulse(company_id, "payments")
             self.invalidate_suppliers_cache(company_id)
             self.invalidate_products_cache(company_id)
@@ -8697,6 +9172,113 @@ class DataManager:
         # returned dict and hand it straight back to upsert_order().
         merged.pop("data", None)
         return merged
+
+    def get_orders_by_ids(self, company_id: str, order_ids: list) -> list[dict]:
+        """Bulk fetch (jsonb-flattened, same shape as get_order_by_id) — used
+        by payments_view to pull in orders a manager is the frozen
+        'order_settlement' owner of even when they no longer generally own
+        the underlying product/category (see recompute_entity_owners_for_scope's
+        order block and _maybe_snapshot_order_settlement_owner)."""
+        if not self._use_postgres():
+            return []
+        cid = str(company_id or "").strip()
+        oids = sorted({str(x or "").strip() for x in (order_ids or []) if str(x or "").strip()})
+        if not cid or not oids:
+            return []
+        with self._pg().cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, company_id, region_id, manager_id, supplier_id, data, created_at, updated_at
+                FROM orders
+                WHERE company_id=%s AND id = ANY(%s)
+                """,
+                (cid, oids),
+            )
+            rows = cur.fetchall() or []
+        out = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            data = r.get("data") if isinstance(r.get("data"), dict) else {}
+            merged = {**r, **data}
+            merged.pop("data", None)
+            out.append(merged)
+        return out
+
+    def _maybe_snapshot_order_settlement_owner(
+        self, company_id: str, order_id: str
+    ) -> None:
+        """Freeze this order's settlement ("Взаєморозрахунки") attribution
+        the first time its payment status moves away from unpaid.
+
+        This is deliberately independent of entity_owners('order') (general
+        order visibility/analytics), which fully follows a category/level
+        transfer like everything else. Settlements must NOT: a manager who
+        already got paid for an order shouldn't have that payment silently
+        reattributed to whoever the category is transferred to later — see
+        recompute_entity_owners_for_scope's order block, which never
+        touches entity_type='order_settlement'.
+
+        No-op once a snapshot already exists for this order (checked first)
+        — the freeze only happens once, at the first real payment, and is
+        permanent after that regardless of how many more times the order or
+        its owning category changes hands.
+        """
+        if not self._use_postgres():
+            return
+        cid = str(company_id or "").strip()
+        oid = str(order_id or "").strip()
+        if not cid or not oid:
+            return
+        try:
+            with self._pg().cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM entity_owners WHERE company_id=%s AND entity_type='order_settlement' AND entity_id=%s LIMIT 1",
+                    (cid, oid),
+                )
+                if cur.fetchone():
+                    return  # already frozen — never overwritten
+                cur.execute(
+                    "SELECT manager_id, data FROM orders WHERE id=%s AND company_id=%s LIMIT 1",
+                    (oid, cid),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return
+                data = row.get("data") if isinstance(row.get("data"), dict) else {}
+                pay = str((data or {}).get("payment_status") or "unpaid").strip().lower()
+                if pay in {"", "unpaid", "не сплачений", "не сплачено"}:
+                    return  # still genuinely unpaid — nothing to freeze yet
+                cur.execute(
+                    "SELECT DISTINCT manager_id FROM entity_owners "
+                    "WHERE company_id=%s AND entity_type='order' AND entity_id=%s",
+                    (cid, oid),
+                )
+                owners = {
+                    str(r.get("manager_id") or "").strip()
+                    for r in (cur.fetchall() or [])
+                    if isinstance(r, dict) and r.get("manager_id")
+                }
+                if not owners:
+                    # No entity_owners('order') row yet (order never touched
+                    # by a category transfer) — fall back to its own raw
+                    # manager_id column.
+                    raw_mid = str(row.get("manager_id") or "").strip()
+                    if raw_mid:
+                        owners = {raw_mid}
+                if not owners:
+                    return
+                now = self._now_ts()
+                for mid in owners:
+                    cur.execute(
+                        "INSERT INTO entity_owners (company_id, entity_type, entity_id, manager_id, created_at) "
+                        "VALUES (%s,'order_settlement',%s,%s,%s) ON CONFLICT DO NOTHING",
+                        (cid, oid, mid, now),
+                    )
+        except Exception:
+            logger.exception(
+                "Failed to snapshot order_settlement owner for order %s", oid
+            )
 
     def reconcile_packaging_supply_goods_links(
         self, company_id: str, region_id: str, manager_id: str | None = None
@@ -9079,6 +9661,9 @@ class DataManager:
                 self.reconcile_packaging_supply_goods_links(
                     cid, rid, manager_id=str(mid)
                 )
+            if "payment_status" in data:
+                with contextlib.suppress(Exception):
+                    self._maybe_snapshot_order_settlement_owner(cid, oid)
             return True
         except Exception:
             logger.exception("upsert_order failed")
@@ -9235,6 +9820,11 @@ class DataManager:
                     (psycopg.types.json.Jsonb(fields), now, order_id, company_id),
                 )
             self._pulse(company_id, "orders")
+            if "payment_status" in fields:
+                with contextlib.suppress(Exception):
+                    self._maybe_snapshot_order_settlement_owner(
+                        company_id, order_id
+                    )
             return True
         except Exception:
             logger.exception("patch_order_fields failed")
@@ -11263,48 +11853,49 @@ class DataManager:
     #  screen and stored here so they migrate with the rest of the DB.    #
     # ------------------------------------------------------------------ #
     def _ensure_i18n_tables(self):
-        with self._general_pg().cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.translation_languages (
-                    code        character varying(8) NOT NULL,
-                    name        character varying(64) NOT NULL,
-                    flag_emoji  character varying(16) NOT NULL DEFAULT '',
-                    sort_order  integer NOT NULL DEFAULT 0,
-                    enabled     boolean NOT NULL DEFAULT true,
-                    created_at  timestamp without time zone NOT NULL,
-                    updated_at  timestamp without time zone NOT NULL,
-                    PRIMARY KEY (code)
+        with self._general_schema_lock:
+            with self._general_pg().cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.translation_languages (
+                        code        character varying(8) NOT NULL,
+                        name        character varying(64) NOT NULL,
+                        flag_emoji  character varying(16) NOT NULL DEFAULT '',
+                        sort_order  integer NOT NULL DEFAULT 0,
+                        enabled     boolean NOT NULL DEFAULT true,
+                        created_at  timestamp without time zone NOT NULL,
+                        updated_at  timestamp without time zone NOT NULL,
+                        PRIMARY KEY (code)
+                    )
+                    """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.translation_keys (
+                        key         character varying(255) NOT NULL,
+                        uk_text     text NOT NULL DEFAULT '',
+                        created_at  timestamp without time zone NOT NULL,
+                        updated_at  timestamp without time zone NOT NULL,
+                        PRIMARY KEY (key)
+                    )
+                    """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.translation_values (
+                        id          character varying NOT NULL,
+                        key         character varying(255) NOT NULL,
+                        lang_code   character varying(8) NOT NULL,
+                        value       text NOT NULL DEFAULT '',
+                        updated_at  timestamp without time zone NOT NULL,
+                        PRIMARY KEY (id),
+                        UNIQUE (key, lang_code)
+                    )
+                    """)
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_translation_values_key "
+                    "ON public.translation_values (key)"
                 )
-                """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.translation_keys (
-                    key         character varying(255) NOT NULL,
-                    uk_text     text NOT NULL DEFAULT '',
-                    created_at  timestamp without time zone NOT NULL,
-                    updated_at  timestamp without time zone NOT NULL,
-                    PRIMARY KEY (key)
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_translation_values_lang "
+                    "ON public.translation_values (lang_code)"
                 )
-                """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.translation_values (
-                    id          character varying NOT NULL,
-                    key         character varying(255) NOT NULL,
-                    lang_code   character varying(8) NOT NULL,
-                    value       text NOT NULL DEFAULT '',
-                    updated_at  timestamp without time zone NOT NULL,
-                    PRIMARY KEY (id),
-                    UNIQUE (key, lang_code)
-                )
-                """)
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_translation_values_key "
-                "ON public.translation_values (key)"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_translation_values_lang "
-                "ON public.translation_values (lang_code)"
-            )
-        self._general_pg().commit()
+            self._general_pg().commit()
 
     def get_translation_languages(self) -> list[dict]:
         """All languages (incl. disabled), ordered for display."""
@@ -11951,7 +12542,7 @@ class DataManager:
         cid = str(company_id or "").strip()
         if not cid:
             return False
-        with contextlib.suppress(Exception):
+        try:
             with self._pg().cursor() as cur:
                 cur.execute(
                     "SELECT state FROM company_extensions WHERE company_id=%s AND ext_key=%s LIMIT 1",
@@ -11972,7 +12563,21 @@ class DataManager:
                 return bool((state or {}).get("enabled"))
             # If never configured, allow by default (prevents "dead" button).
             return True
-        return False
+        except Exception:
+            # A transient failure here (e.g. a cold DB connection right after
+            # app launch — observed live: "server closed the connection
+            # unexpectedly" on the very first query) used to be silently
+            # swallowed and treated as "not enabled", incorrectly blocking a
+            # user whose company genuinely has this on — fixed on their very
+            # next login attempt once the connection warmed up, which read
+            # as "it randomly denies access sometimes". Same fail-open
+            # philosophy as the "never configured" case above: don't let a
+            # DB hiccup masquerade as a real permissions decision.
+            logger.exception(
+                "[GSM] is_company_gsm_parser_enabled: query failed for company_id=%s — failing open",
+                cid,
+            )
+            return True
 
     def get_company_gsm_parser_state(self, company_id: str) -> dict:
         """
@@ -12918,32 +13523,125 @@ class DataManager:
         return True
 
     # ------------------------------------------------------------------ #
+    #  GSM Parser run lock — cross-PROCESS guard (DB-backed)              #
+    # ------------------------------------------------------------------ #
+    # There are two independent triggers for a full parser run:
+    #   1. gsm_parser_scheduler.py --daemon, checking its own DB-stored
+    #      run_times on a timer, in its own process.
+    #   2. parser_service.py's /trigger endpoint (hit by the desktop app's
+    #      "Запустити"/"Запланувати запуск" buttons), running in a SEPARATE
+    #      process with its own in-process threading.Lock — which cannot see
+    #      the scheduler daemon's lock, since that's a different process.
+    # A manual trigger landing close to the daemon's own scheduled time ran
+    # BOTH concurrently (confirmed live: two "Кінець" log entries under one
+    # surviving header, near-identical elapsed times, two separate Telegram
+    # digests). This table is the missing shared lock: whichever side asks
+    # first wins; the other skips instead of running a parallel 5+ hour
+    # scrape that corrupts the shared log and double-sends reports.
+    def _ensure_gsm_parser_run_lock_table(self) -> None:
+        with self._general_schema_lock:
+            with self._general_pg().cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.gsm_parser_run_lock (
+                        lock_key    character varying NOT NULL,
+                        locked_by   character varying NOT NULL,
+                        locked_at   timestamp without time zone NOT NULL,
+                        expires_at  timestamp without time zone NOT NULL,
+                        PRIMARY KEY (lock_key)
+                    )
+                    """)
+
+    def try_acquire_gsm_parser_run_lock(
+        self, owner: str, ttl_seconds: int = 28800
+    ) -> tuple[bool, str]:
+        """Atomically claim the single global GSM-parser run slot.
+
+        ttl_seconds defaults to 8h — comfortably above the ~5.3h a real full
+        run has taken — so a crashed holder (process killed mid-run, no
+        chance to release) can't wedge the lock forever; a genuinely stuck
+        run just means a missed cycle, not a permanent block.
+
+        Returns (acquired, message) — message explains who's holding it when
+        acquisition fails, for logging."""
+        owner = str(owner or "unknown").strip()
+        if not self._use_postgres():
+            return True, ""
+        try:
+            self._ensure_gsm_parser_run_lock_table()
+            now = datetime.utcnow()
+            with self._general_pg().cursor() as cur:
+                # Reap an expired lock first (previous holder crashed/hung).
+                cur.execute(
+                    "DELETE FROM public.gsm_parser_run_lock "
+                    "WHERE lock_key=%s AND expires_at < %s",
+                    ("gsm_parser_run", now),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO public.gsm_parser_run_lock
+                      (lock_key, locked_by, locked_at, expires_at)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (lock_key) DO NOTHING
+                    """,
+                    ("gsm_parser_run", owner, now, now + timedelta(seconds=ttl_seconds)),
+                )
+                cur.execute(
+                    "SELECT locked_by FROM public.gsm_parser_run_lock WHERE lock_key=%s",
+                    ("gsm_parser_run",),
+                )
+                row = cur.fetchone()
+            holder = str((row or {}).get("locked_by") or "").strip()
+            if holder == owner:
+                return True, ""
+            return False, f"Парсинг вже виконується ({holder or 'інший процес'})"
+        except Exception:
+            logger.exception("try_acquire_gsm_parser_run_lock failed")
+            # Fail OPEN: a broken lock table must never permanently block
+            # every future run — the two in-process locks (threading.Lock
+            # in parser_service.py, single-threaded loop in the scheduler)
+            # still cover the common case on their own.
+            return True, ""
+
+    def release_gsm_parser_run_lock(self, owner: str) -> None:
+        owner = str(owner or "").strip()
+        if not self._use_postgres() or not owner:
+            return
+        with contextlib.suppress(Exception):
+            with self._general_pg().cursor() as cur:
+                cur.execute(
+                    "DELETE FROM public.gsm_parser_run_lock "
+                    "WHERE lock_key=%s AND locked_by=%s",
+                    ("gsm_parser_run", owner),
+                )
+
+    # ------------------------------------------------------------------ #
     #  GSM Parser Brands Table (global config — not per-company)          #
     # ------------------------------------------------------------------ #
     def _ensure_gsm_parser_brands_table(self):
-        """Create gsm_parser_brands if it does not exist yet."""
-        with self._general_pg().cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.gsm_parser_brands (
-                    id              character varying NOT NULL,
-                    brand           character varying(128) NOT NULL DEFAULT '',
-                    gsm_url         text NOT NULL DEFAULT '',
-                    last_item       character varying(512) NOT NULL DEFAULT '',
-                    ek_url_phones   text NOT NULL DEFAULT '',
-                    ek_url_tablets  text NOT NULL DEFAULT '',
-                    ek_url_watches  text NOT NULL DEFAULT '',
-                    sort_order      integer NOT NULL DEFAULT 0,
-                    enabled         boolean NOT NULL DEFAULT true,
-                    created_at      timestamp without time zone NOT NULL,
-                    updated_at      timestamp without time zone NOT NULL,
-                    PRIMARY KEY (id)
+        with self._general_schema_lock:
+            """Create gsm_parser_brands if it does not exist yet."""
+            with self._general_pg().cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.gsm_parser_brands (
+                        id              character varying NOT NULL,
+                        brand           character varying(128) NOT NULL DEFAULT '',
+                        gsm_url         text NOT NULL DEFAULT '',
+                        last_item       character varying(512) NOT NULL DEFAULT '',
+                        ek_url_phones   text NOT NULL DEFAULT '',
+                        ek_url_tablets  text NOT NULL DEFAULT '',
+                        ek_url_watches  text NOT NULL DEFAULT '',
+                        sort_order      integer NOT NULL DEFAULT 0,
+                        enabled         boolean NOT NULL DEFAULT true,
+                        created_at      timestamp without time zone NOT NULL,
+                        updated_at      timestamp without time zone NOT NULL,
+                        PRIMARY KEY (id)
+                    )
+                    """)
+                cur.execute(
+                    "ALTER TABLE public.gsm_parser_brands "
+                    "ADD COLUMN IF NOT EXISTS enabled boolean NOT NULL DEFAULT true"
                 )
-                """)
-            cur.execute(
-                "ALTER TABLE public.gsm_parser_brands "
-                "ADD COLUMN IF NOT EXISTS enabled boolean NOT NULL DEFAULT true"
-            )
-        self._general_pg().commit()
+            self._general_pg().commit()
 
     def get_gsm_parser_brands(self) -> list[dict]:
         """Return all brand rows ordered by sort_order, brand."""
@@ -13048,23 +13746,24 @@ class DataManager:
     #  on every EK-primary run so they get parsed/refreshed like normal)  #
     # ------------------------------------------------------------------ #
     def _ensure_gsm_manual_ek_links_table(self):
-        with self._general_pg().cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.gsm_parser_manual_ek_links (
-                    id            character varying NOT NULL,
-                    brand         character varying(128) NOT NULL DEFAULT '',
-                    device_type   character varying(32) NOT NULL DEFAULT '',
-                    url           text NOT NULL DEFAULT '',
-                    added_by      character varying(128) NOT NULL DEFAULT '',
-                    created_at    timestamp without time zone NOT NULL,
-                    PRIMARY KEY (id)
-                )
-                """)
-            cur.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS ux_gsm_manual_ek_links_brand_url
-                ON public.gsm_parser_manual_ek_links (LOWER(brand), LOWER(url))
-                """)
-        self._general_pg().commit()
+        with self._general_schema_lock:
+            with self._general_pg().cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.gsm_parser_manual_ek_links (
+                        id            character varying NOT NULL,
+                        brand         character varying(128) NOT NULL DEFAULT '',
+                        device_type   character varying(32) NOT NULL DEFAULT '',
+                        url           text NOT NULL DEFAULT '',
+                        added_by      character varying(128) NOT NULL DEFAULT '',
+                        created_at    timestamp without time zone NOT NULL,
+                        PRIMARY KEY (id)
+                    )
+                    """)
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS ux_gsm_manual_ek_links_brand_url
+                    ON public.gsm_parser_manual_ek_links (LOWER(brand), LOWER(url))
+                    """)
+            self._general_pg().commit()
 
     def get_gsm_manual_ek_links(
         self, brand: str | None = None, device_type: str | None = None
@@ -13142,31 +13841,132 @@ class DataManager:
             return True
         return False
 
+    # Mirror of gsm_parser_manual_ek_links above, for the "Посилання GSM
+    # Arena" toolbar button — pinning a brand-new GSM Arena device that has
+    # no E-Katalog counterpart to attach to (see fetch_and_add_manual_gsm_
+    # device in gsm_parser_runner.py). Kept as a separate table/table-name
+    # rather than reusing gsm_parser_manual_ek_links so the two sides'
+    # tracked-links UI never mix.
+    def _ensure_gsm_manual_gsm_links_table(self):
+        with self._general_schema_lock:
+            with self._general_pg().cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.gsm_parser_manual_gsm_links (
+                        id            character varying NOT NULL,
+                        brand         character varying(128) NOT NULL DEFAULT '',
+                        device_type   character varying(32) NOT NULL DEFAULT '',
+                        url           text NOT NULL DEFAULT '',
+                        added_by      character varying(128) NOT NULL DEFAULT '',
+                        created_at    timestamp without time zone NOT NULL,
+                        PRIMARY KEY (id)
+                    )
+                    """)
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS ux_gsm_manual_gsm_links_brand_url
+                    ON public.gsm_parser_manual_gsm_links (LOWER(brand), LOWER(url))
+                    """)
+            self._general_pg().commit()
+
+    def get_gsm_manual_gsm_links(
+        self, brand: str | None = None, device_type: str | None = None
+    ) -> list[dict]:
+        if not self._use_postgres():
+            return []
+        with contextlib.suppress(Exception):
+            self._ensure_gsm_manual_gsm_links_table()
+            conditions = []
+            params: list = []
+            if brand:
+                conditions.append("LOWER(brand)=LOWER(%s)")
+                params.append(str(brand).strip())
+            if device_type:
+                conditions.append("LOWER(device_type)=LOWER(%s)")
+                params.append(str(device_type).strip())
+            where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+            with self._general_pg().cursor() as cur:
+                cur.execute(
+                    f"SELECT id, brand, device_type, url, added_by, created_at "
+                    f"FROM public.gsm_parser_manual_gsm_links{where} "
+                    f"ORDER BY created_at DESC",
+                    params,
+                )
+                rows = cur.fetchall() or []
+            return [dict(r) for r in rows if isinstance(r, dict)]
+        return []
+
+    def add_gsm_manual_gsm_link(
+        self, brand: str, device_type: str, url: str, added_by: str
+    ) -> bool:
+        if not self._use_postgres():
+            return False
+        clean_url = str(url or "").strip()
+        clean_brand = str(brand or "").strip()
+        if not clean_url or not clean_brand:
+            return False
+        import uuid as _uuid
+
+        with contextlib.suppress(Exception):
+            self._ensure_gsm_manual_gsm_links_table()
+            with self._general_pg().cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.gsm_parser_manual_gsm_links
+                        (id, brand, device_type, url, added_by, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (LOWER(brand), LOWER(url)) DO NOTHING
+                    """,
+                    (
+                        f"mgkl_{_uuid.uuid4().hex}",
+                        clean_brand,
+                        str(device_type or "").strip(),
+                        clean_url,
+                        str(added_by or "").strip(),
+                        self._now_ts(),
+                    ),
+                )
+            self._general_pg().commit()
+            return True
+        return False
+
+    def delete_gsm_manual_gsm_link(self, link_id: str) -> bool:
+        if not self._use_postgres():
+            return False
+        with contextlib.suppress(Exception):
+            with self._general_pg().cursor() as cur:
+                cur.execute(
+                    "DELETE FROM public.gsm_parser_manual_gsm_links WHERE id=%s",
+                    (str(link_id).strip(),),
+                )
+            self._general_pg().commit()
+            return True
+        return False
+
     # ------------------------------------------------------------------ #
     #  GSM Parser — Daily History                                         #
     # ------------------------------------------------------------------ #
     def _ensure_gsm_daily_history_table(self):
-        with self._general_pg().cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.gsm_parser_daily_history (
-                    id            character varying NOT NULL,
-                    device_id     character varying NOT NULL,
-                    record_date   date NOT NULL,
-                    price_gsm     numeric,
-                    price_ek_min  numeric,
-                    price_ek_max  numeric,
-                    shops_count   integer,
-                    status        character varying(64) NOT NULL DEFAULT '',
-                    created_at    timestamp without time zone NOT NULL,
-                    PRIMARY KEY (id),
-                    UNIQUE (device_id, record_date)
-                )
-                """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_gsm_daily_hist_dev_date
-                ON public.gsm_parser_daily_history (device_id, record_date DESC)
-                """)
-        self._general_pg().commit()
+        with self._general_schema_lock:
+            with self._general_pg().cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.gsm_parser_daily_history (
+                        id            character varying NOT NULL,
+                        device_id     character varying NOT NULL,
+                        record_date   date NOT NULL,
+                        price_gsm     numeric,
+                        price_ek_min  numeric,
+                        price_ek_max  numeric,
+                        shops_count   integer,
+                        status        character varying(64) NOT NULL DEFAULT '',
+                        created_at    timestamp without time zone NOT NULL,
+                        PRIMARY KEY (id),
+                        UNIQUE (device_id, record_date)
+                    )
+                    """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_gsm_daily_hist_dev_date
+                    ON public.gsm_parser_daily_history (device_id, record_date DESC)
+                    """)
+            self._general_pg().commit()
 
     def record_gsm_daily_history(self, device_id: str, fields: dict) -> bool:
         """
@@ -13302,16 +14102,17 @@ class DataManager:
     #  GSM Parser — Parse Trigger                                         #
     # ------------------------------------------------------------------ #
     def _ensure_gsm_trigger_table(self):
-        with self._general_pg().cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.gsm_parser_trigger (
-                    id             character varying NOT NULL DEFAULT 'singleton',
-                    last_parse_at  timestamp without time zone,
-                    changes_count  integer NOT NULL DEFAULT 0,
-                    PRIMARY KEY (id)
-                )
-                """)
-        self._general_pg().commit()
+        with self._general_schema_lock:
+            with self._general_pg().cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.gsm_parser_trigger (
+                        id             character varying NOT NULL DEFAULT 'singleton',
+                        last_parse_at  timestamp without time zone,
+                        changes_count  integer NOT NULL DEFAULT 0,
+                        PRIMARY KEY (id)
+                    )
+                    """)
+            self._general_pg().commit()
 
     def get_parser_service_config(self) -> dict:
         """VPS FastAPI parser service config (service URL + API key, NOT the DB DSN)."""
@@ -13348,6 +14149,55 @@ class DataManager:
                     SET policy=EXCLUDED.policy, updated_at=EXCLUDED.updated_at
                 """,
                 ("parser_service", psycopg.types.json.Jsonb(payload), self._now_ts()),
+            )
+        return True
+
+    def get_calculator_web_github_config(self) -> dict:
+        """GitHub credentials for publishing the web calculator's access
+        password (catman-calculator-web repo — a separate, low-blast-
+        radius repo, see calculator_web_app.py's module docstring). Stored
+        in the DB rather than a local secrets/*.json file so it's reachable
+        from any built exe regardless of what that particular PyInstaller
+        build happened to bundle — a local file only exists in dev mode,
+        never inside a packaged .exe (confirmed live: the "Пароль веб-
+        версії" save button in SuperAdm.exe silently did nothing because
+        secrets/github_calculator_web.json simply wasn't there)."""
+        defaults: dict = {"token": "", "owner": "", "repo": "", "branch": "main"}
+        if not self._use_postgres():
+            return defaults
+        with contextlib.suppress(Exception):
+            with self._general_pg().cursor() as cur:
+                cur.execute(
+                    "SELECT policy FROM public.app_update_policy WHERE id=%s LIMIT 1",
+                    ("calculator_web_github",),
+                )
+                row = cur.fetchone() or {}
+            policy = row.get("policy") if isinstance(row.get("policy"), dict) else {}
+            out = dict(defaults)
+            out.update(policy or {})
+            return out
+        return defaults
+
+    def set_calculator_web_github_config(
+        self, token: str, owner: str, repo: str, branch: str = "main"
+    ) -> bool:
+        if not self._use_postgres():
+            return True
+        payload = {
+            "token": str(token or "").strip(),
+            "owner": str(owner or "").strip(),
+            "repo": str(repo or "").strip(),
+            "branch": str(branch or "main").strip(),
+        }
+        with self._general_pg().cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.app_update_policy (id, policy, updated_at)
+                VALUES (%s, %s::jsonb, %s)
+                ON CONFLICT (id) DO UPDATE
+                    SET policy=EXCLUDED.policy, updated_at=EXCLUDED.updated_at
+                """,
+                ("calculator_web_github", psycopg.types.json.Jsonb(payload), self._now_ts()),
             )
         return True
 
@@ -13392,22 +14242,23 @@ class DataManager:
     #  GSM Parser — User Presets                                          #
     # ------------------------------------------------------------------ #
     def _ensure_gsm_presets_table(self):
-        with self._general_pg().cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.gsm_parser_user_presets (
-                    id           character varying NOT NULL,
-                    manager_id   character varying NOT NULL,
-                    preset_name  character varying(255) NOT NULL,
-                    filters      jsonb NOT NULL DEFAULT '{}'::jsonb,
-                    created_at   timestamp without time zone NOT NULL,
-                    updated_at   timestamp without time zone NOT NULL,
-                    PRIMARY KEY (id)
+        with self._general_schema_lock:
+            with self._general_pg().cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.gsm_parser_user_presets (
+                        id           character varying NOT NULL,
+                        manager_id   character varying NOT NULL,
+                        preset_name  character varying(255) NOT NULL,
+                        filters      jsonb NOT NULL DEFAULT '{}'::jsonb,
+                        created_at   timestamp without time zone NOT NULL,
+                        updated_at   timestamp without time zone NOT NULL,
+                        PRIMARY KEY (id)
+                    )
+                    """)
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_gsm_presets_manager ON public.gsm_parser_user_presets (manager_id)"
                 )
-                """)
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_gsm_presets_manager ON public.gsm_parser_user_presets (manager_id)"
-            )
-        self._general_pg().commit()
+            self._general_pg().commit()
 
     def get_gsm_user_presets(self, manager_id: str) -> list[dict]:
         if not self._use_postgres():
@@ -13513,52 +14364,53 @@ class DataManager:
     #  GSM Parser — Compatible Devices                                    #
     # ------------------------------------------------------------------ #
     def _ensure_gsm_compatible_table(self):
-        with self._general_pg().cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.gsm_parser_compatible (
-                    id                   character varying NOT NULL,
-                    device_id            character varying NOT NULL,
-                    compatible_device_id character varying NOT NULL,
-                    status               character varying(64) NOT NULL DEFAULT 'compatible',
-                    notes                text NOT NULL DEFAULT '',
-                    variant_label        character varying(100) NOT NULL DEFAULT '',
-                    created_at           timestamp without time zone NOT NULL,
-                    updated_at           timestamp without time zone NOT NULL,
-                    PRIMARY KEY (id),
-                    UNIQUE (device_id, compatible_device_id)
+        with self._general_schema_lock:
+            with self._general_pg().cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.gsm_parser_compatible (
+                        id                   character varying NOT NULL,
+                        device_id            character varying NOT NULL,
+                        compatible_device_id character varying NOT NULL,
+                        status               character varying(64) NOT NULL DEFAULT 'compatible',
+                        notes                text NOT NULL DEFAULT '',
+                        variant_label        character varying(100) NOT NULL DEFAULT '',
+                        created_at           timestamp without time zone NOT NULL,
+                        updated_at           timestamp without time zone NOT NULL,
+                        PRIMARY KEY (id),
+                        UNIQUE (device_id, compatible_device_id)
+                    )
+                    """)
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_gsm_compat_device ON public.gsm_parser_compatible (device_id)"
                 )
-                """)
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_gsm_compat_device ON public.gsm_parser_compatible (device_id)"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_gsm_compat_compat ON public.gsm_parser_compatible (compatible_device_id)"
-            )
-            # Migration: add variant_label column if not present (existing tables)
-            cur.execute("""
-                ALTER TABLE public.gsm_parser_compatible
-                ADD COLUMN IF NOT EXISTS variant_label character varying(100) NOT NULL DEFAULT ''
-                """)
-            # Migration: add accessory_type so case vs. glass compatibility can differ
-            # for the same device pair ('case' | 'glass').
-            cur.execute("""
-                ALTER TABLE public.gsm_parser_compatible
-                ADD COLUMN IF NOT EXISTS accessory_type character varying(16) NOT NULL DEFAULT 'case'
-                """)
-            cur.execute("""
-                ALTER TABLE public.gsm_parser_compatible
-                DROP CONSTRAINT IF EXISTS gsm_parser_compatible_device_id_compatible_device_id_key
-                """)
-            cur.execute(
-                "SELECT 1 FROM pg_constraint WHERE conname = 'gsm_parser_compatible_pair_type_key'"
-            )
-            if not cur.fetchone():
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_gsm_compat_compat ON public.gsm_parser_compatible (compatible_device_id)"
+                )
+                # Migration: add variant_label column if not present (existing tables)
                 cur.execute("""
                     ALTER TABLE public.gsm_parser_compatible
-                    ADD CONSTRAINT gsm_parser_compatible_pair_type_key
-                    UNIQUE (device_id, compatible_device_id, accessory_type)
+                    ADD COLUMN IF NOT EXISTS variant_label character varying(100) NOT NULL DEFAULT ''
                     """)
-        self._general_pg().commit()
+                # Migration: add accessory_type so case vs. glass compatibility can differ
+                # for the same device pair ('case' | 'glass').
+                cur.execute("""
+                    ALTER TABLE public.gsm_parser_compatible
+                    ADD COLUMN IF NOT EXISTS accessory_type character varying(16) NOT NULL DEFAULT 'case'
+                    """)
+                cur.execute("""
+                    ALTER TABLE public.gsm_parser_compatible
+                    DROP CONSTRAINT IF EXISTS gsm_parser_compatible_device_id_compatible_device_id_key
+                    """)
+                cur.execute(
+                    "SELECT 1 FROM pg_constraint WHERE conname = 'gsm_parser_compatible_pair_type_key'"
+                )
+                if not cur.fetchone():
+                    cur.execute("""
+                        ALTER TABLE public.gsm_parser_compatible
+                        ADD CONSTRAINT gsm_parser_compatible_pair_type_key
+                        UNIQUE (device_id, compatible_device_id, accessory_type)
+                        """)
+            self._general_pg().commit()
 
     def get_gsm_compatible_devices(
         self, device_id: str, accessory_type: str = "case"
@@ -13844,21 +14696,22 @@ class DataManager:
     #  GSM Parser — per-user edit permissions (case/glass compat, Xiaomi) #
     # ------------------------------------------------------------------ #
     def _ensure_manager_gsm_permissions_table(self):
-        with self._general_pg().cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.manager_gsm_parser_permissions (
-                    manager_id character varying NOT NULL,
-                    company_id character varying NOT NULL,
-                    permission character varying(32) NOT NULL,
-                    created_at timestamp without time zone NOT NULL,
-                    PRIMARY KEY (manager_id, permission)
+        with self._general_schema_lock:
+            with self._general_pg().cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.manager_gsm_parser_permissions (
+                        manager_id character varying NOT NULL,
+                        company_id character varying NOT NULL,
+                        permission character varying(32) NOT NULL,
+                        created_at timestamp without time zone NOT NULL,
+                        PRIMARY KEY (manager_id, permission)
+                    )
+                    """)
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_mgr_gsm_perms_company "
+                    "ON public.manager_gsm_parser_permissions (company_id)"
                 )
-                """)
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_mgr_gsm_perms_company "
-                "ON public.manager_gsm_parser_permissions (company_id)"
-            )
-        self._general_pg().commit()
+            self._general_pg().commit()
 
     def get_manager_gsm_permissions(self, manager_id: str) -> set[str]:
         """Return the set of GSM-parser edit permissions granted to this manager
@@ -13941,35 +14794,36 @@ class DataManager:
     # ------------------------------------------------------------------
 
     def _ensure_feature_toggle_tables(self):
-        with self._general_pg().cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.company_feature_toggles (
-                    company_id character varying NOT NULL,
-                    feature_key character varying(64) NOT NULL,
-                    enabled boolean NOT NULL,
-                    updated_at timestamp without time zone NOT NULL,
-                    PRIMARY KEY (company_id, feature_key)
+        with self._general_schema_lock:
+            with self._general_pg().cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.company_feature_toggles (
+                        company_id character varying NOT NULL,
+                        feature_key character varying(64) NOT NULL,
+                        enabled boolean NOT NULL,
+                        updated_at timestamp without time zone NOT NULL,
+                        PRIMARY KEY (company_id, feature_key)
+                    )
+                    """)
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_company_feature_toggles_feature "
+                    "ON public.company_feature_toggles (feature_key)"
                 )
-                """)
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_company_feature_toggles_feature "
-                "ON public.company_feature_toggles (feature_key)"
-            )
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.manager_feature_overrides (
-                    manager_id character varying NOT NULL,
-                    company_id character varying NOT NULL,
-                    feature_key character varying(64) NOT NULL,
-                    enabled boolean NOT NULL,
-                    updated_at timestamp without time zone NOT NULL,
-                    PRIMARY KEY (manager_id, feature_key)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.manager_feature_overrides (
+                        manager_id character varying NOT NULL,
+                        company_id character varying NOT NULL,
+                        feature_key character varying(64) NOT NULL,
+                        enabled boolean NOT NULL,
+                        updated_at timestamp without time zone NOT NULL,
+                        PRIMARY KEY (manager_id, feature_key)
+                    )
+                    """)
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_manager_feature_overrides_company "
+                    "ON public.manager_feature_overrides (company_id)"
                 )
-                """)
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_manager_feature_overrides_company "
-                "ON public.manager_feature_overrides (company_id)"
-            )
-        self._general_pg().commit()
+            self._general_pg().commit()
 
     def is_company_feature_enabled(self, company_id: str, feature_key: str) -> bool:
         """Fail-open: a feature never explicitly configured is enabled."""
@@ -14248,7 +15102,406 @@ class DataManager:
             effective[key] = bool(base and requires_ok)
         return effective
 
-    def delete_gsm_device(self, device_id: str) -> bool:
+    def add_gsm_excluded(
+        self, source: str, model_key: str, brand: str = "", model_name: str = "", manager_id: str = ""
+    ) -> bool:
+        """Manually deleting a GSM Arena/E-Katalog device (delete_gsm_device)
+        registers it here so the next scheduled parse never silently
+        re-adds it — per spec, the only way back in is a manual link
+        add (see clear_gsm_excluded), never an automatic re-scrape."""
+        source = str(source or "").strip()
+        model_key = str(model_key or "").strip()
+        if not self._use_postgres() or not source or not model_key:
+            return False
+        with contextlib.suppress(Exception):
+            with self._general_pg().cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.gsm_parser_excluded_devices
+                      (source, model_key, brand, model_name, excluded_by, excluded_at)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (source, model_key) DO UPDATE SET
+                      brand=EXCLUDED.brand, model_name=EXCLUDED.model_name,
+                      excluded_by=EXCLUDED.excluded_by, excluded_at=EXCLUDED.excluded_at
+                    """,
+                    (source, model_key, brand, model_name, manager_id, self._now_ts()),
+                )
+            self._general_pg().commit()
+            return True
+        return False
+
+    def clear_gsm_excluded(self, source: str, model_key: str) -> bool:
+        """Undo add_gsm_excluded — called by every manual link-add path so a
+        deliberate manual re-add always works even if this exact device was
+        previously deleted/excluded."""
+        source = str(source or "").strip()
+        model_key = str(model_key or "").strip()
+        if not self._use_postgres() or not source or not model_key:
+            return False
+        with contextlib.suppress(Exception):
+            with self._general_pg().cursor() as cur:
+                cur.execute(
+                    "DELETE FROM public.gsm_parser_excluded_devices WHERE source=%s AND model_key=%s",
+                    (source, model_key),
+                )
+            self._general_pg().commit()
+            return True
+        return False
+
+    def is_gsm_device_excluded(self, source: str, model_key: str) -> bool:
+        source = str(source or "").strip()
+        model_key = str(model_key or "").strip()
+        if not self._use_postgres() or not source or not model_key:
+            return False
+        with contextlib.suppress(Exception):
+            with self._general_pg().cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM public.gsm_parser_excluded_devices WHERE source=%s AND model_key=%s",
+                    (source, model_key),
+                )
+                return bool(cur.fetchone())
+        return False
+
+    @staticmethod
+    def _norm_size_num(v) -> str:
+        """Same normalization as views/gsm_parser_view.py's _norm_size_num —
+        "8.5" and "8.50" (or "8,5") are the SAME physical size and must
+        never be treated as a split/merge-blocking difference just because
+        of formatting."""
+        s = str(v or "").strip().replace(",", ".")
+        if not s:
+            return ""
+        try:
+            f = float(s)
+        except Exception:
+            return s
+        return f"{f:.2f}".rstrip("0").rstrip(".")
+
+    def split_gsm_device_by_region(self, device_id: str) -> tuple[bool, str, list]:
+        """Manual action: a Xiaomi device whose regional variants carry 2+
+        distinct physical sizes gets split into one physical device row per
+        size group. Per spec: everything is copied as-is (specs, links —
+        the linked E-Katalog row is cloned onto every new sibling too, so
+        each can independently show/hide it via its own "available_ua"),
+        only the name gets a "(Region, Region)" suffix and the size comes
+        from the region group instead of GSM Arena. Each sibling also gets
+        its OWN full copy of the regional-variants table (not just its own
+        group) so either can be edited independently — see
+        merge_gsm_region_split, which re-detects convergence from these
+        per-sibling copies and reverses this.
+
+        Returns (ok, message, new_device_ids) — new_device_ids is every
+        freshly created row (GSM siblings + cloned EK rows), used by the
+        caller to also copy the local photo cache file so the new card
+        shows a photo immediately instead of waiting for the next warm-
+        cache pass."""
+        if not self._use_postgres():
+            return False, "Потрібен PostgreSQL", []
+        did = str(device_id or "").strip()
+        if not did:
+            return False, "Некоректний пристрій", []
+        with contextlib.suppress(Exception):
+            with self._general_pg().cursor() as cur:
+                cur.execute(
+                    "SELECT id, source, brand, device_type, model_name, model_key, "
+                    "source_url, image_url, specs, device_order "
+                    "FROM public.gsm_parser_devices WHERE id=%s",
+                    (did,),
+                )
+                row = cur.fetchone()
+                if not row or str(row.get("source") or "") != "GSM Arena":
+                    return False, "Пристрій не знайдено", []
+                if str(row.get("brand") or "").strip().lower() != "xiaomi":
+                    return False, "Розділення за регіоном доступне лише для Xiaomi", []
+                specs = dict(row.get("specs") or {})
+                if specs.get("region_split_group_id"):
+                    return False, "Пристрій уже розділено за регіоном", []
+
+                cur.execute(
+                    "SELECT variants FROM public.gsm_parser_regional_variants WHERE device_id=%s",
+                    (did,),
+                )
+                vrow = cur.fetchone() or {}
+                variants = vrow.get("variants") or []
+                if isinstance(variants, str):
+                    variants = json.loads(variants)
+
+                groups: dict[tuple, list[str]] = {}
+                order: list[tuple] = []
+                for v in variants:
+                    if not isinstance(v, dict):
+                        continue
+                    if not (str(v.get("region") or "").strip() and str(v.get("L") or "").strip() and str(v.get("W") or "").strip()):
+                        continue
+                    sig = (
+                        self._norm_size_num(v.get("L")), self._norm_size_num(v.get("W")),
+                        self._norm_size_num(v.get("T")), self._norm_size_num(v.get("diagonal")),
+                    )
+                    region = str(v.get("region") or "").strip()
+                    if sig not in groups:
+                        groups[sig] = []
+                        order.append(sig)
+                    if region not in groups[sig]:
+                        groups[sig].append(region)
+                if len(order) < 2:
+                    return False, "У регіонів однаковий розмір — розділення не потрібне", []
+
+                group_id = uuid.uuid4().hex
+                now = self._now_ts()
+                base_name = str(row.get("model_name") or "")
+                new_ids = [did]
+                for i, sig in enumerate(order):
+                    # Only Global/Europe ever go in the split card's own
+                    # name/label — those are the only sized markets a group
+                    # can legitimately represent going forward (see
+                    # xiaomi_regions_sync.py's TARGET_REGIONS). A stray
+                    # non-target region name here would only ever come from
+                    # a manually-typed variants row from before that
+                    # restriction — filtered out so it can't leak into the
+                    # title; other markets belong on the badge row instead
+                    # (specs.xiaomi_other_markets), not baked into the name.
+                    _target_regions = [r for r in groups[sig] if r in ("Global", "Europe")]
+                    regions = _target_regions or groups[sig]
+                    label = ", ".join(regions)
+                    new_specs = dict(specs)
+                    new_specs["region_split_group_id"] = group_id
+                    new_specs["region_split_label"] = label
+                    new_specs["region_split_regions"] = regions
+                    new_specs["available_ua"] = True
+                    new_name = f"{base_name} ({label})"
+                    if i == 0:
+                        cur.execute(
+                            "UPDATE public.gsm_parser_devices SET model_name=%s, specs=%s::jsonb, updated_at=%s WHERE id=%s",
+                            (new_name, json.dumps(new_specs, ensure_ascii=False), now, did),
+                        )
+                        continue
+                    new_id = f"dev_{uuid.uuid4().hex}"
+                    new_ids.append(new_id)
+                    new_model_key = f"{row.get('model_key')}__split__{group_id}__{i}"
+                    cur.execute(
+                        """
+                        INSERT INTO public.gsm_parser_devices
+                          (id, source, brand, device_type, model_name, model_key,
+                           source_url, image_url, specs, last_seen_at, created_at, updated_at, device_order)
+                        VALUES (%s,'GSM Arena',%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s)
+                        """,
+                        (
+                            new_id, row.get("brand"), row.get("device_type"), new_name,
+                            new_model_key, row.get("source_url"), row.get("image_url"),
+                            json.dumps(new_specs, ensure_ascii=False),
+                            now, now, now, int(row.get("device_order") or 0),
+                        ),
+                    )
+                    # Clone the DB-stored photo rows onto the new sibling —
+                    # NOT just a local disk-cache file copy (see the caller
+                    # in views/gsm_parser_view.py's _do_split, which only
+                    # ever helped the one machine that happened to already
+                    # have the original cached; every other session/machine
+                    # never got a photo at all, since _warm_photo_cache_from_db
+                    # only ever pulls from this table, never from image_url).
+                    cur.execute(
+                        "SELECT role, sort_order, image_data, content_type "
+                        "FROM public.gsm_parser_device_photos WHERE device_id=%s",
+                        (did,),
+                    )
+                    for _prow in cur.fetchall() or []:
+                        cur.execute(
+                            """
+                            INSERT INTO public.gsm_parser_device_photos
+                                (id, device_id, role, sort_order, image_data, content_type, created_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                f"gph_{uuid.uuid4().hex}", new_id,
+                                _prow.get("role"), _prow.get("sort_order"),
+                                _prow.get("image_data"), _prow.get("content_type"), now,
+                            ),
+                        )
+                    cur.execute(
+                        "INSERT INTO public.gsm_parser_regional_variants (device_id, variants, updated_at) "
+                        "VALUES (%s,%s::jsonb,%s) "
+                        "ON CONFLICT (device_id) DO UPDATE SET variants=EXCLUDED.variants, updated_at=EXCLUDED.updated_at",
+                        (new_id, json.dumps(variants, ensure_ascii=False), now),
+                    )
+
+                # Clone the linked E-Katalog row (if any) onto every NEW
+                # sibling, so each has its own independent "same link" copy
+                # — required for the per-sibling available_ua toggle to mean
+                # anything (blanking one mustn't blank the shared original).
+                cur.execute(
+                    "SELECT id, brand, device_type, model_name, model_key, source_url, "
+                    "image_url, specs FROM public.gsm_parser_devices "
+                    "WHERE source='E-Katalog' AND (specs->>'gsm_ref_device_id')=%s",
+                    (did,),
+                )
+                ek_row = cur.fetchone()
+                new_ek_ids: list[str] = []
+                if ek_row:
+                    for new_id in new_ids[1:]:
+                        ek_specs = dict(ek_row.get("specs") or {})
+                        ek_specs["gsm_ref_device_id"] = new_id
+                        new_ek_id = f"dev_{uuid.uuid4().hex}"
+                        new_ek_key = f"{ek_row.get('model_key')}__split__{group_id}__{new_id}"
+                        cur.execute(
+                            """
+                            INSERT INTO public.gsm_parser_devices
+                              (id, source, brand, device_type, model_name, model_key,
+                               source_url, image_url, specs, last_seen_at, created_at, updated_at)
+                            VALUES (%s,'E-Katalog',%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s)
+                            """,
+                            (
+                                new_ek_id, ek_row.get("brand"), ek_row.get("device_type"),
+                                ek_row.get("model_name"), new_ek_key, ek_row.get("source_url"),
+                                ek_row.get("image_url"), json.dumps(ek_specs, ensure_ascii=False),
+                                now, now, now,
+                            ),
+                        )
+                        new_ek_ids.append(new_ek_id)
+            self._general_pg().commit()
+            # Every new sibling (GSM + its cloned EK row, if any) must show
+            # the SAME photo as the card it split from, not a placeholder.
+            for _nid in new_ids[1:]:
+                with contextlib.suppress(Exception):
+                    self.clone_gsm_device_photos(did, _nid)
+            if ek_row:
+                _src_ek_id = str(ek_row.get("id") or "")
+                for _nek_id in new_ek_ids:
+                    with contextlib.suppress(Exception):
+                        self.clone_gsm_device_photos(_src_ek_id, _nek_id)
+            return True, f"Розділено на {len(order)} карток", (new_ids[1:] + new_ek_ids)
+        return False, "Помилка розділення", []
+
+    def merge_gsm_region_split(self, device_id: str) -> tuple[bool, str]:
+        """Manual reversal of split_gsm_device_by_region — always offered
+        whenever the device is currently split, regardless of whether
+        sizes have converged: every sibling already carries its OWN full
+        copy of the regional-variants table (every region's own size —
+        see split_gsm_device_by_region), so the survivor loses nothing by
+        merging even while regions still differ in size — that's just the
+        normal, ordinary pre-split state most Xiaomi devices are already
+        in (Global/Europe legitimately have different sizes all the time).
+        Merges into the earliest-created sibling (matching the convention
+        used by the supplier/packaging dup-merge elsewhere), migrating
+        price history (additive) and deleting the rest."""
+        if not self._use_postgres():
+            return False, "Потрібен PostgreSQL"
+        did = str(device_id or "").strip()
+        if not did:
+            return False, "Некоректний пристрій"
+        import re as _re
+
+        with contextlib.suppress(Exception):
+            with self._general_pg().cursor() as cur:
+                cur.execute(
+                    "SELECT id, specs FROM public.gsm_parser_devices WHERE id=%s AND source='GSM Arena'",
+                    (did,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False, "Пристрій не знайдено"
+                specs = dict(row.get("specs") or {})
+                group_id = str(specs.get("region_split_group_id") or "").strip()
+                if not group_id:
+                    return False, "Цей пристрій не розділений за регіоном"
+
+                cur.execute(
+                    "SELECT id, specs, created_at FROM public.gsm_parser_devices "
+                    "WHERE source='GSM Arena' AND (specs->>'region_split_group_id')=%s "
+                    "ORDER BY created_at",
+                    (group_id,),
+                )
+                siblings = cur.fetchall() or []
+                if len(siblings) < 2:
+                    return False, "Не знайдено пари для об'єднання"
+
+                survivor = siblings[0]
+                sid = str(survivor.get("id"))
+                now = self._now_ts()
+                for loser in siblings[1:]:
+                    lid = str(loser.get("id"))
+                    cur.execute(
+                        "SELECT record_date, price_gsm, price_ek_min, price_ek_max, shops_count, status, created_at "
+                        "FROM public.gsm_parser_daily_history WHERE device_id=%s",
+                        (lid,),
+                    )
+                    for r in cur.fetchall() or []:
+                        d = dict(r)
+                        cur.execute(
+                            """
+                            INSERT INTO public.gsm_parser_daily_history
+                              (id, device_id, record_date, price_gsm, price_ek_min, price_ek_max, shops_count, status, created_at)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (device_id, record_date) DO UPDATE SET
+                              price_gsm    = COALESCE(gsm_parser_daily_history.price_gsm, EXCLUDED.price_gsm),
+                              price_ek_min = COALESCE(gsm_parser_daily_history.price_ek_min, EXCLUDED.price_ek_min),
+                              price_ek_max = COALESCE(gsm_parser_daily_history.price_ek_max, EXCLUDED.price_ek_max),
+                              shops_count  = COALESCE(gsm_parser_daily_history.shops_count, EXCLUDED.shops_count)
+                            """,
+                            (
+                                f"hist_{sid}_{d['record_date']}", sid, d["record_date"],
+                                d["price_gsm"], d["price_ek_min"], d["price_ek_max"], d["shops_count"],
+                                d["status"], d["created_at"],
+                            ),
+                        )
+                    cur.execute(
+                        "SELECT id FROM public.gsm_parser_devices WHERE source='E-Katalog' "
+                        "AND (specs->>'gsm_ref_device_id')=%s",
+                        (lid,),
+                    )
+                    for ek in cur.fetchall() or []:
+                        ekid = ek.get("id")
+                        cur.execute("DELETE FROM public.gsm_parser_daily_history WHERE device_id=%s", (ekid,))
+                        cur.execute("DELETE FROM public.gsm_parser_change_history WHERE device_id=%s", (ekid,))
+                        cur.execute("DELETE FROM public.gsm_parser_devices WHERE id=%s", (ekid,))
+                    for tbl, col in [
+                        ("gsm_parser_change_history", "device_id"),
+                        ("gsm_parser_daily_history", "device_id"),
+                        ("gsm_parser_regional_variants", "device_id"),
+                    ]:
+                        cur.execute(f"DELETE FROM public.{tbl} WHERE {col}=%s", (lid,))
+                    cur.execute("DELETE FROM public.gsm_parser_devices WHERE id=%s", (lid,))
+
+                sspecs = dict(survivor.get("specs") or {})
+                for k in ("region_split_group_id", "region_split_label", "region_split_regions", "available_ua"):
+                    sspecs.pop(k, None)
+                cur.execute("SELECT model_name FROM public.gsm_parser_devices WHERE id=%s", (sid,))
+                cur_name = str((cur.fetchone() or {}).get("model_name") or "")
+                plain_name = _re.sub(r"\s*\([^)]*\)\s*$", "", cur_name).strip() or cur_name
+                cur.execute(
+                    "UPDATE public.gsm_parser_devices SET model_name=%s, specs=%s::jsonb, updated_at=%s WHERE id=%s",
+                    (plain_name, json.dumps(sspecs, ensure_ascii=False), now, sid),
+                )
+            self._general_pg().commit()
+            return True, "Об'єднано в одну картку"
+        return False, "Помилка об'єднання"
+
+    def set_gsm_device_available_ua(self, device_id: str, available: bool) -> bool:
+        """Toggle the "Є в продажу Україна" flag on a region-split sibling —
+        when off, get_gsm_merged_results' caller blanks its E-Katalog price/
+        shop data (see _load_devices_sync's post-process) instead of
+        pretending this regional variant is actually sold here."""
+        if not self._use_postgres():
+            return False
+        did = str(device_id or "").strip()
+        if not did:
+            return False
+        with contextlib.suppress(Exception):
+            with self._general_pg().cursor() as cur:
+                cur.execute("SELECT specs FROM public.gsm_parser_devices WHERE id=%s", (did,))
+                row = cur.fetchone()
+                if not row:
+                    return False
+                specs = dict(row.get("specs") or {})
+                specs["available_ua"] = bool(available)
+                cur.execute(
+                    "UPDATE public.gsm_parser_devices SET specs=%s::jsonb, updated_at=%s WHERE id=%s",
+                    (json.dumps(specs, ensure_ascii=False), self._now_ts(), did),
+                )
+            self._general_pg().commit()
+            return True
+        return False
+
+    def delete_gsm_device(self, device_id: str, manager_id: str = "") -> bool:
         """Delete a device and all related records (history, compat, comments).
 
         E-Katalog price/shop-count daily history for a MATCHED device is
@@ -14265,12 +15518,17 @@ class DataManager:
         with contextlib.suppress(Exception):
             with self._general_pg().cursor() as cur:
                 cur.execute(
-                    "SELECT specs->>'gsm_ref_device_id' AS parent_id "
+                    "SELECT source, model_key, brand, model_name, "
+                    "specs->>'gsm_ref_device_id' AS parent_id "
                     "FROM public.gsm_parser_devices WHERE id=%s",
                     (device_id,),
                 )
-                _row = cur.fetchone()
-                parent_id = str((_row or {}).get("parent_id") or "").strip() or None
+                _row = cur.fetchone() or {}
+                parent_id = str(_row.get("parent_id") or "").strip() or None
+                _excl_source = str(_row.get("source") or "").strip()
+                _excl_model_key = str(_row.get("model_key") or "").strip()
+                _excl_brand = str(_row.get("brand") or "").strip()
+                _excl_model_name = str(_row.get("model_name") or "").strip()
 
                 for tbl, col in [
                     ("gsm_parser_change_history", "device_id"),
@@ -14307,32 +15565,180 @@ class DataManager:
                         (parent_id,),
                     )
             self._general_pg().commit()
+            if _excl_source and _excl_model_key:
+                self.add_gsm_excluded(
+                    _excl_source, _excl_model_key, _excl_brand, _excl_model_name, manager_id
+                )
             return True
         return False
+
+    def detach_gsm_side_keep_ek(self, gsm_device_id: str, manager_id: str = "") -> tuple[bool, str, str]:
+        """Delete only the GSM Arena side of a matched device, promoting its
+        linked E-Katalog row to stand alone in its place — the mirror image
+        of delete_gsm_device(ek_id) (which removes the EK side and leaves
+        GSM Arena as-is). Registers (source, model_key) as excluded so a
+        future scheduled parse never silently re-matches/re-adds this GSM
+        Arena device — the only way back is a manual link (see
+        fetch_and_attach_manual_gsm_url).
+
+        Unlike delete_gsm_device, this MIGRATES the GSM row's own comments,
+        compatibility (case/glass) lists, price history, and regional
+        variants onto the E-Katalog row first — the GSM Arena id has been
+        the "parent" id these were always recorded/edited against, so a
+        plain delete would silently wipe them instead of just detaching the
+        GSM Arena data. Returns (ok, message, new_primary_device_id) —
+        new_primary_device_id is the E-Katalog row's own id, which the
+        caller must switch the open card/table row to reference from here on."""
+        if not self._use_postgres():
+            return False, "Потрібен PostgreSQL", ""
+        gid = str(gsm_device_id or "").strip()
+        if not gid:
+            return False, "Некоректний пристрій", ""
+        with contextlib.suppress(Exception):
+            with self._general_pg().cursor() as cur:
+                cur.execute(
+                    "SELECT source, model_key, brand, model_name FROM public.gsm_parser_devices WHERE id=%s",
+                    (gid,),
+                )
+                grow = cur.fetchone()
+                if not grow or str(grow.get("source") or "") != "GSM Arena":
+                    return False, "GSM-пристрій не знайдено", ""
+                _excl_source = str(grow.get("source") or "").strip()
+                _excl_model_key = str(grow.get("model_key") or "").strip()
+                _excl_brand = str(grow.get("brand") or "").strip()
+                _excl_model_name = str(grow.get("model_name") or "").strip()
+
+                cur.execute(
+                    "SELECT id, specs FROM public.gsm_parser_devices "
+                    "WHERE source='E-Katalog' AND (specs->>'gsm_ref_device_id')=%s LIMIT 1",
+                    (gid,),
+                )
+                erow = cur.fetchone()
+                if not erow:
+                    return (
+                        False,
+                        "Немає прив'язаного товару ЄК — видаліть пристрій повністю замість цього",
+                        "",
+                    )
+                eid = str(erow.get("id"))
+                now = self._now_ts()
+
+                # Comments/regional-variants are UNIQUE(device_id) — only
+                # migrate if the EK row doesn't already improbably have its
+                # own (never overwrite a genuine existing EK-side row).
+                cur.execute("SELECT 1 FROM public.gsm_parser_comments WHERE device_id=%s", (eid,))
+                if not cur.fetchone():
+                    cur.execute(
+                        "UPDATE public.gsm_parser_comments SET device_id=%s, updated_at=%s WHERE device_id=%s",
+                        (eid, now, gid),
+                    )
+                cur.execute("SELECT 1 FROM public.gsm_parser_regional_variants WHERE device_id=%s", (eid,))
+                if not cur.fetchone():
+                    cur.execute(
+                        "UPDATE public.gsm_parser_regional_variants SET device_id=%s, updated_at=%s WHERE device_id=%s",
+                        (eid, now, gid),
+                    )
+
+                # id-keyed tables (no UNIQUE(device_id)) — plain repoint.
+                cur.execute(
+                    "UPDATE public.gsm_parser_change_history SET device_id=%s WHERE device_id=%s",
+                    (eid, gid),
+                )
+                cur.execute(
+                    "UPDATE public.gsm_parser_device_photos SET device_id=%s WHERE device_id=%s",
+                    (eid, gid),
+                )
+                cur.execute(
+                    "UPDATE public.gsm_parser_compatible SET device_id=%s WHERE device_id=%s "
+                    "AND NOT EXISTS (SELECT 1 FROM public.gsm_parser_compatible c2 "
+                    "WHERE c2.device_id=%s AND c2.compatible_device_id=public.gsm_parser_compatible.compatible_device_id)",
+                    (eid, gid, eid),
+                )
+                with contextlib.suppress(Exception):
+                    # Rare edge case (some other device already listed as
+                    # compatible with BOTH the GSM and EK id) — degrade to
+                    # "leave that one link as-is" rather than aborting the
+                    # rest of this migration over a single UNIQUE conflict.
+                    cur.execute(
+                        "UPDATE public.gsm_parser_compatible SET compatible_device_id=%s "
+                        "WHERE compatible_device_id=%s",
+                        (eid, gid),
+                    )
+                cur.execute("DELETE FROM public.gsm_parser_compatible WHERE device_id=%s", (gid,))
+
+                # Daily price/shop history — same additive merge pattern as
+                # merge_gsm_region_split (EK's own copy, if any, wins on
+                # overlap; GSM's history fills in everything else).
+                cur.execute(
+                    "SELECT record_date, price_gsm, price_ek_min, price_ek_max, shops_count, status, created_at "
+                    "FROM public.gsm_parser_daily_history WHERE device_id=%s",
+                    (gid,),
+                )
+                for r in cur.fetchall() or []:
+                    d = dict(r)
+                    cur.execute(
+                        """
+                        INSERT INTO public.gsm_parser_daily_history
+                          (id, device_id, record_date, price_gsm, price_ek_min, price_ek_max, shops_count, status, created_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (device_id, record_date) DO UPDATE SET
+                          price_gsm    = COALESCE(gsm_parser_daily_history.price_gsm, EXCLUDED.price_gsm),
+                          price_ek_min = COALESCE(gsm_parser_daily_history.price_ek_min, EXCLUDED.price_ek_min),
+                          price_ek_max = COALESCE(gsm_parser_daily_history.price_ek_max, EXCLUDED.price_ek_max),
+                          shops_count  = COALESCE(gsm_parser_daily_history.shops_count, EXCLUDED.shops_count)
+                        """,
+                        (
+                            f"hist_{eid}_{d['record_date']}", eid, d["record_date"],
+                            d["price_gsm"], d["price_ek_min"], d["price_ek_max"], d["shops_count"],
+                            d["status"], d["created_at"],
+                        ),
+                    )
+                cur.execute("DELETE FROM public.gsm_parser_daily_history WHERE device_id=%s", (gid,))
+
+                # EK row no longer references a (soon deleted) GSM parent —
+                # get_gsm_merged_results' standalone-EK UNION branch picks
+                # it up as genuinely standalone from here on.
+                especs = dict(erow.get("specs") or {})
+                especs.pop("gsm_ref_device_id", None)
+                especs.pop("gsm_ref_model_key", None)
+                cur.execute(
+                    "UPDATE public.gsm_parser_devices SET specs=%s::jsonb, updated_at=%s WHERE id=%s",
+                    (json.dumps(especs, ensure_ascii=False), now, eid),
+                )
+
+                cur.execute("DELETE FROM public.gsm_parser_devices WHERE id=%s", (gid,))
+            self._general_pg().commit()
+            if _excl_source and _excl_model_key:
+                self.add_gsm_excluded(
+                    _excl_source, _excl_model_key, _excl_brand, _excl_model_name, manager_id
+                )
+            return True, "GSM Arena від'єднано — товар тепер лише ЄК", eid
+        return False, "Помилка видалення", ""
 
     # ------------------------------------------------------------------ #
     #  GSM Parser — Device Photos (stored as bytes — never hot-linked to  #
     #  GSM Arena from the app, to avoid re-triggering anti-bot blocking)  #
     # ------------------------------------------------------------------ #
     def _ensure_gsm_device_photos_table(self):
-        with self._general_pg().cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.gsm_parser_device_photos (
-                    id           character varying NOT NULL,
-                    device_id    character varying NOT NULL,
-                    role         character varying(16) NOT NULL,
-                    sort_order   integer NOT NULL DEFAULT 0,
-                    image_data   bytea NOT NULL,
-                    content_type character varying(32) NOT NULL DEFAULT 'image/jpeg',
-                    created_at   timestamp without time zone NOT NULL,
-                    PRIMARY KEY (id)
+        with self._general_schema_lock:
+            with self._general_pg().cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.gsm_parser_device_photos (
+                        id           character varying NOT NULL,
+                        device_id    character varying NOT NULL,
+                        role         character varying(16) NOT NULL,
+                        sort_order   integer NOT NULL DEFAULT 0,
+                        image_data   bytea NOT NULL,
+                        content_type character varying(32) NOT NULL DEFAULT 'image/jpeg',
+                        created_at   timestamp without time zone NOT NULL,
+                        PRIMARY KEY (id)
+                    )
+                    """)
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_gsm_photos_device "
+                    "ON public.gsm_parser_device_photos (device_id, role, sort_order)"
                 )
-                """)
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_gsm_photos_device "
-                "ON public.gsm_parser_device_photos (device_id, role, sort_order)"
-            )
-        self._general_pg().commit()
+            self._general_pg().commit()
 
     def save_gsm_device_photos(
         self,
@@ -14395,6 +15801,38 @@ class DataManager:
             return True
         return False
 
+    def clone_gsm_device_photos(self, src_device_id: str, dst_device_id: str) -> bool:
+        """Used by split_gsm_device_by_region — a freshly split sibling must
+        show the SAME photo as the card it was split from, not a blank
+        placeholder, until/unless someone deliberately changes it."""
+        if not self._use_postgres():
+            return False
+        with contextlib.suppress(Exception):
+            now = self._now_ts()
+            with self._general_pg().cursor() as cur:
+                cur.execute(
+                    "SELECT role, sort_order, image_data, content_type "
+                    "FROM public.gsm_parser_device_photos WHERE device_id=%s",
+                    (str(src_device_id),),
+                )
+                rows = cur.fetchall() or []
+                for r in rows:
+                    cur.execute(
+                        """
+                        INSERT INTO public.gsm_parser_device_photos
+                            (id, device_id, role, sort_order, image_data, content_type, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            f"gph_{uuid.uuid4().hex}", str(dst_device_id),
+                            r.get("role"), r.get("sort_order"), r.get("image_data"),
+                            r.get("content_type"), now,
+                        ),
+                    )
+            self._general_pg().commit()
+            return True
+        return False
+
     def get_gsm_device_main_photo(self, device_id: str) -> bytes | None:
         if not self._use_postgres():
             return None
@@ -14428,6 +15866,37 @@ class DataManager:
                 if isinstance(r, dict) and r.get("image_data") is not None
             ]
         return []
+
+    def get_gsm_device_gallery_photos_bulk(
+        self, device_ids: list[str]
+    ) -> dict[str, list[bytes]]:
+        """One query for many devices' gallery (extra) photos — same bulk
+        pattern as get_gsm_device_main_photos_bulk, used to warm the local
+        gallery-photo cache for a whole catalog up front instead of one
+        DB round trip per device on first card open."""
+        ids = [str(i) for i in (device_ids or []) if i]
+        if not self._use_postgres() or not ids:
+            return {}
+        with contextlib.suppress(Exception):
+            self._ensure_gsm_device_photos_table()
+            with self._general_pg().cursor() as cur:
+                cur.execute(
+                    "SELECT device_id, image_data FROM public.gsm_parser_device_photos "
+                    "WHERE role='gallery' AND device_id = ANY(%s) "
+                    "ORDER BY device_id, sort_order ASC",
+                    (ids,),
+                )
+                rows = cur.fetchall() or []
+            result: dict[str, list[bytes]] = {}
+            for r in rows:
+                if not isinstance(r, dict) or r.get("image_data") is None:
+                    continue
+                did = str(r.get("device_id") or "")
+                if not did:
+                    continue
+                result.setdefault(did, []).append(bytes(r.get("image_data")))
+            return result
+        return {}
 
     def get_gsm_device_main_photos_bulk(
         self, device_ids: list[str]
@@ -14539,28 +16008,39 @@ class DataManager:
             self._general_pg().commit()
         return added
 
-    def update_gsm_device_price_and_dates(
+    def update_gsm_device_full_refresh(
         self,
         device_id: str,
-        price_raw: str,
-        price_uah: str,
-        announced: str,
-        released: str,
+        model_name: str,
+        model_key: str,
+        specs_update: dict,
         device_order: int | None = None,
     ) -> dict:
-        """Update price fields (always) and date fields (only when currently empty in DB).
-        GSM Arena changes are applied directly — no gsm_parser_change_history entry
-        is written for them (change tracking is E-Katalog-only: price/shops fields).
+        """Re-check path for a device already known to the DB (has a main photo):
+        overwrites model_name/model_key and every spec field in specs_update
+        whenever the freshly-scraped value differs from what's stored — not just
+        price/dates, and not only empty→filled, so a name change ("Redmi Note 17
+        (China)" -> "Redmi Note 17 (India/China)") or a refined announcement date
+        on an already-dated device both land here. GSM Arena changes are applied
+        directly — no gsm_parser_change_history entry is written for them (change
+        tracking is E-Katalog-only: price/shops fields).
+
+        Addressed by device_id (not the usual (source, model_key) upsert lookup)
+        specifically so a name change can't be mistaken for a different device and
+        spawn a duplicate row — GSM Arena has no URL-based recovery fallback like
+        E-Katalog's _fetch_one_ek_by_url, so identity here has to stay pinned to
+        the id we already resolved via the photo-status cache.
 
         device_order (the device's current position on GSM Arena's brand listing
-        page) is refreshed here too when given, even if price/dates didn't change —
-        this is the "lightweight" re-scrape path taken on every run after a device's
-        first full parse, so without this its order would freeze at whatever
-        position it had the one time it WAS fully parsed, drifting out of sync with
-        devices scraped/repositioned later and producing an effectively random
-        sort order within a brand over time.
+        page) is refreshed here too when given, even if nothing else changed —
+        this is the re-scrape path taken on every run after a device's first full
+        parse, so without this its order would freeze at whatever position it had
+        the one time it WAS fully parsed, drifting out of sync with devices
+        scraped/repositioned later and producing an effectively random sort order
+        within a brand over time.
 
-        Returns {field_key: (old_value, new_value)} for changed fields."""
+        Returns {field_key: (old_value, new_value)} for changed fields (including
+        "model_name" when the name itself changed)."""
         if not self._use_postgres():
             return {}
         changed: dict = {}
@@ -14568,7 +16048,7 @@ class DataManager:
             now = datetime.now()
             with self._general_pg().cursor() as cur:
                 cur.execute(
-                    "SELECT specs FROM public.gsm_parser_devices WHERE id=%s LIMIT 1",
+                    "SELECT model_name, specs FROM public.gsm_parser_devices WHERE id=%s LIMIT 1",
                     (str(device_id),),
                 )
                 row = cur.fetchone()
@@ -14579,32 +16059,32 @@ class DataManager:
                     specs = {}
 
                 new_specs = dict(specs)
-
-                for key, new_val in (
-                    ("price_gsm", price_raw),
-                    ("price_uah", price_uah),
-                ):
+                for key, new_val in (specs_update or {}).items():
                     old_val = str(specs.get(key) or "").strip()
                     nv = str(new_val or "").strip()
                     if old_val != nv:
                         new_specs[key] = nv
                         changed[key] = (old_val, nv)
 
-                for key, new_val in (("announced", announced), ("released", released)):
-                    old_val = str(specs.get(key) or "").strip()
-                    nv = str(new_val or "").strip()
-                    if not old_val and nv:
-                        new_specs[key] = nv
-                        changed[key] = (old_val, nv)
+                old_name = str(row.get("model_name") or "").strip()
+                new_name = str(model_name or "").strip()
+                name_changed = bool(new_name) and old_name != new_name
+                if name_changed:
+                    changed["model_name"] = (old_name, new_name)
 
                 if changed:
                     cur.execute(
                         "UPDATE public.gsm_parser_devices "
-                        "SET specs=%s::jsonb, updated_at=%s, device_order=COALESCE(%s, device_order) WHERE id=%s",
+                        "SET specs=%s::jsonb, updated_at=%s, device_order=COALESCE(%s, device_order),"
+                        " model_name=COALESCE(NULLIF(%s, ''), model_name),"
+                        " model_key=COALESCE(NULLIF(%s, ''), model_key)"
+                        " WHERE id=%s",
                         (
                             json.dumps(new_specs, ensure_ascii=False),
                             now,
                             device_order,
+                            new_name if name_changed else "",
+                            str(model_key or "").strip() if name_changed else "",
                             str(device_id),
                         ),
                     )
@@ -14660,20 +16140,21 @@ class DataManager:
     #  GSM Parser — SuperAdmin Comments                                   #
     # ------------------------------------------------------------------ #
     def _ensure_gsm_comments_table(self):
-        with self._general_pg().cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.gsm_parser_comments (
-                    id           character varying NOT NULL,
-                    device_id    character varying NOT NULL,
-                    comment_text text NOT NULL DEFAULT '',
-                    rich_data    jsonb NOT NULL DEFAULT '[]'::jsonb,
-                    created_at   timestamp without time zone NOT NULL,
-                    updated_at   timestamp without time zone NOT NULL,
-                    PRIMARY KEY (id),
-                    UNIQUE (device_id)
-                )
-                """)
-        self._general_pg().commit()
+        with self._general_schema_lock:
+            with self._general_pg().cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.gsm_parser_comments (
+                        id           character varying NOT NULL,
+                        device_id    character varying NOT NULL,
+                        comment_text text NOT NULL DEFAULT '',
+                        rich_data    jsonb NOT NULL DEFAULT '[]'::jsonb,
+                        created_at   timestamp without time zone NOT NULL,
+                        updated_at   timestamp without time zone NOT NULL,
+                        PRIMARY KEY (id),
+                        UNIQUE (device_id)
+                    )
+                    """)
+            self._general_pg().commit()
 
     def get_all_gsm_device_comments(
         self, device_ids: list[str] | None = None
@@ -14759,16 +16240,17 @@ class DataManager:
     #  GSM Parser — Regional Variants (Xiaomi)                            #
     # ------------------------------------------------------------------ #
     def _ensure_gsm_regional_variants_table(self):
-        with self._general_pg().cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.gsm_parser_regional_variants (
-                    device_id   character varying NOT NULL,
-                    variants    jsonb NOT NULL DEFAULT '[]'::jsonb,
-                    updated_at  timestamp without time zone NOT NULL DEFAULT now(),
-                    CONSTRAINT gsm_parser_regional_variants_pkey PRIMARY KEY (device_id)
-                )
-                """)
-        self._general_pg().commit()
+        with self._general_schema_lock:
+            with self._general_pg().cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.gsm_parser_regional_variants (
+                        device_id   character varying NOT NULL,
+                        variants    jsonb NOT NULL DEFAULT '[]'::jsonb,
+                        updated_at  timestamp without time zone NOT NULL DEFAULT now(),
+                        CONSTRAINT gsm_parser_regional_variants_pkey PRIMARY KEY (device_id)
+                    )
+                    """)
+            self._general_pg().commit()
 
     def get_all_gsm_regional_variants(
         self, device_ids: list[str] | None = None
@@ -14859,6 +16341,113 @@ class DataManager:
                 )
             self._general_pg().commit()
             return True
+        return False
+
+    def set_gsm_region_in_stock(self, device_id: str, region: str, in_stock: bool) -> bool:
+        """Toggle one region ROW's own "Є в продажу" flag inside the
+        regional-variants table (distinct from set_gsm_device_available_ua,
+        which is a single flag for the whole card/E-Katalog link) —
+        see views/gsm_parser_view.py's _build_regional_variants_section.
+
+        Every region-split sibling carries its own full copy of the same
+        variants list (see split_gsm_device_by_region), so this specific
+        region's in_stock state must be written into EVERY sibling's own
+        copy too, not just device_id's — otherwise the "(Global)" card and
+        the "(Europe)" card would show different answers for the same
+        real-world fact ("is this phone sold in Global right now")."""
+        did = str(device_id or "").strip()
+        region = str(region or "").strip()
+        if not did or not region or not self._use_postgres():
+            return False
+        target_ids = [did]
+        with contextlib.suppress(Exception):
+            with self._general_pg().cursor() as cur:
+                cur.execute(
+                    "SELECT specs->>'region_split_group_id' AS gid FROM public.gsm_parser_devices WHERE id=%s",
+                    (did,),
+                )
+                gid = str((cur.fetchone() or {}).get("gid") or "").strip()
+                if gid:
+                    cur.execute(
+                        "SELECT id FROM public.gsm_parser_devices WHERE source='GSM Arena' "
+                        "AND (specs->>'region_split_group_id')=%s",
+                        (gid,),
+                    )
+                    sibling_ids = [str(r.get("id")) for r in (cur.fetchall() or [])]
+                    if sibling_ids:
+                        target_ids = sibling_ids
+
+        touched_primary = False
+        for tid in target_ids:
+            variants = self.get_gsm_regional_variants(tid)
+            changed = False
+            for v in variants:
+                if isinstance(v, dict) and str(v.get("region") or "").strip() == region:
+                    v["in_stock"] = bool(in_stock)
+                    changed = True
+            if changed and self.save_gsm_regional_variants(tid, variants):
+                if tid == did:
+                    touched_primary = True
+        return touched_primary
+
+    def set_gsm_xiaomi_other_markets(self, device_id: str, markets: dict) -> bool:
+        """Non-sized markets a Xiaomi device is also sold in — {region:
+        models_str}, e.g. {"China": "24117RN76G", "Japan": "XIG07"} — each
+        surfaced as its own color-coded badge near "Регіональні варіанти"
+        with the model number on hover, never given a size row (see
+        xiaomi_regions_sync.py's module docstring for why only Global/Europe
+        get a full table)."""
+        if not self._use_postgres():
+            return False
+        did = str(device_id or "").strip()
+        if not did:
+            return False
+        with contextlib.suppress(Exception):
+            with self._general_pg().cursor() as cur:
+                cur.execute("SELECT specs FROM public.gsm_parser_devices WHERE id=%s", (did,))
+                row = cur.fetchone()
+                if not row:
+                    return False
+                specs = dict(row.get("specs") or {})
+                specs["xiaomi_other_markets"] = (
+                    {str(k): str(v or "") for k, v in markets.items()}
+                    if isinstance(markets, dict)
+                    else sorted(set(markets or []))  # legacy list-of-names caller
+                )
+                cur.execute(
+                    "UPDATE public.gsm_parser_devices SET specs=%s::jsonb, updated_at=%s WHERE id=%s",
+                    (json.dumps(specs, ensure_ascii=False), self._now_ts(), did),
+                )
+            self._general_pg().commit()
+            return True
+        return False
+
+    def delete_gsm_regional_variant_region(self, device_id: str, region: str) -> bool:
+        """Manual delete of one region row from a Xiaomi device's size
+        table — tombstoned (source='excluded', dims cleared) instead of
+        physically removed, so xiaomi_regions_sync.py's GitHub sync never
+        silently re-adds it (see _merge_variants); the UI filters
+        source='excluded' rows out of what it displays."""
+        if not self._use_postgres():
+            return False
+        did = str(device_id or "").strip()
+        region = str(region or "").strip()
+        if not did or not region:
+            return False
+        with contextlib.suppress(Exception):
+            variants = self.get_gsm_regional_variants(did)
+            found = False
+            for v in variants:
+                if isinstance(v, dict) and str(v.get("region") or "").strip() == region:
+                    v["source"] = "excluded"
+                    v["L"] = ""
+                    v["W"] = ""
+                    v["T"] = ""
+                    v["diagonal"] = ""
+                    found = True
+            if not found:
+                return False
+            return self.save_gsm_regional_variants(did, variants)
         return False
 
     def get_all_gsm_xiaomi_devices(self) -> list[dict]:
@@ -15148,6 +16737,55 @@ class DataManager:
                 ]
         return []
 
+    def get_gsm_parser_filter_options(self) -> dict:
+        """Brand/type/year/status option lists for the GSM Parser filter
+        panel, computed with cheap DISTINCT queries directly against
+        public.gsm_parser_devices (brand/device_type are indexed) — NOT by
+        loading the full merged device list first. Lets the filter panel
+        show real options (so a user who only cares about one device_type
+        or brand can narrow down) before ever clicking "Показати
+        результати", instead of requiring the whole catalog in memory
+        just to know what brands/types even exist."""
+        empty = {"brands": [], "types": [], "years": [], "statuses": []}
+        if not self._use_postgres():
+            return empty
+        with contextlib.suppress(Exception):
+            with self._general_pg().cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT brand FROM public.gsm_parser_devices "
+                    "WHERE brand <> '' ORDER BY brand"
+                )
+                brands = [str(r.get("brand") or "") for r in (cur.fetchall() or []) if r.get("brand")]
+
+                cur.execute(
+                    "SELECT DISTINCT device_type FROM public.gsm_parser_devices "
+                    "WHERE device_type <> '' ORDER BY device_type"
+                )
+                types = [
+                    str(r.get("device_type") or "")
+                    for r in (cur.fetchall() or [])
+                    if r.get("device_type")
+                ]
+
+                cur.execute(
+                    "SELECT DISTINCT specs->>'year' AS year FROM public.gsm_parser_devices "
+                    "WHERE source='GSM Arena' AND specs->>'year' IS NOT NULL "
+                    "AND specs->>'year' <> '' ORDER BY year DESC"
+                )
+                years = [str(r.get("year") or "") for r in (cur.fetchall() or []) if r.get("year")]
+
+                cur.execute(
+                    "SELECT DISTINCT specs->>'status' AS status FROM public.gsm_parser_devices "
+                    "WHERE source='E-Katalog' AND specs->>'status' IS NOT NULL "
+                    "AND specs->>'status' <> '' ORDER BY status"
+                )
+                statuses = [
+                    str(r.get("status") or "") for r in (cur.fetchall() or []) if r.get("status")
+                ]
+
+                return {"brands": brands, "types": types, "years": years, "statuses": statuses}
+        return empty
+
     def get_gsm_merged_results(
         self,
         search: str = "",
@@ -15190,7 +16828,7 @@ class DataManager:
             # scrape position (device_order) — the latter only reflects
             # whatever position a device happened to occupy the one time it
             # was fully parsed and drifts out of sync with reality (see
-            # update_gsm_device_price_and_dates's device_order refresh, which
+            # update_gsm_device_full_refresh's device_order refresh, which
             # helps but only self-heals gradually as devices get rescraped).
             # A date parsed straight out of already-stored specs is correct
             # immediately for every existing row, no rescrape needed.
@@ -15199,32 +16837,51 @@ class DataManager:
             # (parse_gsm_date in GSM_Parser/main.py) or free text such as
             # "Coming soon" when GSM Arena has no date yet.
             #
-            # Tiers (0 = top of the brand group):
+            # Tiers (0 = top of the brand group) — mirrors _gsm_native_order_key
+            # in views/gsm_parser_view.py, which is the authoritative logic
+            # (this SQL order is only what a device happens to land at on
+            # first sync; every render re-sorts client-side with that
+            # Python key, but the two must agree or a forced full resync —
+            # which adopts this SQL order as-is — flashes the wrong order
+            # for a moment). E-Katalog's own "Дата додавання" decides
+            # whenever it exists, REGARDLESS of whether GSM Arena has a
+            # match at all — a brand-new E-Katalog-only device (this
+            # month's date, no GSM Arena entry yet) must rank above a
+            # GSM-matched device released in 2018, not below it:
             #   0 — GSM Arena device not yet released ("Coming soon" et al.)
-            #   1 — GSM Arena device with a real release date
-            #   2 — GSM Arena device with only an announce date
-            #   3 — standalone E-Katalog-only device (Amazfit/MiBand etc.),
-            #       ordered by "Дата додавання" year/month
-            #   4 — nothing parseable at all
+            #   1 — has a usable date from any source (E-Katalog "Дата
+            #       додавання" preferred; GSM Arena release/announce only
+            #       as fallback when E-Katalog has neither year nor month)
+            #   2 — nothing parseable anywhere
             _rel_is_date = "gsm_specs->>'released' ~ '^\\d{2}\\.\\d{2}\\.\\d{4}$'"
             _ann_is_date = "gsm_specs->>'announced' ~ '^\\d{2}\\.\\d{2}\\.\\d{4}$'"
+            _ek_year = (
+                "COALESCE("
+                "  NULLIF(ek_specs->>'date_added_year', '')::int, "
+                "  NULLIF(substring(ek_specs->>'date_added' from '\\d{4}'), '')::int"
+                ")"
+            )
+            _ek_month = "NULLIF(ek_specs->>'date_added_month', '')::int"
+            _eff_year = (
+                f"COALESCE({_ek_year}, "
+                f"CASE WHEN {_rel_is_date} THEN EXTRACT(YEAR FROM to_date(gsm_specs->>'released', 'DD.MM.YYYY'))::int END, "
+                f"CASE WHEN {_ann_is_date} THEN EXTRACT(YEAR FROM to_date(gsm_specs->>'announced', 'DD.MM.YYYY'))::int END)"
+            )
+            _eff_month = (
+                f"COALESCE({_ek_month}, "
+                f"CASE WHEN {_rel_is_date} THEN EXTRACT(MONTH FROM to_date(gsm_specs->>'released', 'DD.MM.YYYY'))::int END, "
+                f"CASE WHEN {_ann_is_date} THEN EXTRACT(MONTH FROM to_date(gsm_specs->>'announced', 'DD.MM.YYYY'))::int END)"
+            )
             order_clause = (
                 "COALESCE(brand_sort_order, 9999) ASC, "
                 "CASE "
-                f"  WHEN gsm_name IS NOT NULL AND gsm_specs->>'released' ILIKE '%%coming%%' THEN 0 "
-                f"  WHEN gsm_name IS NOT NULL AND {_rel_is_date} THEN 1 "
-                f"  WHEN gsm_name IS NOT NULL AND {_ann_is_date} THEN 2 "
-                "  WHEN gsm_name IS NULL THEN 3 "
-                "  ELSE 4 "
+                "  WHEN gsm_name IS NOT NULL AND gsm_specs->>'released' ILIKE '%%coming%%' THEN 0 "
+                f"  WHEN {_ek_year} IS NOT NULL OR {_ek_month} IS NOT NULL "
+                f"       OR {_rel_is_date} OR {_ann_is_date} THEN 1 "
+                "  ELSE 2 "
                 "END ASC, "
-                f"CASE WHEN {_rel_is_date} THEN to_date(gsm_specs->>'released', 'DD.MM.YYYY') END DESC, "
-                f"CASE WHEN {_ann_is_date} THEN to_date(gsm_specs->>'announced', 'DD.MM.YYYY') END DESC, "
-                "COALESCE("
-                "  NULLIF(ek_specs->>'date_added_year', '')::int, "
-                "  NULLIF(substring(ek_specs->>'date_added' from '\\d{4}'), '')::int, "
-                "  0"
-                ") DESC, "
-                "COALESCE(NULLIF(ek_specs->>'date_added_month', '')::int, 0) DESC, "
+                f"COALESCE({_eff_year}, 0) DESC, "
+                f"COALESCE({_eff_month}, 0) DESC, "
                 "brand ASC"
             )
         else:
@@ -15324,14 +16981,28 @@ class DataManager:
         a device card is opened from outside the results table (e.g. the
         sidebar "З'явились в продажу"/"Нові..." panels), so it shows full
         GSM Arena + E-Katalog data instead of get_gsm_device_by_id's raw,
-        un-joined single-table row."""
+        un-joined single-table row.
+
+        device_id may be either side's own row id — the sidebar panels above
+        report whichever source triggered the event (e.g. "Нові Єкаталог"
+        hands back the E-Katalog row's id even for a device that already
+        has a live GSM Arena match). Resolving purely by "which table has
+        this id" used to return the E-Katalog row completely on its own —
+        gsm_specs/gsm_name/gsm_url hardcoded NULL — even when that row's
+        specs->>'gsm_ref_device_id' pointed at a real, already-matched GSM
+        Arena device, so the opened card silently showed E-Katalog data
+        only, no GSM tab, no diagrams/compat (both keyed off the GSM id).
+        Now an E-Katalog row with a live link is re-resolved through that
+        link to the SAME combined shape get_gsm_merged_results/the results
+        table produce, instead of being treated as standalone."""
         if not self._use_postgres():
             return None
         did = str(device_id or "").strip()
         if not did:
             return None
-        query = """
-            SELECT * FROM (
+
+        def _by_gsm_id(gid: str) -> dict | None:
+            query = """
                 SELECT
                     g.id, g.brand, g.device_type,
                     g.model_name AS gsm_name,
@@ -15348,30 +17019,50 @@ class DataManager:
                     ON e.source = 'E-Katalog'
                     AND (e.specs->>'gsm_ref_device_id') = g.id
                 WHERE g.source = 'GSM Arena' AND g.id = %s
-
-                UNION ALL
-
-                SELECT
-                    e.id, e.brand, e.device_type,
-                    NULL AS gsm_name,
-                    e.image_url,
-                    NULL AS gsm_url,
-                    NULL AS gsm_specs,
-                    e.last_seen_at,
-                    e.id AS ek_id,
-                    e.model_name AS ek_name,
-                    e.source_url AS ek_url,
-                    e.specs AS ek_specs
-                FROM public.gsm_parser_devices e
-                WHERE e.source = 'E-Katalog' AND e.id = %s
-            ) combined
-            LIMIT 1
-        """
-        with contextlib.suppress(Exception):
+                LIMIT 1
+            """
             with self._general_pg().cursor() as cur:
-                cur.execute(query, (did, did))
+                cur.execute(query, (gid,))
                 row = cur.fetchone()
             return dict(row) if isinstance(row, dict) else None
+
+        with contextlib.suppress(Exception):
+            with self._general_pg().cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand, device_type, image_url, source_url, "
+                    "specs, last_seen_at, model_name "
+                    "FROM public.gsm_parser_devices WHERE source='E-Katalog' AND id=%s "
+                    "LIMIT 1",
+                    (did,),
+                )
+                ek_row = cur.fetchone()
+
+            if isinstance(ek_row, dict):
+                ek_specs = (
+                    ek_row.get("specs") if isinstance(ek_row.get("specs"), dict) else {}
+                )
+                gsm_ref_id = str(ek_specs.get("gsm_ref_device_id") or "").strip()
+                if gsm_ref_id:
+                    merged = _by_gsm_id(gsm_ref_id)
+                    if merged is not None:
+                        return merged
+                # Genuinely standalone (or its linked GSM row is gone).
+                return {
+                    "id": ek_row.get("id"),
+                    "brand": ek_row.get("brand"),
+                    "device_type": ek_row.get("device_type"),
+                    "gsm_name": None,
+                    "image_url": ek_row.get("image_url"),
+                    "gsm_url": None,
+                    "gsm_specs": None,
+                    "last_seen_at": ek_row.get("last_seen_at"),
+                    "ek_id": ek_row.get("id"),
+                    "ek_name": ek_row.get("model_name"),
+                    "ek_url": ek_row.get("source_url"),
+                    "ek_specs": ek_row.get("specs"),
+                }
+
+            return _by_gsm_id(did)
         return None
 
     def get_gsm_device_ids(self) -> set:
@@ -16012,23 +17703,67 @@ class DataManager:
                     p.append(limit)
                     return p
 
+                b_clause_d = "AND d.brand = ANY(%s)" if bf is not None else ""
+                d_clause_d = "AND d.device_type = ANY(%s)" if dtf is not None else ""
+
+                def _p_union(source_val):
+                    p = [run_day]
+                    if bf is not None:
+                        p.append(bf)
+                    if dtf is not None:
+                        p.append(dtf)
+                    p.append(run_day)
+                    if bf is not None:
+                        p.append(bf)
+                    if dtf is not None:
+                        p.append(dtf)
+                    p.append(limit)
+                    return p
+
+                # UNIONs in a manually-added device (via a pasted GSM Arena/
+                # E-Katalog link, see fetch_and_add_manual_gsm_device/
+                # fetch_and_add_manual_ek_device) whose __manual_announce__
+                # marker was written by _upsert_device on the NEXT scheduled
+                # parse run after it was added — its created_at is from the
+                # manual-add moment, not this run's day, so the plain
+                # created_at>=run_day check alone would never surface it here
+                # even though it must show as "new" exactly once. Same
+                # pattern as __shops_appeared__/__regions_appeared__ below.
                 cur.execute(
-                    f"SELECT id, model_name, brand, device_type "
-                    f"FROM public.gsm_parser_devices "
-                    f"WHERE source='GSM Arena' AND DATE_TRUNC('day', created_at) >= %s "
-                    f"{b_clause} {d_clause} ORDER BY created_at DESC LIMIT %s",
-                    _p(run_day),
+                    f"""
+                    SELECT id, model_name, brand, device_type FROM public.gsm_parser_devices
+                    WHERE source='GSM Arena' AND DATE_TRUNC('day', created_at) >= %s
+                    {b_clause} {d_clause}
+                    UNION
+                    SELECT d.id, d.model_name, d.brand, d.device_type
+                    FROM public.gsm_parser_devices d
+                    JOIN public.gsm_parser_change_history ch ON ch.device_id = d.id
+                    WHERE d.source='GSM Arena' AND ch.field_key='__manual_announce__'
+                      AND DATE_TRUNC('day', ch.changed_at) >= %s
+                    {b_clause_d} {d_clause_d}
+                    LIMIT %s
+                    """,
+                    _p_union("GSM Arena"),
                 )
                 result["gsm_new"] = [
                     dict(r) for r in (cur.fetchall() or []) if isinstance(r, dict)
                 ]
 
                 cur.execute(
-                    f"SELECT id, model_name, brand, device_type "
-                    f"FROM public.gsm_parser_devices "
-                    f"WHERE source='E-Katalog' AND DATE_TRUNC('day', created_at) >= %s "
-                    f"{b_clause} {d_clause} ORDER BY created_at DESC LIMIT %s",
-                    _p(run_day),
+                    f"""
+                    SELECT id, model_name, brand, device_type FROM public.gsm_parser_devices
+                    WHERE source='E-Katalog' AND DATE_TRUNC('day', created_at) >= %s
+                    {b_clause} {d_clause}
+                    UNION
+                    SELECT d.id, d.model_name, d.brand, d.device_type
+                    FROM public.gsm_parser_devices d
+                    JOIN public.gsm_parser_change_history ch ON ch.device_id = d.id
+                    WHERE d.source='E-Katalog' AND ch.field_key='__manual_announce__'
+                      AND DATE_TRUNC('day', ch.changed_at) >= %s
+                    {b_clause_d} {d_clause_d}
+                    LIMIT %s
+                    """,
+                    _p_union("E-Katalog"),
                 )
                 result["ek_new"] = [
                     dict(r) for r in (cur.fetchall() or []) if isinstance(r, dict)
@@ -16394,6 +18129,39 @@ class DataManager:
             logger.exception("resolve_image_base64 failed")
             return ""
 
+    def _find_file_in_any_company(self, file_id: str) -> dict | None:
+        """Look up a `files` row by id across every company's own dedicated
+        DB, for callers with no active company selected (see
+        resolve_image_file_path). Opens short-lived, uncached connections —
+        this path is a rare fallback, not the hot path that _pg()'s
+        per-thread connection cache exists for."""
+        try:
+            with self._general_pg().cursor() as cur:
+                cur.execute("SELECT id FROM public.companies")
+                company_ids = [str(r.get("id") or "") for r in cur.fetchall() if r.get("id")]
+        except Exception:
+            return None
+        for cid in company_ids:
+            conn = None
+            try:
+                dsn = self._resolve_company_dsn(cid)
+                conn = psycopg.connect(dsn, autocommit=True, row_factory=dict_row, connect_timeout=5)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT content_type, content FROM files WHERE id=%s LIMIT 1",
+                        (file_id,),
+                    )
+                    row = cur.fetchone()
+                if row:
+                    return row
+            except Exception:
+                continue
+            finally:
+                if conn is not None:
+                    with contextlib.suppress(Exception):
+                        conn.close()
+        return None
+
     def resolve_image_file_path(self, url: str) -> str:
         """
         Materialize `pgfile://<id>` into a local cached file path and return it.
@@ -16417,12 +18185,24 @@ class DataManager:
             out_path = os.path.join(cache_dir, f"{file_id}.bin")
             if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                 return out_path
-            with self._pg().cursor() as cur:
-                cur.execute(
-                    "SELECT content_type, content FROM files WHERE id=%s LIMIT 1",
-                    (file_id,),
-                )
-                row = cur.fetchone() or {}
+            row = None
+            if self._active_company_id:
+                with self._pg().cursor() as cur:
+                    cur.execute(
+                        "SELECT content_type, content FROM files WHERE id=%s LIMIT 1",
+                        (file_id,),
+                    )
+                    row = cur.fetchone()
+            if not row:
+                # No active company (e.g. the VPS parser trigger, which never
+                # calls set_company — GSM Parser's own catalog/config is
+                # global, but header photos for its Telegram digest are
+                # uploaded through the per-company file store since that's
+                # the only uploader UI that exists). Without a company to
+                # address, fall back to checking every company's own DB for
+                # this id — cheap in practice, there are only ever a handful
+                # of companies, and this only runs on a resolve miss.
+                row = self._find_file_in_any_company(file_id)
             content = row.get("content") if isinstance(row, dict) else None
             ctype = (
                 (row.get("content_type") or "").lower() if isinstance(row, dict) else ""
@@ -17205,6 +18985,18 @@ class DataManager:
                     }
 
             order_ids.update(self.get_entity_owner_entity_ids(cid, mid, "order") or [])
+            # Розклад Замовлень: recompute_entity_owners_for_scope already
+            # computes and writes entity_owners('schedule_group') correctly
+            # on every transfer, but nothing ever read it back here before —
+            # group_ids only matched by the literal order_schedule_groups.
+            # manager_id column above, which a transfer never updates. That
+            # left every task under a transferred group invisible to the new
+            # owner (group headers still showed via product scope, but
+            # get_order_schedule_tasks filters by group_ids, so the actual
+            # planned dates/quantities disappeared) — confirmed live.
+            group_ids.update(
+                self.get_entity_owner_entity_ids(cid, mid, "schedule_group") or []
+            )
             # Note: order_ids from entity_owners is kept for now because orders can
             # span multiple product scopes and entity_owners is the canonical record.
             # Suppliers and packaging are computed purely from in-scope products above.
@@ -19820,8 +21612,137 @@ class DataManager:
 
         return changed
 
+    def _duplicate_supplier_packaging_for_transfer(
+        self,
+        cur,
+        company_id: str,
+        product_rows: list[dict],
+        new_manager_id: str,
+    ) -> None:
+        """
+        MOVE semantics for suppliers/packaging referenced by the products
+        being transferred: the target manager (new_manager_id) must end up
+        the SOLE owner of his own physical row, and the source manager must
+        keep his own untouched row — never a single row co-owned by both.
+        For each transferred product's supplier_id/packaging_id, reuses an
+        existing duplicate already exclusively owned by new_manager_id (so
+        repeated transfers of the same real-world supplier don't pile up
+        more copies), or clones a fresh row for him and repoints just this
+        product's reference to it.
+        """
+        cid = str(company_id or "").strip()
+        mid = str(new_manager_id or "").strip()
+        if not cid or not mid or not product_rows:
+            return
+        now = self._now_ts()
+        _dup_cache: dict[tuple[str, str], str] = {}
+
+        def _get_or_create_duplicate(entity_type: str, table: str, source_id: str) -> str:
+            key = (entity_type, source_id)
+            if key in _dup_cache:
+                return _dup_cache[key]
+            cur.execute(
+                f"SELECT region_id, manager_id, name, data FROM {table} "
+                f"WHERE company_id=%s AND id=%s",
+                (cid, source_id),
+            )
+            src = cur.fetchone()
+            if not src:
+                _dup_cache[key] = source_id
+                return source_id
+            cur.execute(
+                "SELECT manager_id FROM entity_owners WHERE company_id=%s "
+                "AND entity_type=%s AND entity_id=%s",
+                (cid, entity_type, source_id),
+            )
+            owners = {
+                str(r.get("manager_id") or "").strip()
+                for r in (cur.fetchall() or [])
+                if isinstance(r, dict)
+            }
+            if not owners:
+                raw_mid = str(src.get("manager_id") or "").strip()
+                if raw_mid:
+                    owners = {raw_mid}
+            if owners == {mid}:
+                # Already exclusively his — nothing to duplicate.
+                _dup_cache[key] = source_id
+                return source_id
+
+            region_id = str(src.get("region_id") or "").strip()
+            name = str(src.get("name") or "").strip()
+            nname = name.lower()
+            cur.execute(
+                f"SELECT id FROM {table} WHERE company_id=%s AND region_id=%s "
+                f"AND lower(trim(name))=%s AND manager_id=%s LIMIT 1",
+                (cid, region_id, nname, mid),
+            )
+            existing = cur.fetchone()
+            if existing:
+                new_id = str(existing.get("id") or "").strip()
+                _dup_cache[key] = new_id
+                return new_id
+
+            new_id = uuid.uuid4().hex
+            data = src.get("data") if isinstance(src.get("data"), dict) else {}
+            cur.execute(
+                f"INSERT INTO {table} "
+                f"(id, company_id, region_id, manager_id, name, data, created_at, updated_at) "
+                f"VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s)",
+                (
+                    new_id,
+                    cid,
+                    region_id,
+                    mid,
+                    name,
+                    psycopg.types.json.Jsonb(data),
+                    now,
+                    now,
+                ),
+            )
+            cur.execute(
+                "INSERT INTO entity_owners (company_id, entity_type, entity_id, manager_id, created_at) "
+                "VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                (cid, entity_type, new_id, mid, now),
+            )
+            _dup_cache[key] = new_id
+            return new_id
+
+        for row in product_rows:
+            pid = str(row.get("id") or "").strip()
+            data = row.get("data") if isinstance(row.get("data"), dict) else {}
+            sid = str((data or {}).get("supplier_id") or "").strip()
+            pkg_id = str((data or {}).get("packaging_id") or "").strip()
+            new_sid = _get_or_create_duplicate("supplier", "suppliers", sid) if sid else ""
+            new_pkg = (
+                _get_or_create_duplicate("packaging", "packaging", pkg_id) if pkg_id else ""
+            )
+            if pkg_id and new_pkg and new_pkg != pkg_id and new_sid:
+                # A freshly cloned packaging row should point at the new
+                # supplier duplicate too, not the source manager's supplier id.
+                cur.execute(
+                    "UPDATE packaging SET data=jsonb_set(COALESCE(data,'{}'::jsonb),"
+                    "'{supplier_id}', to_jsonb(%s::text), true) "
+                    "WHERE company_id=%s AND id=%s AND (data->>'supplier_id')=%s",
+                    (new_sid, cid, new_pkg, sid),
+                )
+            if not pid or ((new_sid in ("", sid)) and (new_pkg in ("", pkg_id))):
+                continue
+            cur.execute(
+                """
+                UPDATE products
+                SET data = jsonb_set(
+                        jsonb_set(COALESCE(data,'{}'::jsonb), '{supplier_id}', to_jsonb(%s::text), true),
+                        '{packaging_id}', to_jsonb(%s::text), true
+                    ),
+                    updated_at=%s
+                WHERE company_id=%s AND id=%s
+                """,
+                (new_sid or sid, new_pkg or pkg_id, now, cid, pid),
+            )
+
     def recompute_entity_owners_for_scope(
-        self, company_id: str, node_ids: list
+        self, company_id: str, node_ids: list, duplicate_for_manager: str | None = None
     ) -> dict:
         result = {
             "entity_owner_rows": 0,
@@ -19883,6 +21804,16 @@ class DataManager:
                     continue
                 data = row.get("data") if isinstance(row.get("data"), dict) else {}
                 node_id = str((data or {}).get("catalog_node_id") or "").strip()
+                # Most-specific-owner wins: node ownership is assigned
+                # explicitly down to whichever level was actually handed to a
+                # manager (granting a whole category writes node_owners rows
+                # for every level under it too), so a product's own node (or
+                # its nearest owned ancestor) is authoritative on its own —
+                # this must STOP at the first level with an owner, not union
+                # owners from every ancestor above it. Continuing to union
+                # incorrectly re-attached a carved-out sub-branch's products
+                # back onto the parent category's original owner even after
+                # that branch was explicitly reassigned to someone else.
                 owners: set[str] = set()
                 current = by_id.get(node_id)
                 seen: set[str] = set()
@@ -19891,7 +21822,9 @@ class DataManager:
                     if not current_id or current_id in seen:
                         break
                     seen.add(current_id)
-                    owners.update(owners_by_node.get(current_id, set()))
+                    owners = owners_by_node.get(current_id, set())
+                    if owners:
+                        break
                     current = by_id.get(str(current.get("parent_id") or "").strip())
 
                 if not owners and str(row.get("manager_id") or "").strip():
@@ -19907,48 +21840,82 @@ class DataManager:
                 if pkg_id:
                     packaging_owner_map.setdefault(pkg_id, set()).update(owners)
 
-            if self._reconcile_suppliers_for_scope(cur, cid, product_owner_map):
-                cur.execute(
-                    "SELECT id, data FROM products WHERE company_id=%s AND id = ANY(%s)",
-                    (cid, sorted(product_owner_map.keys())),
+            if duplicate_for_manager:
+                # MOVE (transfer with removal from the source manager): the
+                # target manager must end up the SOLE owner of his OWN
+                # physical supplier/packaging row, and the source manager
+                # must keep his own, untouched — never a single row shared
+                # by both. Reusing the additive-union model here (as for
+                # genuine shared access) is what produced supplier cards
+                # tagged with both managers after a plain transfer, which is
+                # wrong: "У Дмитра тільки він, у Віталія тільки Віталій."
+                self._duplicate_supplier_packaging_for_transfer(
+                    cur, cid, product_rows, str(duplicate_for_manager).strip()
                 )
-                supplier_owner_map = {}
-                packaging_owner_map = {}
-                for row in cur.fetchall() or []:
-                    if not isinstance(row, dict):
-                        continue
-                    pid = str(row.get("id") or "").strip()
-                    owners = set(product_owner_map.get(pid, set()))
-                    if not owners:
-                        continue
-                    data = row.get("data") if isinstance(row.get("data"), dict) else {}
-                    sid = str((data or {}).get("supplier_id") or "").strip()
-                    pkg_id = str((data or {}).get("packaging_id") or "").strip()
-                    if sid:
-                        supplier_owner_map.setdefault(sid, set()).update(owners)
-                    if pkg_id:
-                        packaging_owner_map.setdefault(pkg_id, set()).update(owners)
+            else:
+                if self._reconcile_suppliers_for_scope(cur, cid, product_owner_map):
+                    cur.execute(
+                        "SELECT id, data FROM products WHERE company_id=%s AND id = ANY(%s)",
+                        (cid, sorted(product_owner_map.keys())),
+                    )
+                    supplier_owner_map = {}
+                    packaging_owner_map = {}
+                    for row in cur.fetchall() or []:
+                        if not isinstance(row, dict):
+                            continue
+                        pid = str(row.get("id") or "").strip()
+                        owners = set(product_owner_map.get(pid, set()))
+                        if not owners:
+                            continue
+                        data = row.get("data") if isinstance(row.get("data"), dict) else {}
+                        sid = str((data or {}).get("supplier_id") or "").strip()
+                        pkg_id = str((data or {}).get("packaging_id") or "").strip()
+                        if sid:
+                            supplier_owner_map.setdefault(sid, set()).update(owners)
+                        if pkg_id:
+                            packaging_owner_map.setdefault(pkg_id, set()).update(owners)
 
-            # Reconcile packaging duplicates when managers share access
-            if packaging_owner_map:
-                self._reconcile_packaging_for_scope(cur, cid, packaging_owner_map)
+                # Reconcile packaging duplicates when managers share access
+                if packaging_owner_map:
+                    self._reconcile_packaging_for_scope(cur, cid, packaging_owner_map)
 
             def _write_entity_owners(
-                entity_type: str, owner_map: dict[str, set[str]]
+                entity_type: str,
+                owner_map: dict[str, set[str]],
+                *,
+                additive: bool = False,
             ) -> int:
                 # Was DELETE + INSERT per (entity, manager) pair — batched
                 # into one DELETE (ANY) and one multi-row INSERT, since a
                 # scope recompute can touch hundreds of products/suppliers/
                 # packaging entries at once.
+                #
+                # additive=True skips the DELETE entirely — used for
+                # suppliers/packaging, which must only ever ACCUMULATE
+                # owners, never lose one via a transfer: a supplier is
+                # real-world shared infrastructure, not something that
+                # belongs to a single category. Per spec — a manager who
+                # loses a category/level must keep every supplier/packaging
+                # they already had access to through it (their past
+                # orders/history still reference it), while the new owner
+                # gains access too. Confirmed live: a full DELETE+reinsert
+                # here (matching product_owner_map's CURRENT node_owners)
+                # silently dropped the old owner's supplier grant on every
+                # transfer, and — worse — since the old owner's product/
+                # supplier UI no longer resolved the shared row, some
+                # downstream flow ended up creating a second, duplicate
+                # supplier row for the new owner instead of reusing the
+                # existing (now-invisible-to-them) one.
                 written = 0
                 now = self._now_ts()
                 eids = [eid for eid in owner_map.keys() if eid]
                 if not eids:
                     return 0
-                cur.execute(
-                    "DELETE FROM entity_owners WHERE company_id=%s AND entity_type=%s AND entity_id = ANY(%s)",
-                    (cid, entity_type, eids),
-                )
+                if not additive:
+                    cur.execute(
+                        "DELETE FROM entity_owners WHERE company_id=%s AND entity_type=%s AND entity_id = ANY(%s)",
+                        (cid, entity_type, eids),
+                    )
                 pairs = [
                     (eid, omid)
                     for eid, mids in owner_map.items()
@@ -19972,20 +21939,38 @@ class DataManager:
                 return written
 
             result["products"] = len(product_owner_map)
-            result["suppliers"] = len(supplier_owner_map)
-            result["packaging"] = len(packaging_owner_map)
             result["entity_owner_rows"] += _write_entity_owners(
                 "product", product_owner_map
             )
-            result["entity_owner_rows"] += _write_entity_owners(
-                "supplier", supplier_owner_map
-            )
-            result["entity_owner_rows"] += _write_entity_owners(
-                "packaging", packaging_owner_map
-            )
+            if not duplicate_for_manager:
+                # In duplicate/MOVE mode, supplier_owner_map/packaging_owner_map
+                # above still reflect the OLD (pre-duplicate) entity ids —
+                # writing them here would re-union the source manager back
+                # onto the original row, undoing the physical split just
+                # performed by _duplicate_supplier_packaging_for_transfer.
+                result["suppliers"] = len(supplier_owner_map)
+                result["packaging"] = len(packaging_owner_map)
+                result["entity_owner_rows"] += _write_entity_owners(
+                    "supplier", supplier_owner_map, additive=True
+                )
+                result["entity_owner_rows"] += _write_entity_owners(
+                    "packaging", packaging_owner_map, additive=True
+                )
 
             product_ids = sorted(product_owner_map.keys())
             order_owner_map: dict[str, set[str]] = {}
+            # Orders (like every other entity type here) fully follow the
+            # transferred product scope, unconditionally — general order
+            # visibility/analytics for a transferred category/level must
+            # move to the new owner completely, regardless of status, so
+            # they see the full history (all past orders, not just
+            # still-in-production ones). Confirmed live: gating this by
+            # order status left every non-production order invisible to the
+            # new owner (only the one order still "На виробництві" showed
+            # up) — that's wrong; the ONLY thing that must NOT move with a
+            # transfer is settlement/payment attribution (see
+            # entity_type='order_settlement', updated separately whenever a
+            # payment is actually recorded — never here).
             if product_ids:
                 cur.execute(
                     """
@@ -19999,9 +21984,9 @@ class DataManager:
                     """,
                     (cid, product_ids),
                 )
-                for row in cur.fetchall() or []:
-                    if not isinstance(row, dict):
-                        continue
+                order_rows = [r for r in (cur.fetchall() or []) if isinstance(r, dict)]
+
+                for row in order_rows:
                     oid = str(row.get("id") or "").strip()
                     data = row.get("data") if isinstance(row.get("data"), dict) else {}
                     items = self._normalize_json_list((data or {}).get("items"))
@@ -20014,8 +21999,9 @@ class DataManager:
                                 str(item.get("product_id") or "").strip(), set()
                             )
                         )
-                    if mids:
-                        order_owner_map[oid] = mids
+                    if not mids:
+                        continue
+                    order_owner_map[oid] = mids
 
             result["orders"] = len(order_owner_map)
             result["entity_owner_rows"] += _write_entity_owners(
@@ -20079,24 +22065,62 @@ class DataManager:
             )
 
             stock_owner_map: dict[str, set[str]] = {}
+            # (region_id, product_id, stale_manager_id, sole_new_manager_id) —
+            # rows that need re-keying below, collected while scanning.
+            _stock_rekey: list[tuple[str, str, str, str]] = []
             if product_ids:
                 cur.execute(
-                    "SELECT region_id, product_id FROM cost_price_stock_inputs WHERE company_id=%s AND product_id = ANY(%s)",
+                    "SELECT region_id, product_id, manager_id FROM cost_price_stock_inputs WHERE company_id=%s AND product_id = ANY(%s)",
                     (cid, product_ids),
                 )
                 for row in cur.fetchall() or []:
                     if not isinstance(row, dict):
                         continue
-                    key = f"{str(row.get('region_id') or '').strip()}:{str(row.get('product_id') or '').strip()}"
-                    stock_owner_map.setdefault(key, set()).update(
-                        product_owner_map.get(
-                            str(row.get("product_id") or "").strip(), set()
-                        )
-                    )
+                    pid = str(row.get("product_id") or "").strip()
+                    rid_row = str(row.get("region_id") or "").strip()
+                    row_mid = str(row.get("manager_id") or "").strip()
+                    owners = product_owner_map.get(pid, set())
+                    key = f"{rid_row}:{pid}"
+                    stock_owner_map.setdefault(key, set()).update(owners)
+                    # С/В Склад's PK includes manager_id (company_id, manager_id,
+                    # region_id, product_id), and the reader (get_cost_price_stock_inputs)
+                    # picks whichever row has the latest updated_at ACROSS ALL
+                    # managers, not the current scope owner — so a transfer never
+                    # actually deletes the old owner's row, it just becomes
+                    # permanently unreachable the moment anyone else edits the same
+                    # product, which looked exactly like silent data loss (confirmed
+                    # live: "не відновився, він просто видалився"). When the product
+                    # now has EXACTLY one current owner and this row belongs to
+                    # someone else, re-key it onto that owner instead of leaving an
+                    # orphaned duplicate — the actual "everything transfers" fix for
+                    # this table, applied below (outside this cursor loop, so the
+                    # SELECT above finishes before any UPDATE touches the same rows).
+                    if len(owners) == 1 and row_mid and row_mid not in owners:
+                        _stock_rekey.append((rid_row, pid, row_mid, next(iter(owners))))
             result["cost_stock"] = len(stock_owner_map)
             result["entity_owner_rows"] += _write_entity_owners(
                 "cost_stock", stock_owner_map
             )
+            for _rid_row, _pid, _old_mid, _new_mid in _stock_rekey:
+                with contextlib.suppress(Exception):
+                    # NOT EXISTS guard: if the new owner already has their OWN
+                    # row for this exact product/region (e.g. they already
+                    # entered a value post-transfer), re-keying would violate
+                    # the primary key — leave the old row as-is in that one
+                    # edge case rather than risk deleting either manager's
+                    # data to force a merge.
+                    cur.execute(
+                        """
+                        UPDATE cost_price_stock_inputs
+                        SET manager_id=%s
+                        WHERE company_id=%s AND manager_id=%s AND region_id=%s AND product_id=%s
+                          AND NOT EXISTS (
+                              SELECT 1 FROM cost_price_stock_inputs t2
+                              WHERE t2.company_id=%s AND t2.manager_id=%s AND t2.region_id=%s AND t2.product_id=%s
+                          )
+                        """,
+                        (_new_mid, cid, _old_mid, _rid_row, _pid, cid, _new_mid, _rid_row, _pid),
+                    )
 
             order_cost_owner_map: dict[str, set[str]] = {}
             if order_owner_map:
@@ -20147,6 +22171,19 @@ class DataManager:
         # instead of a stale pre-transfer scope for the rest of this process's
         # session cache lifetime.
         self._invalidate_product_scope_cache(cid)
+        # Bump sync pulses too — otherwise OTHER already-open sessions (a
+        # second device/tab, or the old owner's own still-open window) keep
+        # serving their pre-transfer pulse-gated caches for products/orders/
+        # suppliers/packaging/media plan/schedule/payments until something
+        # unrelated happens to bump that pulse later. A transfer touches all
+        # of these at once, so bump them all here rather than relying on the
+        # caller to remember which ones matter for a given transfer.
+        for _pulse_key in (
+            "catalog", "products", "orders", "suppliers", "packaging",
+            "media_plan", "schedule", "payments",
+        ):
+            with contextlib.suppress(Exception):
+                self._pulse(cid, _pulse_key)
         return result
 
     def assign_scope_owner(
@@ -20160,8 +22197,13 @@ class DataManager:
         added, skipped = self._assign_owner_to_nodes(mid, cid, ids)
         rec = self.recompute_entity_owners_for_scope(cid, ids)
         return True, (
-            f"Додано власника на {added} вузлів"
-            + (f" (пропущено {skipped} через ліміт 5)" if skipped else "")
+            f"Призначено власника на {added} вузлів"
+            + (
+                f" (пропущено {skipped} — вже належать іншому менеджеру, "
+                "спершу зніміть або передайте доступ)"
+                if skipped
+                else ""
+            )
             + f". Оновлено owner-зв'язків: {int(rec.get('entity_owner_rows', 0) or 0)}"
         )
 
@@ -20173,6 +22215,14 @@ class DataManager:
         ids = sorted({str(x) for x in (node_ids or []) if str(x).strip()})
         if not self._use_postgres() or not mid or not cid or not ids:
             return False, "Некоректні дані"
+        # Capture supplier/packaging ownership for this manager BEFORE the node
+        # grant disappears — entity_owners writes for those two types are
+        # additive, so this recompute only ever adds rows and is safe to run
+        # twice; it must run while node_owners still reflects this manager,
+        # otherwise the walk can never see him and he silently loses supplier/
+        # packaging ownership he is supposed to keep.
+        with contextlib.suppress(Exception):
+            self.recompute_entity_owners_for_scope(cid, ids)
         removed = self._remove_owner_from_nodes(mid, cid, ids)
         rec = self.recompute_entity_owners_for_scope(cid, ids)
         return True, (
@@ -20200,12 +22250,27 @@ class DataManager:
             or fid == tid
         ):
             return False, "Некоректні дані"
-        added, skipped = self._assign_owner_to_nodes(tid, cid, ids)
+        # Remove the source owner FIRST: with strict single-ownership,
+        # assigning the target while the source still holds these nodes
+        # would be refused as "occupied" — removal must free the node before
+        # the target can take it.
         removed = self._remove_owner_from_nodes(fid, cid, ids)
-        rec = self.recompute_entity_owners_for_scope(cid, ids)
+        added, skipped = self._assign_owner_to_nodes(tid, cid, ids)
+        # MOVE (full transfer, source loses the category): the target
+        # manager must become the SOLE owner of his own physical supplier/
+        # packaging row, and the source manager keeps his own untouched row
+        # — never a single row co-owned by both. duplicate_for_manager=tid
+        # switches recompute onto the clone-and-repoint path instead of the
+        # additive-union path (which is reserved for genuine shared access
+        # via assign_scope_owner).
+        rec = self.recompute_entity_owners_for_scope(cid, ids, duplicate_for_manager=tid)
         return True, (
             f"Передача завершена: +{added} вузлів новому власнику, -{removed} у попереднього"
-            + (f", пропущено {skipped} через ліміт 5" if skipped else "")
+            + (
+                f", пропущено {skipped} — зайняті іншим (третім) менеджером"
+                if skipped
+                else ""
+            )
             + f". Оновлено owner-зв'язків: {int(rec.get('entity_owner_rows', 0) or 0)}"
         )
 
@@ -22218,7 +24283,11 @@ class DataManager:
         company_id: str,
         node_ids: list[str],
     ) -> tuple[int, int]:
-        """Assign manager as node owner; max 5 owners per node."""
+        """Assign manager as node owner. Strictly one owner per node — a node
+        already owned by a DIFFERENT manager is refused (not silently
+        stacked); the caller must go through replace_scope_owner (remove the
+        current owner first) to reassign it. Owned-by-this-same-manager
+        nodes are simply skipped as already-satisfied."""
         if not self._use_postgres():
             return (0, 0)
         mid = str(manager_id or "").strip()
@@ -22227,37 +24296,28 @@ class DataManager:
         if not mid or not cid or not ids:
             return (0, 0)
         inserted = 0
-        skipped_limit = 0
+        skipped_occupied = 0
         now = self._now_ts()
         with self._pg().cursor() as cur:
-            # Two batched lookups (owner counts + this manager's existing
-            # memberships) instead of 2 round trips PER node — a scope save
-            # can cover dozens/hundreds of nodes at once.
+            # Batched lookup of existing owners for these nodes instead of a
+            # round trip PER node — a scope save can cover dozens/hundreds.
             cur.execute(
-                "SELECT node_id, COUNT(*) AS n FROM node_owners WHERE company_id=%s AND node_id = ANY(%s) GROUP BY node_id",
+                "SELECT node_id, manager_id FROM node_owners WHERE company_id=%s AND node_id = ANY(%s)",
                 (cid, ids),
             )
-            owners_by_node = {
-                str(r.get("node_id")): int(r.get("n") or 0)
-                for r in (cur.fetchall() or [])
-                if isinstance(r, dict)
-            }
-            cur.execute(
-                "SELECT node_id FROM node_owners WHERE company_id=%s AND node_id = ANY(%s) AND manager_id=%s",
-                (cid, ids, mid),
-            )
-            already_owned = {
-                str(r.get("node_id"))
+            owner_by_node: dict[str, str] = {
+                str(r.get("node_id")): str(r.get("manager_id") or "")
                 for r in (cur.fetchall() or [])
                 if isinstance(r, dict)
             }
 
             to_insert = []
             for nid in ids:
-                if nid in already_owned:
-                    continue
-                if owners_by_node.get(nid, 0) >= 5:
-                    skipped_limit += 1
+                existing = owner_by_node.get(nid)
+                if existing == mid:
+                    continue  # already the owner — nothing to do
+                if existing:
+                    skipped_occupied += 1
                     continue
                 to_insert.append((cid, nid, mid, now))
 
@@ -22272,7 +24332,13 @@ class DataManager:
                 )
             inserted = len(to_insert)
         self._sync_legacy_scope_access(cid, mid)
-        return (inserted, skipped_limit)
+        # Ownership just changed — acc_categories_* is cached per manager and
+        # was never invalidated on a transfer, so a category filter dropdown
+        # kept showing categories/levels long after they'd been given away
+        # (confirmed live: "передав категорію, а вона й досі в дропі").
+        with contextlib.suppress(Exception):
+            self.invalidate_categories_cache(cid)
+        return (inserted, skipped_occupied)
 
     def add_node_owner(self, manager_id: str, company_id: str, node_id: str) -> bool:
         """Register a manager as owner of a single catalog node (level_node)."""
@@ -22322,10 +24388,16 @@ class DataManager:
                 if str(x).strip()
             }
             if not remaining_node_ids:
-                # Manager has zero remaining scope — purge ALL their entity_owners.
+                # Manager has zero remaining scope — purge their entity_owners,
+                # EXCEPT 'order_settlement': that's a frozen record of whose
+                # ledger a past payment counts toward (see
+                # _maybe_snapshot_order_settlement_owner) and must survive
+                # losing category access entirely, same as it survives a
+                # transfer — otherwise their historical Взаєморозрахунки
+                # balance would silently disappear the moment access is revoked.
                 with self._pg().cursor() as cur:
                     cur.execute(
-                        "DELETE FROM entity_owners WHERE company_id=%s AND manager_id=%s",
+                        "DELETE FROM entity_owners WHERE company_id=%s AND manager_id=%s AND entity_type != 'order_settlement'",
                         (cid, mid),
                     )
         return removed
@@ -22355,12 +24427,20 @@ class DataManager:
             )
             rows = cur.fetchall() or []
             with contextlib.suppress(Exception):
+                # A legacy category_access row must NOT grant scope for a
+                # category that node_owners (canonical, single-owner) says
+                # belongs to a DIFFERENT manager — otherwise a stale/loose
+                # legacy write reopens the exact shared-access hole
+                # _assign_owner_to_nodes now refuses at the write side.
                 cur.execute(
                     """
                     SELECT DISTINCT ca.category_id AS node_id
                     FROM category_access ca
                     JOIN categories c ON c.id = ca.category_id
+                    LEFT JOIN node_owners no2 ON no2.node_id = ca.category_id
+                        AND no2.company_id = c.company_id
                     WHERE ca.manager_id=%s AND c.company_id=%s
+                      AND (no2.manager_id IS NULL OR no2.manager_id = ca.manager_id)
                     ORDER BY ca.category_id
                     """,
                     (mid, cid),
@@ -22427,6 +24507,46 @@ class DataManager:
         except Exception:
             logger.exception("manager_has_category_access_in_region failed")
             return True  # fail open -- never block on an unrelated query error
+
+    def get_manager_create_allowed_region_ids(
+        self, manager_id: str, company_id: str
+    ) -> set[str] | None:
+        """Batched equivalent of calling manager_has_category_access_in_region
+        once per region — a region dropdown used to do that in a loop (role
+        lookup + up to 3 scope queries + a catalog_nodes lookup PER region),
+        which is what made dialogs like "Додати пакування" take seconds to
+        open. Returns None to mean "unrestricted / every region allowed"
+        (admin, superadmin, or non-Postgres mode), otherwise the set of
+        region_ids this manager can create/edit in."""
+        mid = str(manager_id or "").strip()
+        cid = str(company_id or "").strip()
+        if not mid or not cid:
+            return set()
+        role_slug = self._get_manager_role_slug(mid)
+        if role_slug in {
+            "адмін", "админ", "admin", "суперадмін", "суперадмин", "superadmin",
+        }:
+            return None
+        node_ids = [
+            str(x) for x in (self.get_manager_scope_node_ids(mid, cid, "view") or [])
+            if str(x or "").strip()
+        ]
+        if not node_ids or not self._use_postgres():
+            return set()
+        try:
+            with self._pg().cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT region_id FROM catalog_nodes WHERE company_id=%s AND id = ANY(%s)",
+                    (cid, list(set(node_ids))),
+                )
+                return {
+                    str(r.get("region_id"))
+                    for r in (cur.fetchall() or [])
+                    if isinstance(r, dict) and r.get("region_id")
+                }
+        except Exception:
+            logger.exception("get_manager_create_allowed_region_ids failed")
+            return None  # fail open, same as the per-region function
 
     def has_shared_node_ownership(
         self, company_id: str, manager_a: str, manager_b: str
@@ -22555,6 +24675,39 @@ class DataManager:
             if isinstance(r, dict) and r.get("entity_id")
         ]
 
+    def get_entity_owners_map(
+        self, company_id: str, entity_type: str, entity_ids: list
+    ) -> dict[str, set]:
+        """Bulk {entity_id: {manager_id, ...}} for many entities of one type
+        in a single query — used e.g. by payments_view to check which
+        orders already have a frozen 'order_settlement' owner without one
+        query per order."""
+        if not self._use_postgres():
+            return {}
+        cid = str(company_id or "").strip()
+        etype = str(entity_type or "").strip()
+        eids = sorted({str(x or "").strip() for x in (entity_ids or []) if str(x or "").strip()})
+        if not cid or not etype or not eids:
+            return {}
+        out: dict[str, set] = {}
+        with self._pg().cursor() as cur:
+            cur.execute(
+                """
+                SELECT entity_id, manager_id
+                FROM entity_owners
+                WHERE company_id=%s AND entity_type=%s AND entity_id = ANY(%s)
+                """,
+                (cid, etype, eids),
+            )
+            for row in cur.fetchall() or []:
+                if not isinstance(row, dict):
+                    continue
+                eid = str(row.get("entity_id") or "").strip()
+                mid = str(row.get("manager_id") or "").strip()
+                if eid and mid:
+                    out.setdefault(eid, set()).add(mid)
+        return out
+
     def count_entity_owner_entity_ids(
         self, company_id: str, manager_id: str, entity_type: str
     ) -> int:
@@ -22668,6 +24821,20 @@ class DataManager:
                     (cid, mid),
                 )
             self._assign_owner_to_nodes(mid, cid, node_ids)
+            # Some requested node_ids may have been refused (already owned by
+            # someone else) — re-key node_ids to what mid ACTUALLY ended up
+            # owning, so the legacy manager_access_scopes/category_access
+            # writes below never grant visibility node_owners just denied.
+            with self._pg().cursor() as cur:
+                cur.execute(
+                    "SELECT node_id FROM node_owners WHERE company_id=%s AND manager_id=%s AND node_id = ANY(%s)",
+                    (cid, mid, node_ids),
+                )
+                node_ids = [
+                    str(r.get("node_id"))
+                    for r in (cur.fetchall() or [])
+                    if isinstance(r, dict) and r.get("node_id")
+                ]
 
         with self._pg().cursor() as cur:
             cur.execute(
@@ -23063,6 +25230,9 @@ class DataManager:
         return [dict(r) for r in rows if isinstance(r, dict)]
 
     def replace_category_access(self, category_id: str, manager_ids: list) -> bool:
+        """1 категорія = 1 менеджер: тільки перший id зі списку зберігається,
+        а не всі — категорія більше не може мати кількох одночасних власників
+        через цю таблицю."""
         if not self._use_postgres():
             return bool(
                 self._post(
@@ -23072,7 +25242,7 @@ class DataManager:
                 or False
             )
         cat_id = str(category_id or "").strip()
-        manager_ids = [str(x) for x in (manager_ids or []) if str(x).strip()]
+        manager_ids = [str(x) for x in (manager_ids or []) if str(x).strip()][:1]
         with self._pg().cursor() as cur:
             cur.execute("DELETE FROM category_access WHERE category_id=%s", (cat_id,))
             if manager_ids:
@@ -23083,6 +25253,20 @@ class DataManager:
                     f"INSERT INTO category_access (category_id, manager_id, created_at) VALUES {placeholders}",
                     flat_params,
                 )
+        if manager_ids:
+            # Keep the canonical node_owners table in sync from the start —
+            # this category is brand new (no prior owner), so the strict
+            # single-owner check in _assign_owner_to_nodes always succeeds
+            # here.
+            with contextlib.suppress(Exception):
+                cur_row = None
+                with self._pg().cursor() as cur2:
+                    cur2.execute("SELECT company_id FROM categories WHERE id=%s", (cat_id,))
+                    cur_row = cur2.fetchone()
+                if cur_row and cur_row.get("company_id"):
+                    self._assign_owner_to_nodes(
+                        manager_ids[0], str(cur_row.get("company_id")), [cat_id]
+                    )
         return True
 
     def get_manager_category_ids(
@@ -23115,12 +25299,22 @@ class DataManager:
         company_id = str(company_id or "").strip()
         region_id = str(region_id or "").strip()
         with self._pg().cursor() as cur:
+            # LEFT JOIN node_owners guard — same fix as get_manager_scope_node_ids:
+            # a category_access row must NOT grant access when node_owners (the
+            # canonical, single-owner source) says the category now belongs to a
+            # DIFFERENT manager. Without this, a stale category_access row left
+            # over from before a transfer keeps showing the old owner the
+            # category forever (confirmed live: transferred category still
+            # appeared in the new C/В Склад filter dropdown for its old owner).
             if company_id or region_id:
                 q = """
                 SELECT ca.category_id
                 FROM category_access ca
                 JOIN categories c ON c.id = ca.category_id
+                LEFT JOIN node_owners no2 ON no2.node_id = ca.category_id
+                    AND no2.company_id = c.company_id
                 WHERE ca.manager_id=%s
+                  AND (no2.manager_id IS NULL OR no2.manager_id = ca.manager_id)
                 """
                 params: list[Any] = [mid]
                 if company_id:
@@ -23133,7 +25327,14 @@ class DataManager:
                 cur.execute(q, params)
             else:
                 cur.execute(
-                    "SELECT category_id FROM category_access WHERE manager_id=%s ORDER BY category_id",
+                    """
+                    SELECT ca.category_id
+                    FROM category_access ca
+                    LEFT JOIN node_owners no2 ON no2.node_id = ca.category_id
+                    WHERE ca.manager_id=%s
+                      AND (no2.manager_id IS NULL OR no2.manager_id = ca.manager_id)
+                    ORDER BY ca.category_id
+                    """,
                     (mid,),
                 )
             rows = cur.fetchall() or []
@@ -23191,6 +25392,179 @@ class DataManager:
                 ON CONFLICT (id) DO UPDATE SET policy=EXCLUDED.policy, updated_at=EXCLUDED.updated_at
                 """,
                 ("default", psycopg.types.json.Jsonb(policy), self._now_ts()),
+            )
+        return True
+
+    def get_calculator_access_policy(self) -> dict:
+        """Shared password gate for the standalone CatMan Калькулятори
+        portable exe — one password for everyone, set by SuperAdmin, stored
+        in the general (cross-company) DB so it applies no matter which
+        machine/copy of the exe is asking. Changing it here is how access
+        gets revoked (e.g. from someone who kept a copy of the exe after
+        leaving).
+
+        Deliberately does NOT swallow connection errors here (unlike most
+        other read helpers) — the caller needs to tell a genuine "wrong
+        password" apart from "couldn't reach the DB right now", otherwise a
+        transient connection hiccup silently comes back as an empty policy
+        and gets reported to the user as "Невірний пароль" even though the
+        password was correct — confirmed live as the cause of the login
+        gate intermittently rejecting the right password."""
+        if not self._use_postgres():
+            return {}
+        with self._general_pg().cursor() as cur:
+            cur.execute(
+                "SELECT policy FROM public.app_update_policy WHERE id=%s LIMIT 1",
+                ("calculator_access",),
+            )
+            row = cur.fetchone()
+        if row and isinstance(row.get("policy"), dict):
+            return row["policy"]
+        return {}
+
+    def set_calculator_access_policy(self, password: str) -> bool:
+        password = str(password or "").strip()
+        if not self._use_postgres():
+            return True
+        with self._general_pg().cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.app_update_policy (id, policy, updated_at)
+                VALUES (%s, %s::jsonb, %s)
+                ON CONFLICT (id) DO UPDATE SET policy=EXCLUDED.policy, updated_at=EXCLUDED.updated_at
+                """,
+                ("calculator_access", psycopg.types.json.Jsonb({"password": password}), self._now_ts()),
+            )
+        return True
+
+    def get_calculator_web_access_policy(self) -> dict:
+        """SuperAdmin-only record of the web calculator's CURRENT plaintext
+        password, so the "Пароль веб-версії" field can be pre-filled with
+        what's actually set right now (matching calc_password_f's own
+        UX above) — never sent to the public catman-calculator-web repo,
+        which only ever gets a one-way SHA-256 hash (see
+        calculator_web_app.py's _pw_fingerprint). This record exists
+        purely for SuperAdmin's own recall; the hash in the public repo is
+        what actually gates access."""
+        if not self._use_postgres():
+            return {}
+        with self._general_pg().cursor() as cur:
+            cur.execute(
+                "SELECT policy FROM public.app_update_policy WHERE id=%s LIMIT 1",
+                ("calculator_web_access",),
+            )
+            row = cur.fetchone()
+        if row and isinstance(row.get("policy"), dict):
+            return row["policy"]
+        return {}
+
+    def set_calculator_web_access_policy(self, password: str) -> bool:
+        password = str(password or "").strip()
+        if not self._use_postgres():
+            return True
+        with self._general_pg().cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.app_update_policy (id, policy, updated_at)
+                VALUES (%s, %s::jsonb, %s)
+                ON CONFLICT (id) DO UPDATE SET policy=EXCLUDED.policy, updated_at=EXCLUDED.updated_at
+                """,
+                ("calculator_web_access", psycopg.types.json.Jsonb({"password": password}), self._now_ts()),
+            )
+        return True
+
+    def get_calculator_update_policy(self) -> dict:
+        """min_required + download links for the standalone calculator —
+        same id="calculator_update" record holds both the desktop
+        installer link (download_url) and the browser-hosted version link
+        (download_url_web), so SuperAdmin edits both from one place."""
+        if not self._use_postgres():
+            return {}
+        with self._general_pg().cursor() as cur:
+            cur.execute(
+                "SELECT policy FROM public.app_update_policy WHERE id=%s LIMIT 1",
+                ("calculator_update",),
+            )
+            row = cur.fetchone()
+        if row and isinstance(row.get("policy"), dict):
+            return row["policy"]
+        return {}
+
+    def set_calculator_update_policy(self, payload: dict) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if not self._use_postgres():
+            return True
+        with self._general_pg().cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.app_update_policy (id, policy, updated_at)
+                VALUES (%s, %s::jsonb, %s)
+                ON CONFLICT (id) DO UPDATE SET policy=EXCLUDED.policy, updated_at=EXCLUDED.updated_at
+                """,
+                ("calculator_update", psycopg.types.json.Jsonb(payload), self._now_ts()),
+            )
+        return True
+
+    def get_supadm_update_policy(self) -> dict:
+        """min_required + download_url for the standalone CatMan SupAdm exe —
+        same shape as get_calculator_update_policy, id="supadm"."""
+        if not self._use_postgres():
+            return {}
+        with self._general_pg().cursor() as cur:
+            cur.execute(
+                "SELECT policy FROM public.app_update_policy WHERE id=%s LIMIT 1",
+                ("supadm",),
+            )
+            row = cur.fetchone()
+        if row and isinstance(row.get("policy"), dict):
+            return row["policy"]
+        return {}
+
+    def set_supadm_update_policy(self, payload: dict) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if not self._use_postgres():
+            return True
+        with self._general_pg().cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.app_update_policy (id, policy, updated_at)
+                VALUES (%s, %s::jsonb, %s)
+                ON CONFLICT (id) DO UPDATE SET policy=EXCLUDED.policy, updated_at=EXCLUDED.updated_at
+                """,
+                ("supadm", psycopg.types.json.Jsonb(payload), self._now_ts()),
+            )
+        return True
+
+    def get_gsm_parser_update_policy(self) -> dict:
+        """min_required + download_url for the standalone CatManGSMParser
+        exe — same shape as get_calculator_update_policy, id="gsm_parser"."""
+        if not self._use_postgres():
+            return {}
+        with self._general_pg().cursor() as cur:
+            cur.execute(
+                "SELECT policy FROM public.app_update_policy WHERE id=%s LIMIT 1",
+                ("gsm_parser",),
+            )
+            row = cur.fetchone()
+        if row and isinstance(row.get("policy"), dict):
+            return row["policy"]
+        return {}
+
+    def set_gsm_parser_update_policy(self, payload: dict) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if not self._use_postgres():
+            return True
+        with self._general_pg().cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.app_update_policy (id, policy, updated_at)
+                VALUES (%s, %s::jsonb, %s)
+                ON CONFLICT (id) DO UPDATE SET policy=EXCLUDED.policy, updated_at=EXCLUDED.updated_at
+                """,
+                ("gsm_parser", psycopg.types.json.Jsonb(payload), self._now_ts()),
             )
         return True
 
@@ -23915,63 +26289,88 @@ class DataManager:
         except Exception:
             return 0
 
-    def invalidate_scope_cache(
-        self, company_id: str, scope: str
-    ) -> None:  # noqa: ARG002
-        # Cache layer is not implemented in direct Postgres mode yet.
-        return None
+    def invalidate_scope_cache(self, company_id: str, scope: str) -> None:
+        """Called by dashboard.py's cross-device sync-pulse watcher whenever
+        it sees another process/device bump a scope's pulse — this is the
+        other half of the "оновиться при вході на вкладку" promise the pulse
+        toast makes. Without this, that promise was false: the pulse was
+        detected but nothing ever cleared this process's `_session_cache`
+        (_cached_list), so get_products/get_suppliers/get_packaging/
+        get_accessible_categories kept serving this process's own stale
+        snapshot forever after a change made elsewhere — same-process edits
+        worked (they call the matching invalidate_*_cache directly) but a
+        second device/session/manager's edit never surfaced here short of a
+        region/manager switch or app restart.
+
+        Only scopes backed by _cached_list have anything to invalidate;
+        others (orders/payments/schedule/media_plan/ui/...) use their own
+        shared-map + pulse mechanisms per view and don't touch this cache."""
+        cid = str(company_id or "").strip()
+        sc = str(scope or "").strip()
+        if not cid or not sc:
+            return
+        if sc == "catalog":
+            self.invalidate_categories_cache(cid)
+            self.invalidate_products_cache(cid)
+        elif sc == "products":
+            self.invalidate_products_cache(cid)
+        elif sc == "suppliers":
+            self.invalidate_suppliers_cache(cid)
+        elif sc == "packaging":
+            self.invalidate_packaging_cache(cid)
 
     # ------------------------------------------------------------------ #
     #  User Files — per manager per region file storage                  #
     # ------------------------------------------------------------------ #
 
     def _ensure_user_files_tables(self):
-        with self._general_pg().cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.user_file_groups (
-                    id          character varying NOT NULL,
-                    company_id  character varying NOT NULL,
-                    manager_id  character varying NOT NULL,
-                    region_id   character varying NOT NULL DEFAULT '',
-                    name        character varying(200) NOT NULL,
-                    parent_id   character varying NULL,
-                    sort_order  integer NOT NULL DEFAULT 0,
-                    created_at  timestamp without time zone NOT NULL,
-                    updated_at  timestamp without time zone NOT NULL,
-                    PRIMARY KEY (id)
+        with self._general_schema_lock:
+            with self._general_pg().cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.user_file_groups (
+                        id          character varying NOT NULL,
+                        company_id  character varying NOT NULL,
+                        manager_id  character varying NOT NULL,
+                        region_id   character varying NOT NULL DEFAULT '',
+                        name        character varying(200) NOT NULL,
+                        parent_id   character varying NULL,
+                        sort_order  integer NOT NULL DEFAULT 0,
+                        created_at  timestamp without time zone NOT NULL,
+                        updated_at  timestamp without time zone NOT NULL,
+                        PRIMARY KEY (id)
+                    )
+                    """)
+                # Migrate: add parent_id if missing (existing installs)
+                cur.execute("""
+                    ALTER TABLE public.user_file_groups
+                        ADD COLUMN IF NOT EXISTS parent_id character varying NULL
+                    """)
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_ufg_manager ON public.user_file_groups (company_id, manager_id, region_id)"
                 )
-                """)
-            # Migrate: add parent_id if missing (existing installs)
-            cur.execute("""
-                ALTER TABLE public.user_file_groups
-                    ADD COLUMN IF NOT EXISTS parent_id character varying NULL
-                """)
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ufg_manager ON public.user_file_groups (company_id, manager_id, region_id)"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ufg_parent ON public.user_file_groups (parent_id)"
-            )
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.user_files (
-                    id                character varying NOT NULL,
-                    group_id          character varying NOT NULL,
-                    company_id        character varying NOT NULL,
-                    manager_id        character varying NOT NULL,
-                    region_id         character varying NOT NULL DEFAULT '',
-                    original_filename character varying(500) NOT NULL,
-                    file_size         bigint NOT NULL DEFAULT 0,
-                    mime_type         character varying(200) NOT NULL DEFAULT '',
-                    file_data         bytea NOT NULL,
-                    created_at        timestamp without time zone NOT NULL,
-                    updated_at        timestamp without time zone NOT NULL,
-                    PRIMARY KEY (id)
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_ufg_parent ON public.user_file_groups (parent_id)"
                 )
-                """)
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_uf_group ON public.user_files (group_id)"
-            )
-        self._general_pg().commit()
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.user_files (
+                        id                character varying NOT NULL,
+                        group_id          character varying NOT NULL,
+                        company_id        character varying NOT NULL,
+                        manager_id        character varying NOT NULL,
+                        region_id         character varying NOT NULL DEFAULT '',
+                        original_filename character varying(500) NOT NULL,
+                        file_size         bigint NOT NULL DEFAULT 0,
+                        mime_type         character varying(200) NOT NULL DEFAULT '',
+                        file_data         bytea NOT NULL,
+                        created_at        timestamp without time zone NOT NULL,
+                        updated_at        timestamp without time zone NOT NULL,
+                        PRIMARY KEY (id)
+                    )
+                    """)
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_uf_group ON public.user_files (group_id)"
+                )
+            self._general_pg().commit()
 
     def get_user_file_groups(
         self, company_id: str, manager_id: str, region_id: str

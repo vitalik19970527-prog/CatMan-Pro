@@ -397,6 +397,32 @@ class HomeView:
             cache[key] = value
         return value
 
+    def _home_workspace_state_cached(self, manager_id: str) -> dict:
+        """Read-only fetch of this manager's workspace-state row, memoized
+        per build. The 6 `_load_home_*_display_title_keys` functions each
+        independently called `db.get_manager_workspace_state` for the exact
+        same manager_id — 6 identical uncached round trips per Home build
+        for what's always the same row. The `_save_home_*` counterparts
+        deliberately do NOT use this cache — a save must read-merge-write
+        against the current DB state, not a build-stale snapshot."""
+        return self._prefetch_get(
+            f"home_workspace_state_{manager_id}",
+            lambda: self.db.get_manager_workspace_state(manager_id) or {},
+        )
+
+    def _company_catalog_nodes_cached(self) -> list:
+        """All catalog nodes for this company, memoized per build.
+
+        Called from 8 places during a single Home build — the pending-series
+        counters (once per manager in general mode) plus every "display title"
+        row builder (term/cost/fact-weight/shoulder/stock-cost/blended-cost) —
+        always with the exact same self.company_id and no other arguments, so
+        each was paying for an identical full-table fetch of the same result."""
+        return self._prefetch_get(
+            "home_company_catalog_nodes",
+            lambda: self.db.get_company_catalog_nodes(self.company_id) or [],
+        ) or []
+
     def _delivery_methods_in_scope(self) -> list[dict]:
         if not self.company_id:
             return []
@@ -729,8 +755,8 @@ class HomeView:
             return 0
         orders = self._all_orders_unfiltered()
         date_field_map = {
-            "ready_for_shipment": "date_ready_at_supplier",
-            "in_transit": "date_shipped",
+            "ready_for_shipment": "date_shipped",
+            "in_transit": "date_departed",
             "at_warehouse": "date_arrived_warehouse",
             "accepted": "date_accepted",
         }
@@ -979,7 +1005,7 @@ class HomeView:
 
             # Mirror Products dialog logic: hide series that already have a product
             # directly on the series node or on any deeper detail node.
-            company_nodes = self.db.get_company_catalog_nodes(self.company_id) or []
+            company_nodes = self._company_catalog_nodes_cached()
             node_by_id = {
                 n.get("id"): n
                 for n in company_nodes
@@ -1058,7 +1084,7 @@ class HomeView:
             candidates = pv._pending_series_candidates(self.company_id, region_id) or []
             if not candidates:
                 return 0
-            company_nodes = self.db.get_company_catalog_nodes(self.company_id) or []
+            company_nodes = self._company_catalog_nodes_cached()
             node_by_id = {
                 n.get("id"): n
                 for n in company_nodes
@@ -1105,6 +1131,63 @@ class HomeView:
             )
         except Exception:
             return 0
+
+    def _packaging_ctx_journal_cached(
+        self, ctx_id: str, manager_id: str, region_id: str, ps=None
+    ) -> tuple:
+        """Raw (opening, order_rows, writeoff_rows) for one packaging supply
+        context — shared across every counter that reads this same journal
+        (_count_packaging_supplier_debt(_for_manager), _count_packaging_
+        low_stock(_for_manager), _packaging_stock_rows). Each of those used
+        to independently re-fetch all three straight from the DB per
+        context, so a Home build paid for the same context's journal up to
+        5-6x over (multiplied further per subordinate in Загальні mode).
+
+        `ps` (the PackagingStockView probe from _packaging_probe_for_manager,
+        when the caller already has one in scope) lets this read straight
+        from its already-loaded _local_*_cache dicts — populated by ONE
+        batched load per manager — instead of re-querying the DB per
+        context, which is what every one of the callers below used to do."""
+        cache = getattr(self, "_pkg_ctx_journal_cache", None)
+        if cache is None:
+            cache = {}
+            self._pkg_ctx_journal_cache = cache
+        key = (ctx_id, manager_id, region_id)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        if ps is not None:
+            opening = dict(getattr(ps, "_local_opening_cache", {}).get(ctx_id) or {})
+            rows = [
+                x
+                for x in (getattr(ps, "_local_orders_cache", {}).get(ctx_id) or [])
+                if isinstance(x, dict)
+            ]
+            wo_rows = [
+                {**x, "row_kind": "writeoff"}
+                for x in (getattr(ps, "_local_writeoff_cache", {}).get(ctx_id) or [])
+                if isinstance(x, dict)
+            ]
+        else:
+            opening = self.db.get_packaging_supply_opening(ctx_id) or {}
+            rows = [
+                x
+                for x in (self.db.list_packaging_supply_orders(ctx_id) or [])
+                if isinstance(x, dict)
+            ]
+            wo_rows = [
+                {**x, "row_kind": "writeoff"}
+                for x in (
+                    self.db.get_packaging_writeoffs(
+                        ctx_id, manager_id=manager_id, region_id=region_id
+                    )
+                    or []
+                )
+                if isinstance(x, dict)
+            ]
+        result = (opening, rows, wo_rows)
+        cache[key] = result
+        return result
 
     def _packaging_probe_for_manager(self, probe_manager_id: str):
         """Build (and cache for this build) a loaded PackagingStockView plus
@@ -1171,22 +1254,9 @@ class HomeView:
                 if not ctx_id:
                     continue
                 _rid_ctx = str(ctx.get("region_id") or "").strip()
-                opening = self.db.get_packaging_supply_opening(ctx_id) or {}
-                rows = [
-                    x
-                    for x in (self.db.list_packaging_supply_orders(ctx_id) or [])
-                    if isinstance(x, dict)
-                ]
-                wo_rows = [
-                    {**x, "row_kind": "writeoff"}
-                    for x in (
-                        self.db.get_packaging_writeoffs(
-                            ctx_id, manager_id=probe_manager_id, region_id=_rid_ctx
-                        )
-                        or []
-                    )
-                    if isinstance(x, dict)
-                ]
+                opening, rows, wo_rows = self._packaging_ctx_journal_cached(
+                    ctx_id, probe_manager_id, _rid_ctx, ps=ps
+                )
                 eff_pack, eff_goods = ps._packaging_journal_final_stocks(
                     opening, rows, wo_rows
                 )
@@ -1235,8 +1305,10 @@ class HomeView:
                 ctx_id = str(ctx.get("id") or "").strip()
                 if not ctx_id:
                     continue
-                opening = self.db.get_packaging_supply_opening(ctx_id) or {}
-                rows = self.db.list_packaging_supply_orders(ctx_id) or []
+                _rid_ctx = str(ctx.get("region_id") or "").strip()
+                opening, rows, _wo_rows = self._packaging_ctx_journal_cached(
+                    ctx_id, probe_manager_id, _rid_ctx, ps=ps
+                )
                 pack_row = (
                     boxes_by_id.get(str(ctx.get("packaging_id") or "").strip()) or {}
                 )
@@ -1283,22 +1355,9 @@ class HomeView:
                 if not ctx_id:
                     continue
                 _rid_ctx = str(ctx.get("region_id") or "").strip()
-                opening = self.db.get_packaging_supply_opening(ctx_id) or {}
-                rows = [
-                    x
-                    for x in (self.db.list_packaging_supply_orders(ctx_id) or [])
-                    if isinstance(x, dict)
-                ]
-                wo_rows = [
-                    {**x, "row_kind": "writeoff"}
-                    for x in (
-                        self.db.get_packaging_writeoffs(
-                            ctx_id, manager_id=probe_manager_id, region_id=_rid_ctx
-                        )
-                        or []
-                    )
-                    if isinstance(x, dict)
-                ]
+                opening, rows, wo_rows = self._packaging_ctx_journal_cached(
+                    ctx_id, probe_manager_id, _rid_ctx, ps=ps
+                )
                 eff_pack, eff_goods = ps._packaging_journal_final_stocks(
                     opening, rows, wo_rows
                 )
@@ -1339,22 +1398,9 @@ class HomeView:
                 if not ctx_id:
                     continue
                 _rid_ctx = str(ctx.get("region_id") or "").strip()
-                opening = self.db.get_packaging_supply_opening(ctx_id) or {}
-                rows = [
-                    x
-                    for x in (self.db.list_packaging_supply_orders(ctx_id) or [])
-                    if isinstance(x, dict)
-                ]
-                wo_rows = [
-                    {**x, "row_kind": "writeoff"}
-                    for x in (
-                        self.db.get_packaging_writeoffs(
-                            ctx_id, manager_id=probe_manager_id, region_id=_rid_ctx
-                        )
-                        or []
-                    )
-                    if isinstance(x, dict)
-                ]
+                opening, rows, wo_rows = self._packaging_ctx_journal_cached(
+                    ctx_id, probe_manager_id, _rid_ctx, ps=ps
+                )
                 eff_pack, eff_goods = ps._packaging_journal_final_stocks(
                     opening, rows, wo_rows
                 )
@@ -1500,16 +1546,9 @@ class HomeView:
                 if not ctx_id:
                     continue
                 _rid_ctx = str(ctx.get("region_id") or "").strip()
-                opening = self.db.get_packaging_supply_opening(ctx_id) or {}
-                supply_rows = [
-                    x
-                    for x in (self.db.list_packaging_supply_orders(ctx_id) or [])
-                    if isinstance(x, dict)
-                ]
-                _raw_wo = self.db.get_packaging_writeoffs(
-                    ctx_id, manager_id=probe_manager_id, region_id=_rid_ctx
-                ) or []
-                writeoff_rows = [{**x, "row_kind": "writeoff"} for x in _raw_wo if isinstance(x, dict)]
+                opening, supply_rows, writeoff_rows = self._packaging_ctx_journal_cached(
+                    ctx_id, probe_manager_id, _rid_ctx, ps=ps
+                )
                 eff_pack, eff_goods = ps._packaging_journal_final_stocks(
                     opening, supply_rows, writeoff_rows
                 )
@@ -1814,6 +1853,17 @@ class HomeView:
                     )
                     mv._load()
                     rows = mv._build_rows()
+                    # Stash the entries this manager's MediaPlanView just loaded so
+                    # _count_media_plan_schedule_end (called right after, same mgr
+                    # list) can reuse them instead of re-fetching get_media_plan_
+                    # entries() a second time per manager.
+                    _mp_cache = (
+                        self._prefetch_cache
+                        if isinstance(self._prefetch_cache, dict)
+                        else None
+                    )
+                    if _mp_cache is not None:
+                        _mp_cache[f"home_media_plan_entries_{mid}"] = mv._entries or []
                     for row in rows or []:
                         rid = str(row.get("id") or id(row))
                         if rid in seen_row_ids:
@@ -1855,13 +1905,18 @@ class HomeView:
             future_dates: set = set()
             for mid in mgr_ids:
                 try:
-                    entries = (
-                        self.db.get_media_plan_entries(
+                    # Reuse entries already loaded by _count_media_plan_stale (runs
+                    # just before this, over the same manager list) when present —
+                    # avoids a second identical get_media_plan_entries() round trip
+                    # per manager.
+                    entries = self._prefetch_get(
+                        f"home_media_plan_entries_{mid}",
+                        lambda mid=mid: self.db.get_media_plan_entries(
                             self.company_id,
                             manager_id=mid,
                             region_id=region_id,
                         )
-                        or []
+                        or [],
                     )
                     for en in entries:
                         raw = en.get("post_dates") or []
@@ -2018,8 +2073,10 @@ class HomeView:
         if not self.company_id:
             return 0
         try:
-            if self.general_mode and self.general_manager_ids:
-                return self._general_count_unique("get_company_categories")
+            # _categories_in_scope() already computes the same per-manager union
+            # in general_mode (and is _prefetch_get-cached) — reuse it instead
+            # of re-querying get_company_categories() once more per manager here
+            # (same fix already applied to _count_total_suppliers/_products above).
             categories = self._categories_in_scope() or []
             return sum(1 for row in categories if isinstance(row, dict))
         except Exception:
@@ -2558,7 +2615,8 @@ class HomeView:
                 if self._safe_float(order.get("duration_transit_days"), None)
                 is not None
                 else self._days_between_or_none(
-                    order.get("date_shipped"), order.get("date_arrived_warehouse")
+                    order.get("date_departed") or order.get("date_shipped"),
+                    order.get("date_arrived_warehouse"),
                 )
             ),
             status_filter=None,
@@ -2646,6 +2704,7 @@ class HomeView:
         - Status counters: normalized by canonical status keys with date-based fallback
         """
         production_values = []
+        waiting_values = []
         acceptance_values = []
         deviation_values = []
         status_counts = {
@@ -2695,6 +2754,7 @@ class HomeView:
                 return None
 
             date_shipped = str(order.get("date_shipped") or "")[:10]
+            date_departed = str(order.get("date_departed") or "")[:10] or date_shipped
             date_wh = str(order.get("date_arrived_warehouse") or "")[:10]
 
             dur_prod = self._safe_float(order.get("duration_production_days"), None)
@@ -2702,7 +2762,7 @@ class HomeView:
                 dur_prod = self._days_between_or_none(order_date, date_shipped)
             dur_deliv = self._safe_float(order.get("duration_transit_days"), None)
             if dur_deliv is None:
-                dur_deliv = self._days_between_or_none(date_shipped, date_wh)
+                dur_deliv = self._days_between_or_none(date_departed, date_wh)
 
             prod_term_days = None
             items = order.get("items") if isinstance(order.get("items"), list) else []
@@ -2781,6 +2841,19 @@ class HomeView:
                 if prod_days is not None:
                     production_values.append(prod_days)
 
+            has_date_departed = self._parse_date(order.get("date_departed")) is not None
+            if (
+                status in {"in_transit", "at_warehouse", "accepted"}
+                and has_date_departed
+            ):
+                wait_days = self._safe_float(order.get("duration_wait_days"), None)
+                if wait_days is None:
+                    wait_days = self._days_between_or_none(
+                        order.get("date_shipped"), order.get("date_departed")
+                    )
+                if wait_days is not None:
+                    waiting_values.append(wait_days)
+
             if status == "accepted" and has_date_accepted:
                 acc_days = self._safe_float(order.get("duration_warehouse_days"), None)
                 if acc_days is None:
@@ -2814,6 +2887,7 @@ class HomeView:
 
         return [
             ("Середній час виробництва", self._format_avg_days(production_values)),
+            ("Середній час очікування", self._format_avg_days(waiting_values)),
             ("Середній час прийомки", self._format_avg_days(acceptance_values)),
             ("Середнє відхилення", dev_text, None, dev_color),
             (
@@ -3212,7 +3286,7 @@ class HomeView:
             manager_id = str(self.manager_id or "").strip()
             if not manager_id:
                 return []
-            payload = self.db.get_manager_workspace_state(manager_id) or {}
+            payload = self._home_workspace_state_cached(manager_id)
             if not isinstance(payload, dict):
                 return []
             store = (
@@ -3313,6 +3387,142 @@ class HomeView:
         except Exception:
             return None
 
+    def _home_name_ambiguous_categories(self) -> dict[str, list[str]]:
+        """name -> sorted list of every category name this product name
+        exists under, per the full catalog (from `_products_in_scope()`) —
+        NOT per any single metric's data.
+
+        This is deliberately catalog-driven rather than derived from
+        whichever order items happened to carry a qualifying sample for a
+        given metric: a name can be genuinely ambiguous (e.g. "Cloudy
+        Pictures" filed under two different categories) while one of those
+        categories has zero accepted orders / zero weight_actual_kg / zero
+        cost inputs for a *particular* card's metric — in which case a
+        bucket keyed only from that metric's own samples would see just one
+        category and wrongly conclude "not ambiguous", silently hiding the
+        breakdown tooltip on some cards (typically the order-item-driven
+        ones: Термін виробництва, Собівартість Замовлення, Плече, Фактична
+        вага, Товару в дорозі/Виробництві) while it still worked on the
+        product-keyed С/В Склад / С/В З+С cards, whose data source doesn't
+        depend on any particular order's status.
+
+        Falls back to the catalog-tree root name when a product carries no
+        flat `category_id` (some products are classified only through the
+        node tree — see `product_naming.resolve_category_label`'s docstring
+        for the same caveat).
+        """
+
+        def _load():
+            try:
+                all_products = self._products_in_scope() or []
+            except Exception:
+                all_products = []
+            try:
+                categories = self._categories_in_scope() or []
+            except Exception:
+                categories = []
+            categories_by_id = {
+                str(c.get("id") or "").strip(): str(c.get("name") or "").strip()
+                for c in (categories or [])
+                if isinstance(c, dict) and c.get("id")
+            }
+            try:
+                all_nodes = self._company_catalog_nodes_cached()
+            except Exception:
+                all_nodes = []
+            nodes_by_id = {
+                str(n.get("id") or "").strip(): n
+                for n in all_nodes
+                if isinstance(n, dict) and str(n.get("id") or "").strip()
+            }
+
+            def _root_name(node_id: str) -> str:
+                cur = str(node_id or "").strip()
+                hops = 0
+                last = ""
+                while cur and hops < 40:
+                    row = nodes_by_id.get(cur)
+                    if not isinstance(row, dict):
+                        break
+                    nm = str(row.get("name") or "").strip()
+                    if nm:
+                        last = nm
+                    parent = str(row.get("parent_node_id") or "").strip()
+                    if not parent:
+                        break
+                    cur = parent
+                    hops += 1
+                return last
+
+            out: dict[str, set[str]] = {}
+            for prod in all_products or []:
+                if not isinstance(prod, dict):
+                    continue
+                name = str(prod.get("name") or "").strip()
+                if not name:
+                    continue
+                cid = str(prod.get("category_id") or "").strip()
+                cat_name = categories_by_id.get(cid, "") if cid else ""
+                if not cat_name:
+                    node_id = str(prod.get("catalog_node_id") or "").strip()
+                    if node_id:
+                        cat_name = _root_name(node_id)
+                if cat_name:
+                    out.setdefault(name, set()).add(cat_name)
+            return {k: sorted(v, key=str.lower) for k, v in out.items()}
+
+        return self._prefetch_get("home_name_ambiguous_categories", _load) or {}
+
+    def _home_name_category_tooltip(
+        self,
+        name_cat_breakdown: dict[str, dict[str, list[float]]],
+        name: str,
+        fmt,
+    ) -> str | None:
+        """Per-category "Назва" breakdown tooltip text (avg-of-values per
+        category), for a "name" that is genuinely ambiguous in the catalog
+        (spans 2+ categories) — regardless of whether every one of those
+        categories happened to have a qualifying sample for this metric.
+        Returns None when the name maps to a single category (nothing
+        ambiguous to disambiguate)."""
+        all_cats = self._home_name_ambiguous_categories().get(name) or []
+        if len(all_cats) < 2:
+            return None
+        cat_bucket = name_cat_breakdown.get(name) or {}
+        lines = []
+        for cat in all_cats:
+            vals = cat_bucket.get(cat) or []
+            if vals:
+                avg = sum(float(v) for v in vals) / max(1, len(vals))
+                lines.append(f"{cat} {fmt(avg)}")
+            else:
+                lines.append(f"{cat} -")
+        return "\n".join(lines) if lines else None
+
+    def _home_name_category_tooltip_ratio(
+        self,
+        breakdown_w: dict[str, dict[str, float]],
+        breakdown_q: dict[str, dict[str, float]],
+        name: str,
+        fmt,
+    ) -> str | None:
+        """Same as `_home_name_category_tooltip`, but for Σw/Σq-style metrics
+        (e.g. weighted average weight) instead of a plain average-of-values."""
+        all_cats = self._home_name_ambiguous_categories().get(name) or []
+        if len(all_cats) < 2:
+            return None
+        cat_bucket_w = breakdown_w.get(name) or {}
+        cat_bucket_q = breakdown_q.get(name) or {}
+        lines = []
+        for cat in all_cats:
+            q = cat_bucket_q.get(cat, 0.0)
+            if q:
+                avg = cat_bucket_w.get(cat, 0.0) / q
+                lines.append(f"{cat} {fmt(avg)}")
+            else:
+                lines.append(f"{cat} -")
+        return "\n".join(lines) if lines else None
+
     def _home_term_production_rows(
         self, orders: list[dict], selected_title_keys: list[str]
     ) -> list[tuple[str, str]]:
@@ -3361,7 +3571,7 @@ class HomeView:
         }
 
         try:
-            all_nodes = self.db.get_company_catalog_nodes(self.company_id) or []
+            all_nodes = self._company_catalog_nodes_cached()
         except Exception:
             all_nodes = []
         nodes_by_id = {
@@ -3411,6 +3621,7 @@ class HomeView:
 
         label_by_key = {k: v for k, v in self._home_term_display_title_options()}
         buckets: dict[tuple[str, str], list[int]] = {}
+        name_cat_breakdown: dict[str, dict[str, list[int]]] = {}
 
         for order in orders or []:
             if not isinstance(order, dict):
@@ -3441,6 +3652,24 @@ class HomeView:
                 if not pid:
                     continue  # skip items with no catalog product (custom "Своя назва")
                 prod = products_by_id.get(pid) if pid else None
+                if prod is None:
+                    # Not in this manager's accessible scope (e.g. only one
+                    # level/subcategory of the category was shared) —
+                    # products_by_id only has what _products_in_scope() ->
+                    # get_products() -> the manager's granted scope nodes
+                    # actually cover. Without this, the `or item.get(...)`
+                    # fallbacks below resolve category/level straight from
+                    # the order item's own denormalized fields regardless
+                    # of scope, leaking every level in the category instead
+                    # of just the shared one (confirmed live).
+                    continue
+
+                cat_id = str(
+                    (prod.get("category_id") if isinstance(prod, dict) else None)
+                    or item.get("category_id")
+                    or ""
+                ).strip()
+                cat_name = categories_by_id.get(cat_id, "") if cat_id else ""
 
                 if "name" in selected_key_set:
                     display_name = str(
@@ -3451,17 +3680,15 @@ class HomeView:
                     ).strip()
                     if display_name:
                         buckets.setdefault(("name", display_name), []).append(duration)
+                        if cat_name:
+                            name_cat_breakdown.setdefault(display_name, {}).setdefault(
+                                cat_name, []
+                            ).append(duration)
 
-                cat_id = str(
-                    (prod.get("category_id") if isinstance(prod, dict) else None)
-                    or item.get("category_id")
-                    or ""
-                ).strip()
                 if not cat_id:
                     continue
 
                 if "category" in selected_key_set:
-                    cat_name = categories_by_id.get(cat_id, "")
                     if cat_name:
                         buckets.setdefault(("category", cat_name), []).append(duration)
 
@@ -3490,7 +3717,7 @@ class HomeView:
                         continue
                     buckets.setdefault((key, node_name), []).append(duration)
 
-        rows: list[tuple[str, str]] = []
+        rows: list[tuple] = []
         for key in keys:
             matches = [
                 (name, vals)
@@ -3503,7 +3730,14 @@ class HomeView:
                 label = (
                     name if len(keys) == 1 else f"{label_by_key.get(key, key)}: {name}"
                 )
-                rows.append((label, f"{int(avg)} днів"))
+                tooltip_text = (
+                    self._home_name_category_tooltip(
+                        name_cat_breakdown, name, lambda a: f"{int(round(a))} дн."
+                    )
+                    if key == "name"
+                    else None
+                )
+                rows.append((label, f"{int(avg)} днів", None, None, tooltip_text))
 
         if not rows:
             rows.append(("Немає даних", "-"))
@@ -3517,7 +3751,7 @@ class HomeView:
             manager_id = str(self.manager_id or "").strip()
             if not manager_id:
                 return []
-            payload = self.db.get_manager_workspace_state(manager_id) or {}
+            payload = self._home_workspace_state_cached(manager_id)
             if not isinstance(payload, dict):
                 return []
             store = (
@@ -3688,7 +3922,7 @@ class HomeView:
         }
 
         try:
-            all_nodes = self.db.get_company_catalog_nodes(self.company_id) or []
+            all_nodes = self._company_catalog_nodes_cached()
         except Exception:
             all_nodes = []
         nodes_by_id = {
@@ -3738,6 +3972,7 @@ class HomeView:
 
         label_by_key = {k: v for k, v in self._home_cost_display_title_options()}
         buckets: dict[tuple[str, str], list[float]] = {}
+        name_cat_breakdown: dict[str, dict[str, list[float]]] = {}
 
         for order in orders or []:
             if not isinstance(order, dict):
@@ -3783,6 +4018,23 @@ class HomeView:
                 if not pid:
                     continue  # skip items with no catalog product (custom "Своя назва")
                 prod = products_by_id.get(pid) if pid else None
+                if prod is None:
+                    # Not in this manager's accessible scope. This section
+                    # currently gets away without this check in practice
+                    # (cost comes from get_cost_price_order_inputs(), already
+                    # scoped per-ORDER upstream) — but that's per-order, not
+                    # per-line-item, so a single order mixing an in-scope and
+                    # out-of-scope product could still leak here. Added for
+                    # the same reason as the production-time/weight/shoulder
+                    # sections, which had no upstream protection at all.
+                    continue
+
+                cat_id = str(
+                    (prod.get("category_id") if isinstance(prod, dict) else None)
+                    or item.get("category_id")
+                    or ""
+                ).strip()
+                cat_name = categories_by_id.get(cat_id, "") if cat_id else ""
 
                 if "name" in selected_key_set:
                     display_name = str(
@@ -3795,17 +4047,15 @@ class HomeView:
                         buckets.setdefault(("name", display_name), []).append(
                             float(cost)
                         )
+                        if cat_name:
+                            name_cat_breakdown.setdefault(
+                                display_name, {}
+                            ).setdefault(cat_name, []).append(float(cost))
 
-                cat_id = str(
-                    (prod.get("category_id") if isinstance(prod, dict) else None)
-                    or item.get("category_id")
-                    or ""
-                ).strip()
                 if not cat_id:
                     continue
 
                 if "category" in selected_key_set:
-                    cat_name = categories_by_id.get(cat_id, "")
                     if cat_name:
                         buckets.setdefault(("category", cat_name), []).append(
                             float(cost)
@@ -3836,7 +4086,7 @@ class HomeView:
                         continue
                     buckets.setdefault((key, node_name), []).append(float(cost))
 
-        rows: list[tuple[str, str]] = []
+        rows: list[tuple] = []
         for key in keys:
             matches = [
                 (name, vals)
@@ -3849,7 +4099,14 @@ class HomeView:
                 label = (
                     name if len(keys) == 1 else f"{label_by_key.get(key, key)}: {name}"
                 )
-                rows.append((label, f"${avg:.2f}"))
+                tooltip_text = (
+                    self._home_name_category_tooltip(
+                        name_cat_breakdown, name, lambda a: f"${a:.2f}"
+                    )
+                    if key == "name"
+                    else None
+                )
+                rows.append((label, f"${avg:.2f}", None, None, tooltip_text))
 
         if not rows:
             rows.append(("Немає даних", "-"))
@@ -4061,7 +4318,7 @@ class HomeView:
             manager_id = str(self.manager_id or "").strip()
             if not manager_id:
                 return []
-            payload = self.db.get_manager_workspace_state(manager_id) or {}
+            payload = self._home_workspace_state_cached(manager_id)
             if not isinstance(payload, dict):
                 return []
             store = (
@@ -4198,7 +4455,7 @@ class HomeView:
         }
 
         try:
-            all_nodes = self.db.get_company_catalog_nodes(self.company_id) or []
+            all_nodes = self._company_catalog_nodes_cached()
         except Exception:
             all_nodes = []
         nodes_by_id = {
@@ -4253,6 +4510,8 @@ class HomeView:
         # than avg(w/q) when order sizes differ significantly.
         buckets_w: dict[tuple[str, str], float] = {}
         buckets_q: dict[tuple[str, str], float] = {}
+        name_cat_breakdown_w: dict[str, dict[str, float]] = {}
+        name_cat_breakdown_q: dict[str, dict[str, float]] = {}
 
         def _add(bucket_key, w, q):
             buckets_w[bucket_key] = buckets_w.get(bucket_key, 0.0) + w
@@ -4273,6 +4532,17 @@ class HomeView:
                 if weight_fact is None or weight_fact <= 0 or qty is None or qty <= 0:
                     continue
                 prod = products_by_id.get(pid)
+                if prod is None:
+                    # Not in this manager's accessible scope — see the
+                    # matching comment in the production-time section above.
+                    continue
+
+                cat_id = str(
+                    (prod.get("category_id") if isinstance(prod, dict) else None)
+                    or item.get("category_id")
+                    or ""
+                ).strip()
+                cat_name = categories_by_id.get(cat_id, "") if cat_id else ""
 
                 if "name" in selected_key_set:
                     display_name = str(
@@ -4283,17 +4553,26 @@ class HomeView:
                     ).strip()
                     if display_name:
                         _add(("name", display_name), float(weight_fact), float(qty))
+                        if cat_name:
+                            name_cat_breakdown_w[display_name] = name_cat_breakdown_w.get(
+                                display_name, {}
+                            )
+                            name_cat_breakdown_w[display_name][cat_name] = (
+                                name_cat_breakdown_w[display_name].get(cat_name, 0.0)
+                                + float(weight_fact)
+                            )
+                            name_cat_breakdown_q[display_name] = name_cat_breakdown_q.get(
+                                display_name, {}
+                            )
+                            name_cat_breakdown_q[display_name][cat_name] = (
+                                name_cat_breakdown_q[display_name].get(cat_name, 0.0)
+                                + float(qty)
+                            )
 
-                cat_id = str(
-                    (prod.get("category_id") if isinstance(prod, dict) else None)
-                    or item.get("category_id")
-                    or ""
-                ).strip()
                 if not cat_id:
                     continue
 
                 if "category" in selected_key_set:
-                    cat_name = categories_by_id.get(cat_id, "")
                     if cat_name:
                         _add(("category", cat_name), float(weight_fact), float(qty))
 
@@ -4322,7 +4601,7 @@ class HomeView:
                         continue
                     _add((key, node_name), float(weight_fact), float(qty))
 
-        rows: list[tuple[str, str]] = []
+        rows: list[tuple] = []
         for key in keys:
             matches = [
                 (name, buckets_w[bk], buckets_q[bk])
@@ -4336,7 +4615,17 @@ class HomeView:
                 label = (
                     name if len(keys) == 1 else f"{label_by_key.get(key, key)}: {name}"
                 )
-                rows.append((label, f"{avg:.3f} кг"))
+                tooltip_text = (
+                    self._home_name_category_tooltip_ratio(
+                        name_cat_breakdown_w,
+                        name_cat_breakdown_q,
+                        name,
+                        lambda a: f"{a:.3f} кг",
+                    )
+                    if key == "name"
+                    else None
+                )
+                rows.append((label, f"{avg:.3f} кг", None, None, tooltip_text))
 
         if not rows:
             rows.append(("Немає даних", "-"))
@@ -4428,7 +4717,7 @@ class HomeView:
             manager_id = str(self.manager_id or "").strip()
             if not manager_id:
                 return []
-            payload = self.db.get_manager_workspace_state(manager_id) or {}
+            payload = self._home_workspace_state_cached(manager_id)
             if not isinstance(payload, dict):
                 return []
             store = (
@@ -4566,7 +4855,7 @@ class HomeView:
         }
 
         try:
-            all_nodes = self.db.get_company_catalog_nodes(self.company_id) or []
+            all_nodes = self._company_catalog_nodes_cached()
         except Exception:
             all_nodes = []
         nodes_by_id = {
@@ -4616,6 +4905,7 @@ class HomeView:
 
         label_by_key = {k: v for k, v in self._home_shoulder_display_title_options()}
         buckets: dict[tuple[str, str], list[float]] = {}
+        name_cat_breakdown: dict[str, dict[str, list[float]]] = {}
 
         for order in orders or []:
             if not isinstance(order, dict):
@@ -4633,6 +4923,17 @@ class HomeView:
                 if not pid:
                     continue
                 prod = products_by_id.get(pid)
+                if prod is None:
+                    # Not in this manager's accessible scope — see the
+                    # matching comment in the production-time section above.
+                    continue
+
+                cat_id = str(
+                    (prod.get("category_id") if isinstance(prod, dict) else None)
+                    or item.get("category_id")
+                    or ""
+                ).strip()
+                cat_name = categories_by_id.get(cat_id, "") if cat_id else ""
 
                 if "name" in selected_key_set:
                     display_name = str(
@@ -4645,17 +4946,15 @@ class HomeView:
                         buckets.setdefault(("name", display_name), []).append(
                             float(log_days)
                         )
+                        if cat_name:
+                            name_cat_breakdown.setdefault(
+                                display_name, {}
+                            ).setdefault(cat_name, []).append(float(log_days))
 
-                cat_id = str(
-                    (prod.get("category_id") if isinstance(prod, dict) else None)
-                    or item.get("category_id")
-                    or ""
-                ).strip()
                 if not cat_id:
                     continue
 
                 if "category" in selected_key_set:
-                    cat_name = categories_by_id.get(cat_id, "")
                     if cat_name:
                         buckets.setdefault(("category", cat_name), []).append(
                             float(log_days)
@@ -4686,7 +4985,7 @@ class HomeView:
                         continue
                     buckets.setdefault((key, node_name), []).append(float(log_days))
 
-        rows: list[tuple[str, str]] = []
+        rows: list[tuple] = []
         for key in keys:
             matches = [
                 (name, vals)
@@ -4699,7 +4998,14 @@ class HomeView:
                 label = (
                     name if len(keys) == 1 else f"{label_by_key.get(key, key)}: {name}"
                 )
-                rows.append((label, f"{int(round(avg))} дн."))
+                tooltip_text = (
+                    self._home_name_category_tooltip(
+                        name_cat_breakdown, name, lambda a: f"{int(round(a))} дн."
+                    )
+                    if key == "name"
+                    else None
+                )
+                rows.append((label, f"{int(round(avg))} дн.", None, None, tooltip_text))
 
         if not rows:
             rows.append(("Немає даних", "-"))
@@ -4779,6 +5085,408 @@ class HomeView:
         )
         page.show_dialog(dlg)
 
+    # ── Товару в дорозі / Виробництві ───────────────────────────────────────
+
+    def _home_transit_production_display_state_key(self) -> str:
+        return f"{self._table_layout_state_key()}:transit_production_display"
+
+    def _load_home_transit_production_display_title_keys(self) -> list[str]:
+        try:
+            manager_id = str(self.manager_id or "").strip()
+            if not manager_id:
+                return []
+            payload = self._home_workspace_state_cached(manager_id)
+            if not isinstance(payload, dict):
+                return []
+            store = (
+                payload.get("home_transit_production_display")
+                if isinstance(payload.get("home_transit_production_display"), dict)
+                else {}
+            )
+            raw = store.get(self._home_transit_production_display_state_key())
+            if not isinstance(raw, list):
+                return []
+            return [str(x).strip().lower() for x in raw if str(x).strip()]
+        except Exception:
+            return []
+
+    def _save_home_transit_production_display_title_keys(self, keys: list[str]) -> None:
+        try:
+            manager_id = str(self.manager_id or "").strip()
+            if not manager_id:
+                return
+            payload = self.db.get_manager_workspace_state(manager_id) or {}
+            if not isinstance(payload, dict):
+                payload = {}
+            store = (
+                payload.get("home_transit_production_display")
+                if isinstance(payload.get("home_transit_production_display"), dict)
+                else {}
+            )
+            store[self._home_transit_production_display_state_key()] = [
+                str(x).strip().lower() for x in (keys or []) if str(x).strip()
+            ]
+            payload["home_transit_production_display"] = store
+            self.db.save_manager_workspace_state(manager_id, payload)
+        except Exception:
+            pass
+
+    def _home_transit_production_display_title_options(self) -> list[tuple[str, str]]:
+        try:
+            categories = self._categories_in_scope() or []
+        except Exception:
+            categories = []
+        options: list[tuple[str, str]] = [("name", "Назва")]
+        seen = {"name", "category"}
+        titled: list[tuple[int, str, str]] = []
+        for cat in categories:
+            if not isinstance(cat, dict):
+                continue
+            cfg = self.db.get_category_levels_config(cat) or {}
+            levels = cfg.get("levels") if isinstance(cfg.get("levels"), list) else []
+            for row in levels:
+                if not isinstance(row, dict) or not bool(row.get("enabled")):
+                    continue
+                label = str(row.get("title") or "").strip()
+                if not label:
+                    continue
+                key = label.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    pos = int(row.get("position") or 0)
+                except Exception:
+                    pos = 0
+                titled.append((pos, label.lower(), key))
+                options.append((key, label))
+        tail = sorted(
+            options[1:],
+            key=lambda pair: (
+                next((p for p, _, k in titled if k == pair[0]), 999),
+                pair[1].lower(),
+            ),
+        )
+        return [options[0], ("category", "Категорія")] + tail
+
+    def _selected_home_transit_production_display_title_keys(self) -> list[str]:
+        options = self._home_transit_production_display_title_options()
+        available_keys = [
+            str(k or "").strip().lower() for k, _ in options if str(k or "").strip()
+        ]
+        saved = [
+            k
+            for k in self._load_home_transit_production_display_title_keys()
+            if k in available_keys
+        ]
+        if saved:
+            return saved
+        return ["name"] if "name" in available_keys else []
+
+    def _home_transit_production_rows(
+        self, orders: list[dict], selected_title_keys: list[str]
+    ) -> list[tuple]:
+        """Qty in transit (Готовий+В дорозі+На складі) vs qty in production
+        (Виробництво), per product/category/level group.
+
+        Each row is (label, blue_qty, green_qty, tooltip_text_or_None).
+        tooltip_text is only set for "name" rows whose qty is aggregated
+        across 2+ categories, listing the per-category breakdown.
+        """
+        keys = [
+            str(k or "").strip().lower()
+            for k in (selected_title_keys or [])
+            if str(k or "").strip()
+        ]
+        if not keys:
+            return [("Немає даних", 0.0, 0.0, None)]
+
+        selected_key_set = set(keys)
+        _BLUE_STATUSES = {"ready_for_shipment", "in_transit", "at_warehouse"}
+
+        try:
+            all_products = self._products_in_scope() or []
+        except Exception:
+            all_products = []
+        products_by_id = {}
+        for prod in all_products:
+            if not isinstance(prod, dict):
+                continue
+            pid = str(prod.get("id") or "").strip()
+            if pid:
+                products_by_id[pid] = prod
+
+        try:
+            categories = self._categories_in_scope() or []
+        except Exception:
+            categories = []
+        cat_cfg_by_id: dict[str, dict] = {}
+        for cat in categories or []:
+            if not isinstance(cat, dict):
+                continue
+            cid = str(cat.get("id") or "").strip()
+            if not cid:
+                continue
+            cat_cfg_by_id[cid] = self.db.get_category_levels_config(cat) or {}
+
+        categories_by_id: dict[str, str] = {
+            str(c.get("id") or "").strip(): str(c.get("name") or "").strip()
+            for c in (categories or [])
+            if isinstance(c, dict) and c.get("id")
+        }
+
+        try:
+            all_nodes = self._company_catalog_nodes_cached()
+        except Exception:
+            all_nodes = []
+        nodes_by_id = {
+            str(node.get("id") or "").strip(): node
+            for node in all_nodes
+            if isinstance(node, dict) and str(node.get("id") or "").strip()
+        }
+
+        def _node_names_by_position(
+            node_id: str, item: dict | None = None
+        ) -> dict[int, str]:
+            out: dict[int, str] = {}
+            cur = str(node_id or "").strip()
+            hops = 0
+            while cur and hops < 40:
+                row = nodes_by_id.get(cur)
+                if not isinstance(row, dict):
+                    break
+                try:
+                    pos = int(row.get("level_position") or 0)
+                except Exception:
+                    pos = 0
+                if 1 <= pos <= 6 and pos not in out:
+                    out[pos] = str(row.get("name") or "").strip()
+                cur = str(row.get("parent_node_id") or "").strip()
+                hops += 1
+            for pos in range(1, 7):
+                direct_id = ""
+                if isinstance(item, dict):
+                    direct_id = str(item.get(f"level_{pos}_node_id") or "").strip()
+                if not direct_id:
+                    direct_id = str(
+                        (
+                            products_by_id.get(
+                                str(item.get("product_id") or "").strip()
+                            )
+                            or {}
+                        ).get(f"level_{pos}_node_id")
+                        if isinstance(item, dict)
+                        else ""
+                    ).strip()
+                if direct_id and pos not in out:
+                    direct_row = nodes_by_id.get(direct_id)
+                    if isinstance(direct_row, dict):
+                        out[pos] = str(direct_row.get("name") or "").strip()
+            return out
+
+        label_by_key = {
+            k: v for k, v in self._home_transit_production_display_title_options()
+        }
+        buckets: dict[tuple[str, str], dict[str, float]] = {}
+        name_cat_breakdown: dict[str, dict[str, dict[str, float]]] = {}
+
+        def _add(bucket_key, blue, green):
+            b = buckets.setdefault(bucket_key, {"blue": 0.0, "green": 0.0})
+            b["blue"] += blue
+            b["green"] += green
+
+        for order in orders or []:
+            if not isinstance(order, dict):
+                continue
+            status = self._normalize_order_status(order.get("status"))
+            if status in _BLUE_STATUSES:
+                blue_flag, green_flag = True, False
+            elif status == "production":
+                blue_flag, green_flag = False, True
+            else:
+                continue
+            items = order.get("items") if isinstance(order.get("items"), list) else []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                pid = str(item.get("product_id") or "").strip()
+                if not pid:
+                    continue
+                qty = self._safe_float(item.get("qty") or item.get("quantity"), None)
+                if qty is None or qty <= 0:
+                    continue
+                prod = products_by_id.get(pid)
+                if prod is None:
+                    # Not in this manager's accessible scope — see the
+                    # matching comment in the production-time section above.
+                    continue
+                blue_q = float(qty) if blue_flag else 0.0
+                green_q = float(qty) if green_flag else 0.0
+
+                cat_id = str(
+                    (prod.get("category_id") if isinstance(prod, dict) else None)
+                    or item.get("category_id")
+                    or ""
+                ).strip()
+                cat_name = categories_by_id.get(cat_id, "") if cat_id else ""
+
+                if "name" in selected_key_set:
+                    display_name = str(
+                        (prod.get("name") if isinstance(prod, dict) else "")
+                        or item.get("product_name")
+                        or item.get("name")
+                        or ""
+                    ).strip()
+                    if display_name:
+                        _add(("name", display_name), blue_q, green_q)
+                        if cat_name:
+                            entry = name_cat_breakdown.setdefault(
+                                display_name, {}
+                            ).setdefault(cat_name, {"blue": 0.0, "green": 0.0})
+                            entry["blue"] += blue_q
+                            entry["green"] += green_q
+
+                if not cat_id:
+                    continue
+
+                if "category" in selected_key_set:
+                    if cat_name:
+                        _add(("category", cat_name), blue_q, green_q)
+
+                cfg = cat_cfg_by_id.get(cat_id) or {}
+                levels = (
+                    cfg.get("levels") if isinstance(cfg.get("levels"), list) else []
+                )
+                node_id = str(
+                    item.get("catalog_node_id")
+                    or (prod.get("catalog_node_id") if isinstance(prod, dict) else "")
+                    or ""
+                ).strip()
+                node_names_by_pos = _node_names_by_position(node_id, item)
+                for level in levels:
+                    if not isinstance(level, dict) or not bool(level.get("enabled")):
+                        continue
+                    key = str(level.get("title") or "").strip().lower()
+                    if key not in selected_key_set or key in {"name", "category"}:
+                        continue
+                    try:
+                        pos = int(level.get("position") or 0)
+                    except Exception:
+                        pos = 0
+                    node_name = str(node_names_by_pos.get(pos) or "").strip()
+                    if not node_name:
+                        continue
+                    _add((key, node_name), blue_q, green_q)
+
+        rows: list[tuple] = []
+        for key in keys:
+            matches = [
+                (name, vals["blue"], vals["green"])
+                for (bucket_key, name), vals in buckets.items()
+                if bucket_key == key and (vals["blue"] > 0 or vals["green"] > 0)
+            ]
+            matches.sort(key=lambda pair: pair[0].lower())
+            for name, blue_total, green_total in matches:
+                label = (
+                    name if len(keys) == 1 else f"{label_by_key.get(key, key)}: {name}"
+                )
+                tooltip_text = None
+                if key == "name":
+                    all_cats = self._home_name_ambiguous_categories().get(name) or []
+                    if len(all_cats) > 1:
+                        cat_bucket = name_cat_breakdown.get(name) or {}
+                        lines = []
+                        for cat in all_cats:
+                            v = cat_bucket.get(cat)
+                            if v:
+                                lines.append(
+                                    f"{cat} {int(round(v['blue']))} / {int(round(v['green']))}"
+                                )
+                            else:
+                                lines.append(f"{cat} 0 / 0")
+                        tooltip_text = "\n".join(lines)
+                rows.append((label, blue_total, green_total, tooltip_text))
+
+        if not rows:
+            rows.append(("Немає даних", 0.0, 0.0, None))
+        return rows
+
+    def _open_home_transit_production_display_settings(self, _=None):
+        page = getattr(self.content_area, "page", None)
+        if not page:
+            return
+        options = self._home_transit_production_display_title_options()
+        selected = set(self._selected_home_transit_production_display_title_keys())
+        checkboxes: list[ft.Checkbox] = []
+
+        def _mk_checkbox(key: str, label: str):
+            cb = ft.Checkbox(value=(key in selected), label=label)
+            checkboxes.append(cb)
+            return cb
+
+        items = [_mk_checkbox(key, label) for key, label in options]
+
+        def _save(_e=None):
+            picked = [
+                key
+                for (key, _), cb in zip(options, checkboxes)
+                if bool(getattr(cb, "value", False))
+            ]
+            try:
+                page.pop_dialog()
+            except Exception:
+                try:
+                    dlg.open = False
+                    page.update()
+                except Exception:
+                    pass
+
+            async def _bg(_p=list(picked)):
+                import asyncio as _ai
+
+                with contextlib.suppress(Exception):
+                    await _ai.to_thread(
+                        self._save_home_transit_production_display_title_keys, _p
+                    )
+                self.build()
+
+            try:
+                page.run_task(_bg)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    self._save_home_transit_production_display_title_keys(picked)
+                self.build()
+
+        def _cancel(_e=None):
+            try:
+                page.pop_dialog()
+            except Exception:
+                try:
+                    dlg.open = False
+                    page.update()
+                except Exception:
+                    pass
+
+        _dlg_title_transit = "Що показувати в товарі в дорозі/виробництві"
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Row([
+                ft.Text(_dlg_title_transit, expand=True),
+                ft.IconButton(icon=ft.Icons.HELP_OUTLINE, icon_size=16, tooltip=self.t("common.help.tooltip", "Довідка"), on_click=lambda _: self._show_display_selection_help(page, _dlg_title_transit)),
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER, tight=True),
+            content=ft.Container(
+                width=420,
+                height=320,
+                content=ft.Column(items, spacing=0, scroll=ft.ScrollMode.ADAPTIVE),
+            ),
+            actions=[
+                ft.TextButton("Скасувати", on_click=_cancel),
+                ft.FilledButton("Зберегти", on_click=_save),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        page.show_dialog(dlg)
+
     # ── Середня Собівартість Склад ────────────────────────────────────────────
 
     def _home_stock_cost_display_state_key(self) -> str:
@@ -4789,7 +5497,7 @@ class HomeView:
             manager_id = str(self.manager_id or "").strip()
             if not manager_id:
                 return []
-            payload = self.db.get_manager_workspace_state(manager_id) or {}
+            payload = self._home_workspace_state_cached(manager_id)
             if not isinstance(payload, dict):
                 return []
             store = (
@@ -5014,7 +5722,7 @@ class HomeView:
         }
 
         try:
-            all_nodes = self.db.get_company_catalog_nodes(self.company_id) or []
+            all_nodes = self._company_catalog_nodes_cached()
         except Exception:
             all_nodes = []
         nodes_by_id = {
@@ -5051,6 +5759,7 @@ class HomeView:
 
         label_by_key = {k: v for k, v in self._home_stock_cost_display_title_options()}
         buckets: dict[tuple[str, str], list[float]] = {}
+        name_cat_breakdown: dict[str, dict[str, list[float]]] = {}
 
         for pid, inp in (stock_inputs or {}).items():
             if not isinstance(inp, dict):
@@ -5070,19 +5779,24 @@ class HomeView:
                 # that used to still count toward the visible averages.
                 continue
 
+            cat_id = str(
+                (prod.get("category_id") if isinstance(prod, dict) else "") or ""
+            ).strip()
+            cat_name = categories_by_id.get(cat_id, "") if cat_id else ""
+
             if "name" in selected_key_set:
                 display_name = str(prod.get("name") or "").strip()
                 if display_name:
                     buckets.setdefault(("name", display_name), []).append(unit_cost)
+                    if cat_name:
+                        name_cat_breakdown.setdefault(display_name, {}).setdefault(
+                            cat_name, []
+                        ).append(unit_cost)
 
-            cat_id = str(
-                (prod.get("category_id") if isinstance(prod, dict) else "") or ""
-            ).strip()
             if not cat_id:
                 continue
 
             if "category" in selected_key_set:
-                cat_name = categories_by_id.get(cat_id, "")
                 if cat_name:
                     buckets.setdefault(("category", cat_name), []).append(unit_cost)
 
@@ -5104,7 +5818,7 @@ class HomeView:
                     continue
                 buckets.setdefault((key, node_name), []).append(unit_cost)
 
-        rows: list[tuple[str, str]] = []
+        rows: list[tuple] = []
         for key in keys:
             matches = [
                 (name, vals)
@@ -5117,7 +5831,14 @@ class HomeView:
                 label = (
                     name if len(keys) == 1 else f"{label_by_key.get(key, key)}: {name}"
                 )
-                rows.append((label, f"{avg:.2f}"))
+                tooltip_text = (
+                    self._home_name_category_tooltip(
+                        name_cat_breakdown, name, lambda a: f"{a:.2f}"
+                    )
+                    if key == "name"
+                    else None
+                )
+                rows.append((label, f"{avg:.2f}", None, None, tooltip_text))
 
         if not rows:
             rows.append(("Немає даних", "-"))
@@ -5209,7 +5930,7 @@ class HomeView:
             manager_id = str(self.manager_id or "").strip()
             if not manager_id:
                 return []
-            payload = self.db.get_manager_workspace_state(manager_id) or {}
+            payload = self._home_workspace_state_cached(manager_id)
             if not isinstance(payload, dict):
                 return []
             store = (
@@ -5434,7 +6155,7 @@ class HomeView:
         }
 
         try:
-            all_nodes = self.db.get_company_catalog_nodes(self.company_id) or []
+            all_nodes = self._company_catalog_nodes_cached()
         except Exception:
             all_nodes = []
         nodes_by_id = {
@@ -5472,6 +6193,7 @@ class HomeView:
             k: v for k, v in self._home_blended_cost_display_title_options()
         }
         buckets: dict[tuple[str, str], list[float]] = {}
+        name_cat_breakdown: dict[str, dict[str, list[float]]] = {}
 
         # Collect all product IDs from both sources
         all_pids = set(str(pid).strip() for pid in (stock_inputs or {}).keys())
@@ -5510,21 +6232,26 @@ class HomeView:
                 # used to still count toward the visible averages.
                 continue
 
+            cat_id = str(
+                (prod.get("category_id") if isinstance(prod, dict) else "") or ""
+            ).strip()
+            cat_name = categories_by_id.get(cat_id, "") if cat_id else ""
+
             if "name" in selected_key_set:
                 display_name = str(prod.get("name") or "").strip()
                 if display_name:
                     buckets.setdefault(("name", display_name), []).append(
                         unit_cost_blended
                     )
+                    if cat_name:
+                        name_cat_breakdown.setdefault(display_name, {}).setdefault(
+                            cat_name, []
+                        ).append(unit_cost_blended)
 
-            cat_id = str(
-                (prod.get("category_id") if isinstance(prod, dict) else "") or ""
-            ).strip()
             if not cat_id:
                 continue
 
             if "category" in selected_key_set:
-                cat_name = categories_by_id.get(cat_id, "")
                 if cat_name:
                     buckets.setdefault(("category", cat_name), []).append(
                         unit_cost_blended
@@ -5548,7 +6275,7 @@ class HomeView:
                     continue
                 buckets.setdefault((key, node_name), []).append(unit_cost_blended)
 
-        rows: list[tuple[str, str]] = []
+        rows: list[tuple] = []
         for key in keys:
             matches = [
                 (name, vals)
@@ -5561,7 +6288,14 @@ class HomeView:
                 label = (
                     name if len(keys) == 1 else f"{label_by_key.get(key, key)}: {name}"
                 )
-                rows.append((label, f"{avg:.2f}"))
+                tooltip_text = (
+                    self._home_name_category_tooltip(
+                        name_cat_breakdown, name, lambda a: f"{a:.2f}"
+                    )
+                    if key == "name"
+                    else None
+                )
+                rows.append((label, f"{avg:.2f}", None, None, tooltip_text))
 
         if not rows:
             rows.append(("Немає даних", "-"))
@@ -5729,6 +6463,7 @@ class HomeView:
         badge_color: str = _OK,
         name_to_pid: dict | None = None,
     ):
+        from views.product_naming import with_instant_tooltip as _home_tooltip
         from views.product_quick_view import product_icon_btn as _home_piqb
         list_controls = []
         for row in rows:
@@ -5762,6 +6497,7 @@ class HomeView:
 
             on_click = row[2] if len(row) > 2 else None
             value_color_override = row[3] if len(row) > 3 else None
+            tooltip_text = row[4] if len(row) > 4 else None
             if value_color_override:
                 val_color = value_color_override
             elif callable(on_click):
@@ -5784,6 +6520,8 @@ class HomeView:
                 overflow=ft.TextOverflow.ELLIPSIS,
                 expand=True,
             )
+            if tooltip_text:
+                _label_text = _home_tooltip(_label_text, tooltip_text)
             _label_inner = (
                 ft.Row(
                     [
@@ -5863,6 +6601,227 @@ class HomeView:
                                     ]
                                     if badge_text
                                     else []
+                                ),
+                                ft.IconButton(
+                                    visible=callable(settings_on_click),
+                                    icon=ft.Icons.SETTINGS,
+                                    icon_size=16,
+                                    tooltip="Налаштувати",
+                                    on_click=settings_on_click,
+                                    style=ft.ButtonStyle(
+                                        padding=ft.padding.all(0),
+                                        shape=ft.RoundedRectangleBorder(
+                                            radius=8,
+                                        ),
+                                    ),
+                                ),
+                            ],
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                    ),
+                    ft.Container(
+                        expand=True,
+                        content=ft.Column(
+                            list_controls,
+                            spacing=8,
+                            scroll=ft.ScrollMode.ADAPTIVE,
+                        ),
+                    ),
+                ],
+                spacing=10,
+            ),
+        )
+
+    def _stats_transit_production_card(
+        self,
+        title_blue: str,
+        title_green: str,
+        rows,
+        settings_on_click=None,
+        name_to_pid: dict | None = None,
+    ):
+        from views.product_naming import with_instant_tooltip as _home_tooltip
+        from views.product_quick_view import product_icon_btn as _home_piqb
+
+        def _fmt(v: float) -> str:
+            v = float(v or 0)
+            if v == int(v):
+                return f"{int(v):,}".replace(",", " ")
+            return f"{v:,.1f}".replace(",", " ")
+
+        list_controls = []
+        for row in rows:
+            if not isinstance(row, tuple) or len(row) < 2:
+                continue
+            label = row[0]
+
+            # Region header block: ("__REGION__", "Назва регіону")
+            if label == "__REGION__":
+                list_controls.append(
+                    ft.Container(
+                        padding=ft.padding.only(top=6, bottom=2),
+                        content=ft.Column(
+                            [
+                                ft.Text(
+                                    str(row[1]),
+                                    size=10,
+                                    weight=ft.FontWeight.W_700,
+                                    italic=True,
+                                    color=_WARN_T,
+                                ),
+                                ft.Divider(height=1, color=_WARN, thickness=1),
+                            ],
+                            spacing=2,
+                            tight=True,
+                        ),
+                    )
+                )
+                continue
+
+            if label == "Немає даних":
+                list_controls.append(
+                    ft.Container(
+                        bgcolor=_WARN_BG,
+                        border_radius=10,
+                        padding=ft.padding.symmetric(horizontal=8, vertical=6),
+                        content=ft.Row(
+                            [
+                                ft.Text(label, size=9, color=_STONE2, expand=True),
+                                ft.Text("-", size=11, weight="bold", color=_STONE),
+                            ],
+                            spacing=6,
+                        ),
+                    )
+                )
+                continue
+
+            blue_val = row[1] if len(row) > 1 else 0.0
+            green_val = row[2] if len(row) > 2 else 0.0
+            tooltip_text = row[3] if len(row) > 3 else None
+
+            _pid_for_label = (
+                str((name_to_pid or {}).get(label) or "").strip()
+                if name_to_pid
+                else ""
+            )
+            _label_text = ft.Text(
+                label,
+                size=9,
+                color=_STONE2,
+                no_wrap=False,
+                max_lines=3,
+                overflow=ft.TextOverflow.ELLIPSIS,
+                expand=True,
+            )
+            if tooltip_text:
+                _label_text = _home_tooltip(_label_text, tooltip_text)
+            _label_inner = (
+                ft.Row(
+                    [
+                        _label_text,
+                        _home_piqb(_pid_for_label, self.content_area, self.db, self.user_data, size=11),
+                    ],
+                    spacing=2,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    tight=True,
+                )
+                if _pid_for_label
+                else _label_text
+            )
+
+            list_controls.append(
+                ft.Container(
+                    bgcolor=_WARN_BG,
+                    border_radius=10,
+                    padding=ft.padding.symmetric(horizontal=8, vertical=6),
+                    content=ft.Row(
+                        [
+                            ft.Container(
+                                expand=True,
+                                content=_label_inner,
+                            ),
+                            ft.Container(
+                                alignment=ft.Alignment(1, 0),
+                                content=ft.Row(
+                                    [
+                                        ft.Text(
+                                            _fmt(blue_val),
+                                            size=11,
+                                            weight="bold",
+                                            color=_ACCENT,
+                                            no_wrap=True,
+                                        ),
+                                        ft.Text(
+                                            "/",
+                                            size=11,
+                                            weight="bold",
+                                            color=_STONE,
+                                            no_wrap=True,
+                                        ),
+                                        ft.Text(
+                                            _fmt(green_val),
+                                            size=11,
+                                            weight="bold",
+                                            color=_OK,
+                                            no_wrap=True,
+                                        ),
+                                    ],
+                                    spacing=3,
+                                    tight=True,
+                                ),
+                            ),
+                        ],
+                        spacing=6,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                )
+            )
+
+        card_height = 380
+        return ft.Container(
+            width=240,
+            height=card_height,
+            bgcolor=_FDE68A,
+            border=ft.border.all(1, _WARN),
+            border_radius=12,
+            padding=10,
+            content=ft.Column(
+                [
+                    ft.Container(
+                        bgcolor=_FED7AA,
+                        border_radius=10,
+                        padding=ft.padding.symmetric(horizontal=10, vertical=8),
+                        content=ft.Row(
+                            [
+                                ft.Text(
+                                    spans=[
+                                        ft.TextSpan(
+                                            title_blue,
+                                            style=ft.TextStyle(
+                                                size=12,
+                                                weight=ft.FontWeight.BOLD,
+                                                color=_ACCENT,
+                                            ),
+                                        ),
+                                        ft.TextSpan(
+                                            " / ",
+                                            style=ft.TextStyle(
+                                                size=12,
+                                                weight=ft.FontWeight.BOLD,
+                                                color=_ERR_DK,
+                                            ),
+                                        ),
+                                        ft.TextSpan(
+                                            title_green,
+                                            style=ft.TextStyle(
+                                                size=12,
+                                                weight=ft.FontWeight.BOLD,
+                                                color=_OK,
+                                            ),
+                                        ),
+                                    ],
+                                    expand=True,
                                 ),
                                 ft.IconButton(
                                     visible=callable(settings_on_click),
@@ -6216,6 +7175,8 @@ class HomeView:
     def _build_sync(self):
         if not self.content_area or not self._page():
             return
+        # Fresh per-build cache — see _packaging_ctx_journal_cached.
+        self._pkg_ctx_journal_cache = {}
 
         self._header_loading_indicator = create_orders_header_loading_indicator(
             visible=True
@@ -6417,6 +7378,17 @@ class HomeView:
         home_blended_cost_rows = _safe_value(
             lambda: self._with_region_blocks(
                 scoped_orders, self._home_blended_cost_rows, home_blended_cost_keys
+            ),
+            [],
+        )
+        home_transit_production_keys = _safe_value(
+            self._selected_home_transit_production_display_title_keys, []
+        )
+        home_transit_production_rows = _safe_value(
+            lambda: self._with_region_blocks(
+                scoped_orders,
+                self._home_transit_production_rows,
+                home_transit_production_keys,
             ),
             [],
         )
@@ -6752,6 +7724,13 @@ class HomeView:
                 )
                 is not None
                 else []
+            ),
+            self._stats_transit_production_card(
+                "Товару в дорозі шт.",
+                "Виробництві шт.",
+                home_transit_production_rows,
+                settings_on_click=self._open_home_transit_production_display_settings,
+                name_to_pid=_home_name_to_pid,
             ),
         ]
         stats_gap = 12

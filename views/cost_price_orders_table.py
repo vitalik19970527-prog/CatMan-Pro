@@ -361,6 +361,13 @@ def build_orders_filter_bar(view) -> ft.Container:
     _CHIP_T = _th["chip_text"]
     _CHIP_BG = _th["chip_bg"]
     _ALT = _ALT_2 = _th["alt"]
+    # Candidate ids come from view._orders_rows (built from the manager's
+    # raw historical orders, which keep entries for a supplier/category/
+    # product they've since been stripped of — kept in the DB for
+    # settlement history). Intersecting against the *_by_id dicts (built
+    # from the manager_id-scoped get_suppliers/get_company_categories/
+    # get_products lists) keeps the filter to only what the manager
+    # currently owns, closing the same leak already fixed for orders_view.py.
     supplier_opts = [
         ("all", view.t("orders.filter.all_suppliers", "Всі постачальники"))
     ] + [
@@ -370,6 +377,7 @@ def build_orders_filter_bar(view) -> ft.Container:
                 str(row.get("supplier_id") or "").strip()
                 for row in view._orders_rows
                 if row.get("supplier_id")
+                and str(row.get("supplier_id")).strip() in view._supplier_by_id
             }
         )
     ]
@@ -382,6 +390,7 @@ def build_orders_filter_bar(view) -> ft.Container:
                 str(row.get("category_id") or "").strip()
                 for row in view._orders_rows
                 if row.get("category_id")
+                and str(row.get("category_id")).strip() in view._category_by_id
             }
         )
     ]
@@ -392,6 +401,7 @@ def build_orders_filter_bar(view) -> ft.Container:
                 str((row.get("item") or {}).get("product_id") or "").strip()
                 for row in view._orders_rows
                 if (row.get("item") or {}).get("product_id")
+                and str((row.get("item") or {}).get("product_id")).strip() in view._product_by_id
             }
         )
     ]
@@ -868,10 +878,12 @@ def build_orders_table(view, rows: list) -> dict:
         max_lines: int = 1,
         wrap: bool = False,
         h: int | None = None,
+        raw: bool = False,
     ) -> ft.Container:
         if int(w or 0) <= 0:
             return ft.Container(width=0, height=0, visible=False)
         _h = h if h is not None else row_height
+        display_text = str(text or "") if raw else format_maybe_numeric_text(str(text or ""))
         if wrap:
             return ft.Container(
                 width=w,
@@ -881,7 +893,7 @@ def build_orders_table(view, rows: list) -> dict:
                 alignment=ft.Alignment(0, 0),
                 padding=ft.padding.symmetric(horizontal=4),
                 content=ft.Text(
-                    format_maybe_numeric_text(str(text or "")),
+                    display_text,
                     size=8,
                     color=_TEXT,
                     weight="bold" if bold else None,
@@ -898,7 +910,7 @@ def build_orders_table(view, rows: list) -> dict:
             border=ft.border.all(1, _BORDER),
             alignment=ft.Alignment(0, 0),
             content=ft.Text(
-                format_maybe_numeric_text(str(text or "")),
+                display_text,
                 size=8,
                 color=_TEXT,
                 weight="bold" if bold else None,
@@ -1661,6 +1673,7 @@ def build_orders_table(view, rows: list) -> dict:
                     widths[4],
                     item_bg,
                     h=_row_h,
+                    raw=True,
                 ),
                 _mk_product_cell_cpo(  # noqa: F821
                     row.get("product_name") or "",
@@ -2232,6 +2245,7 @@ def build_orders_table(view, rows: list) -> dict:
                     align=ft.TextAlign.CENTER,
                     wrap=True,
                     h=_grp_h,
+                    raw=True,
                 ),
                 _cell_text(
                     _grp_label,
@@ -3995,9 +4009,14 @@ class CostPriceView:
         return None
 
     def _workspace_user_id(self) -> str:
+        # Must match self.manager_id's own precedence (active_manager_id
+        # first) — same review/"перегляд" mode fix as orders_view.py's twin
+        # method: this used to check ud["id"] first, so review mode loaded/
+        # saved the reviewer's own workspace bucket instead of the reviewed
+        # subordinate's (active_manager_id).
         ud = self.user_data or {}
         return str(
-            ud.get("id") or ud.get("active_manager_id") or self.manager_id or ""
+            ud.get("active_manager_id") or ud.get("id") or self.manager_id or ""
         ).strip()
 
     def _load_workspace_state(self):
@@ -6116,7 +6135,11 @@ class CostPriceView:
                         region_id,
                         manager_id=mid,
                         force_refresh=True,
-                        visible_product_ids=list(vis_ids) if vis_ids else None,
+                        # Explicit [] (not None) when empty — see payments_view.py's
+                        # matching fix: None means "no product filter at all" to
+                        # get_orders(), which used to leak every OTHER manager's
+                        # orders to a manager with zero assigned products.
+                        visible_product_ids=list(vis_ids),
                     )
                     or []
                 )
@@ -6971,7 +6994,10 @@ class CostPriceView:
                         "status": str(order.get("status") or "production"),
                         "delivery_name": str(order.get("delivery_type_name") or ""),
                         "comment": str(order.get("comment") or ""),
-                        "item_comment": str((item or {}).get("comment") or ""),
+                        # Bug fix: items store their comment under the key
+                        # "item_comment" (confirmed against live order data),
+                        # not "comment" — this was always reading nothing.
+                        "item_comment": str((item or {}).get("item_comment") or ""),
                         "qty": qty,
                         "amount": computed_amount,
                         "amount_ccy": purchase_ccy,
@@ -7267,6 +7293,15 @@ class CostPriceView:
                 self.db.get_reference_data_pulse, self.company_id
             )
             if ref_pulse > self._ref_data_pulse_ts:
+                pg = self._page()
+                if getattr(pg, "_active_view", "") != "show_cost_price_orders":
+                    # Leave _ref_data_pulse_ts stale so this same check
+                    # redoes the work once resume() calls it while this tab
+                    # is actually the one on screen — a full _load() +
+                    # row-rebuild blocks the single shared event loop for
+                    # its duration, freezing every OTHER open tab's UI too
+                    # if run for a tab nobody is looking at right now.
+                    return
                 await asyncio.to_thread(self._load)
                 self._ref_data_pulse_ts = ref_pulse
                 self._schedule_render(0.0, rebuild_rows=True)
@@ -9113,11 +9148,19 @@ class CostPriceView:
         if rerender:
             if success_text:
                 self._snack(success_text, _SKY)
-            # CV fields: try instant in-place update first; fall back to full rebuild
+            # CV fields: try instant in-place update first; fall back to full rebuild.
+            # Every input _recalc_order_cv actually reads must be listed here —
+            # qty/amount/full_amount/purchase_price were missing, so editing
+            # "К-сть" or "Вартість" silently left С/В showing its old value
+            # until the next full reload (confirmed live).
             _cv_fields = {
                 "cp_logistics_fact_total",
                 "delivery_price_snapshot",
                 "weight_actual_kg",
+                "qty",
+                "amount",
+                "full_amount",
+                "purchase_price",
             }
             _changed_cv = bool(
                 (isinstance(order_patch, dict) and _cv_fields & set(order_patch.keys()))
@@ -10382,11 +10425,13 @@ class CostPriceView:
                 if not self._workspace_sync_loop_started:
                     self._workspace_sync_loop_started = True
                     with contextlib.suppress(Exception):
+                        # Autosave/outbox-flush loop (pushes THIS manager's
+                        # own pending local edits to the DB every 45s) —
+                        # unrelated to cross-user polling, kept running.
                         page.run_task(self._workspace_sync_loop)
-                if not getattr(self, "_bg_sync_loop_started", False):
-                    self._bg_sync_loop_started = True
-                    with contextlib.suppress(Exception):
-                        page.run_task(self._bg_sync_loop)
+                # _bg_sync_loop removed — it polled for changes made by
+                # ANOTHER device/session, which can't happen anymore (1
+                # менеджер = 1 категорія). Fresh data now only via Ctrl+F5.
                 return
             except Exception:
                 pass

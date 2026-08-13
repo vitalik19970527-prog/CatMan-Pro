@@ -223,8 +223,17 @@ def clean_name_final(name, keep_year=False):
     for old, new in replacements.items():
         name = name.replace(old, new)
 
-    # Уніфікуємо міліметри
-    name = re.sub(r"(\d{2})\s?(mm|мм)", r"\1mm", name)
+    # ВИДАЛЯЄМО РОЗМІР КОРПУСУ ГОДИННИКА (мм) — це те саме, що об'єм пам'яті
+    # для телефону: просто варіант однієї й тієї ж моделі (40mm/44mm/47mm
+    # Watch — одна карта), а не окрема модель. Раніше рядок нижче лише
+    # уніфіковував запис ("40 mm"/"40мм" -> "40mm"), не видаляючи токен —
+    # він лишався в site_words з цифрою всередині, і правило anti-false-
+    # positive в _ek_name_matches (crash guard проти "сайт додає зайвий
+    # номер моделі") сприймало "40mm" як НОВЕ покоління й відхиляло
+    # збіг — Galaxy Watch9/Watch8/Watch7/Watch6 Classic з розміром у назві
+    # ніколи не матчились із уже відстеженим GSM Arena пристроєм і щоразу
+    # додавались як дублікат "новий без GSM".
+    name = re.sub(r"\d{2}\s?(mm|мм)\b", " ", name)
 
     # --- ДОДАНО: РОЗДІЛЯЄМО ЗЛИТІ БУКВИ ТА ЦИФРИ (Pad60 -> Pad 60) ---
     # Змінено на розумне розділення (3+ букви), щоб не чіпати F56
@@ -248,6 +257,15 @@ def clean_name_final(name, keep_year=False):
     # що й голий "2022": розкриваємо дужки в голий токен ДО видалення тексту
     # в дужках нижче, інакше keep_year=True не захищає рік у цьому випадку.
     name = re.sub(r"\((20\d{2})\)", r" \1 ", name)
+
+    # "(China)" рятуємо так само, як рік вище — це не маркетинговий шум у
+    # дужках (кольори тощо), а окрема регіональна версія пристрою, яку в нас
+    # на ринку не продають. Без цього рятування generic-видалення тексту в
+    # дужках нижче стирало "china" повністю, і China-версія з GSM Arena
+    # починала збігатись з тим самим E-Katalog оголошенням, що й звичайна —
+    # обидві версії підтягували одні й ті самі дані ЄК.
+    if re.search(r"\bchina\b", name):
+        name = re.sub(r"\bchina\b", " ", name) + " china"
 
     # ВИДАЛЯЄМО РОКИ (тільки якщо keep_year=False)
     if not keep_year:
@@ -336,11 +354,38 @@ def parse_ekatalog_item(url, target_net, dev_type, skip_net_check=False):
             try:
                 res = EK_HTTP.get(table_url, timeout=35, max_retries=3, referer=url)
 
-                # Перевірка на технічні роботи
-                if (
-                    "Сайт на обслуговуванні" in res.text
-                    or "Технічні роботи" in res.text
-                ):
+                # Перевірка на технічні роботи/блокування — a bad page (site
+                # maintenance, CDN/anti-bot block page, error page) must
+                # NEVER be treated as a valid product page. This check used
+                # to only catch E-Katalog's own Ukrainian maintenance text —
+                # an English "Under Maintenance" page (served by the
+                # host/CDN layer, not the site itself) slipped straight
+                # through to the normal parsing path below, which grabbed
+                # the bad page's own <h1>/data-txt-title as if it were the
+                # real product name — confirmed live, corrupted 478 already-
+                # tracked devices' names/history in one run before this was
+                # caught. Broadened to a general blocklist (not just this
+                # one phrase) so the SAME class of bug can't recur under a
+                # different page signature — on ANY match: retry, and if
+                # every retry still sees it, parse_ekatalog_item returns
+                # None (see bottom of function) — callers already treat
+                # None as "skip this item", never as "clear the existing
+                # name/data". A blocked/broken fetch must always be a
+                # no-op, never an overwrite.
+                _bad_page_markers = (
+                    "сайт на обслуговуванні",
+                    "технічні роботи",
+                    "under maintenance",
+                    "access denied",
+                    "403 forbidden",
+                    "attention required",  # Cloudflare block/challenge page
+                    "just a moment",  # Cloudflare "checking your browser"
+                    "service unavailable",
+                    "502 bad gateway",
+                    "503 service",
+                )
+                _res_text_lower = res.text.lower()
+                if any(marker in _res_text_lower for marker in _bad_page_markers):
                     instant_print(
                         f"      ⏳ Спроба {attempt+1}: Сайт на обслуговуванні. Пауза {retry_delay}с..."
                     )
@@ -750,6 +795,23 @@ def parse_ekatalog_item(url, target_net, dev_type, skip_net_check=False):
                 name = (
                     soup.find("h1").get_text(" ", strip=True) if soup.find("h1") else ""
                 )
+
+            # Hard guard, independent of the page-level check above: the
+            # extracted "product name" itself must never BE one of the known
+            # bad-page titles, whatever produced it. This is the second of
+            # two layers on purpose — the check above can only catch phrases
+            # already in _bad_page_markers; if a differently-worded bad page
+            # (a new CDN provider, a translated error page, etc.) slips past
+            # it, this still refuses to hand back a name that IS the error
+            # itself, forcing a retry/None instead of silently overwriting
+            # an existing device's real name.
+            if name.strip().lower() in _bad_page_markers:
+                instant_print(
+                    f"      ⏳ Спроба {attempt+1}: назва товару виявилась текстом"
+                    f" помилки сторінки ({name!r}). Пауза {retry_delay}с..."
+                )
+                time.sleep(retry_delay)
+                continue
 
             dims_raw = get_val_by_label("Розміри")
             length, w, t, dims_standard = "", "", "", ""

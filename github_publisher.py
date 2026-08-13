@@ -23,14 +23,14 @@ API_BASE = "https://api.github.com"
 API_VERSION = "2022-11-28"
 
 
-def load_publish_config() -> dict:
-    if not os.path.exists(CONFIG_PATH):
+def load_publish_config(config_path: str = CONFIG_PATH) -> dict:
+    if not os.path.exists(config_path):
         return {}
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             return json.load(f) or {}
     except Exception:
-        logger.exception("Failed to read %s", CONFIG_PATH)
+        logger.exception("Failed to read %s", config_path)
         return {}
 
 
@@ -46,8 +46,13 @@ def save_publish_config(cfg: dict) -> bool:
 
 
 class GitHubPublisher:
-    def __init__(self):
-        cfg = load_publish_config()
+    def __init__(self, config_path: str = CONFIG_PATH, config: dict | None = None):
+        # `config`, when given, skips file I/O entirely — for credentials
+        # sourced from the DB (see DataManager.get_calculator_web_github_config),
+        # which is the only reliable place to read them from inside a built
+        # exe: a local secrets/*.json file only exists in the dev checkout,
+        # never inside a packaged PyInstaller build.
+        cfg = config if config is not None else load_publish_config(config_path)
         self.token = (cfg.get("token") or "").strip()
         self.owner = (cfg.get("owner") or "").strip()
         self.repo = (cfg.get("repo") or "").strip()
@@ -234,11 +239,21 @@ class GitHubPublisher:
         return None
 
     def create_draft_release(
-        self, tag: str, name: str, body: str = ""
+        self, tag: str, name: str, body: str = "", prerelease: bool = False
     ) -> tuple[dict | None, str]:
         """Creates a draft release, auto-retrying with -1, -2, ... suffixes if
         the tag was burned by a previous immutable (published) release — see
-        the documented GitHub "immutable releases" gotcha. Returns (release, error)."""
+        the documented GitHub "immutable releases" gotcha. Returns (release, error).
+
+        prerelease=True keeps this release out of GitHub's own "latest"
+        resolution (which only ever considers non-draft, non-prerelease
+        releases) — needed because this repo hosts releases for more than
+        one app (CatMan Pro and the standalone calculator); without this,
+        whichever app published most recently silently becomes "latest"
+        for BOTH, breaking the other app's releases/latest/download/...
+        auto-update URL. Only CatMan Pro's own releases should ever claim
+        "latest" — everything else (calculator, etc.) must pass
+        prerelease=True and be referenced by callers via a pinned tag URL."""
         base_tag = tag
         for attempt in range(10):
             candidate_tag = base_tag if attempt == 0 else f"{base_tag}-{attempt}"
@@ -252,7 +267,7 @@ class GitHubPublisher:
                         "name": name,
                         "body": body,
                         "draft": True,
-                        "prerelease": False,
+                        "prerelease": prerelease,
                     },
                     timeout=30,
                 )
@@ -341,10 +356,13 @@ class GitHubPublisher:
         name: str,
         assets: list[tuple[str, str]],
         body: str = "",
+        prerelease: bool = False,
     ) -> tuple[bool, str]:
         """High-level helper: draft -> upload all assets -> publish.
-        assets is a list of (local_file_path, asset_name)."""
-        release, err = self.create_draft_release(tag, name, body)
+        assets is a list of (local_file_path, asset_name). See
+        create_draft_release's docstring for why prerelease matters in
+        this multi-app repo."""
+        release, err = self.create_draft_release(tag, name, body, prerelease=prerelease)
         if not release:
             return False, err
 
@@ -354,3 +372,74 @@ class GitHubPublisher:
                 return False, err
 
         return self.publish_release(release["id"])
+
+    def list_releases(self) -> tuple[list[dict], str]:
+        """All releases (any tag/app) in this repo, newest first — used by
+        the cleanup step to find every OLDER release for a given app prefix
+        before/after publishing a new one, so only the latest of each app
+        stays on GitHub."""
+        if not self.configured:
+            return [], "GitHub публікація не налаштована (немає токена/repo)"
+        releases: list[dict] = []
+        page = 1
+        try:
+            while True:
+                resp = requests.get(
+                    self._repo_url("/releases"),
+                    headers=self._headers(),
+                    params={"per_page": 100, "page": page},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                batch = resp.json()
+                if not isinstance(batch, list) or not batch:
+                    break
+                releases.extend(batch)
+                if len(batch) < 100:
+                    break
+                page += 1
+        except requests.RequestException as e:
+            return [], f"Мережева помилка списку релізів: {e}"
+        return releases, ""
+
+    def delete_release_and_tag(self, tag: str) -> tuple[bool, str]:
+        """Deletes the release object for `tag` (if any) and the tag ref
+        itself (release deletion alone leaves the git tag behind). Used to
+        clean up superseded versions so only the newest build of each app
+        (Pro/SupAdm/Calculator/GSM Parser) occupies a release slot on
+        GitHub. Safe to call on a tag that's already gone — both steps
+        treat 404 as success."""
+        if not self.configured:
+            return False, "GitHub публікація не налаштована (немає токена/repo)"
+
+        try:
+            release = self._find_release_by_tag(tag)
+        except requests.RequestException as e:
+            return False, f"Не вдалося перевірити реліз '{tag}': {e}"
+
+        if release:
+            try:
+                resp = requests.delete(
+                    self._repo_url(f"/releases/{release['id']}"),
+                    headers=self._headers(),
+                    timeout=30,
+                )
+            except requests.RequestException as e:
+                return False, f"Мережева помилка видалення релізу '{tag}': {e}"
+            if resp.status_code not in (204, 404):
+                return False, f"GitHub {resp.status_code} під час видалення релізу '{tag}': {resp.text[:300]}"
+
+        try:
+            resp = requests.delete(
+                self._repo_url(f"/git/refs/tags/{tag}"),
+                headers=self._headers(),
+                timeout=30,
+            )
+        except requests.RequestException as e:
+            return False, f"Мережева помилка видалення тега '{tag}': {e}"
+        if resp.status_code not in (204, 404, 422):
+            # 422 = "Reference does not exist" on some GitHub API versions —
+            # treated as already-gone, same as 404.
+            return False, f"GitHub {resp.status_code} під час видалення тега '{tag}': {resp.text[:300]}"
+
+        return True, ""

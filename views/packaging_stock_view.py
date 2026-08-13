@@ -340,7 +340,6 @@ class PackagingStockView:
         # dropped instead of retried indefinitely.
         self._ops_outbox_fail_counts: dict[str, int] = {}
         self._ops_outbox_running = False
-        self._ops_sync_loop_started = False
         self._ref_data_pulse_ts: int = 0
         # Guards _async_initial_load against overlapping runs: the pulse-check
         # (every 20s from _bg_sync_loop, and again on every resume()) schedules
@@ -1058,16 +1057,6 @@ class PackagingStockView:
         self._save_pack_outbox()
         self._refresh_pack_sync_status()
 
-    async def _ops_sync_loop(self) -> None:
-        while True:
-            await asyncio.sleep(45)
-            page = self._page()
-            if not page:
-                continue
-            if self._ops_outbox:
-                with contextlib.suppress(Exception):
-                    await self._flush_pack_outbox_async()
-
     # ── page helpers ───────────────────────────────────────────────────────
     def _page(self):
         if not self.content_area:
@@ -1725,8 +1714,8 @@ class PackagingStockView:
 
         picker = ft.DatePicker(
             value=initial_d,
-            first_date=date(2018, 1, 1),
-            last_date=date(2100, 12, 31),
+            first_date=date(2020, 1, 1),
+            last_date=date(2035, 12, 31),
             entry_mode=ft.DatePickerEntryMode.CALENDAR_ONLY,
             date_picker_mode=ft.DatePickerMode.DAY,
             locale=ft.Locale("uk", "UA"),
@@ -1779,8 +1768,8 @@ class PackagingStockView:
 
         picker = ft.DatePicker(
             value=initial_d,
-            first_date=date(2018, 1, 1),
-            last_date=date(2100, 12, 31),
+            first_date=date(2020, 1, 1),
+            last_date=date(2035, 12, 31),
             entry_mode=ft.DatePickerEntryMode.CALENDAR_ONLY,
             date_picker_mode=ft.DatePickerMode.DAY,
             locale=ft.Locale("uk", "UA"),
@@ -2615,8 +2604,11 @@ class PackagingStockView:
         if not cur:
             with contextlib.suppress(Exception):
                 cur = dict(self.db.get_packaging_supply_opening(cid) or {})
-        if not cur:
-            return
+        # No opening row exists yet for this context (brand-new packaging item) —
+        # previously this silently dropped the edit (`return` with cur={}), so the
+        # very first value a user typed into "Відправлено"/"Сплачено" was discarded
+        # and only appeared to "take" on the second attempt, once a row existed.
+        # Proceed with sane zero defaults so the first edit actually creates the row.
         pk = float(cur.get("stock_packaging_supplier_qty") or 0)
         rg = float(cur.get("stock_goods_supplier_qty") or 0)
         bg = float(cur.get("balance_amount") or 0)
@@ -2729,47 +2721,73 @@ class PackagingStockView:
 
     def _load_orders_and_opening_from_db(self) -> None:
         """Load supply orders + opening balances from DB for all known contexts.
-        Called on full refresh; skipped when local file cache is still fresh."""
+        Called on full refresh; skipped when local file cache is still fresh.
+
+        Batched: was 3 DB round-trips PER context (hundreds of contexts per
+        tab open — the single biggest cause of the multi-minute freeze on
+        this tab), now exactly 3 total round-trips regardless of context
+        count."""
+        _ctx_ids = [
+            str((_ctx or {}).get("id") or "").strip()
+            for _ctx in self._packaging_items
+            if str((_ctx or {}).get("id") or "").strip()
+        ]
+
+        try:
+            _orders_bulk = self.db.list_packaging_supply_orders_bulk(_ctx_ids)
+        except Exception:
+            _orders_bulk = {}
+        try:
+            _opening_bulk = self.db.get_packaging_supply_openings_bulk(_ctx_ids)
+        except Exception:
+            _opening_bulk = {}
+
         new_cache: dict[str, list[dict]] = {}
         new_opening_cache: dict[str, dict] = {}
-        for _ctx in self._packaging_items:
-            _cid = str((_ctx or {}).get("id") or "").strip()
-            if not _cid:
-                continue
-            try:
-                _orders = self.db.list_packaging_supply_orders(_cid) or []
-                new_cache[_cid] = [dict(o) for o in _orders if isinstance(o, dict)]
-            except Exception:
+        for _cid in _ctx_ids:
+            if _cid in _orders_bulk:
+                new_cache[_cid] = [
+                    dict(o) for o in (_orders_bulk.get(_cid) or []) if isinstance(o, dict)
+                ]
+            else:
                 new_cache[_cid] = list(self._local_orders_cache.get(_cid) or [])
-            try:
-                _opening = self.db.get_packaging_supply_opening(_cid) or {}
+            if _cid in _opening_bulk:
+                _opening = _opening_bulk.get(_cid) or {}
                 new_opening_cache[_cid] = (
                     dict(_opening) if isinstance(_opening, dict) else {}
                 )
-            except Exception:
+            else:
                 new_opening_cache[_cid] = dict(
                     self._local_opening_cache.get(_cid) or {}
                 )
         self._local_orders_cache = new_cache
         self._local_opening_cache = new_opening_cache
 
-        # Load write-offs from DB for all contexts
+        # Load write-offs from DB for all contexts (one batched query).
         new_writeoff_cache: dict[str, list[dict]] = {}
         _pending_keys = set(self._ops_outbox.keys())
+        _ctx_region_pairs = [
+            (
+                str((_ctx or {}).get("id") or "").strip(),
+                str((_ctx or {}).get("region_id") or "").strip(),
+            )
+            for _ctx in self._packaging_items
+            if str((_ctx or {}).get("id") or "").strip()
+        ]
+        try:
+            _writeoffs_bulk = self.db.get_packaging_writeoffs_bulk(
+                _ctx_region_pairs, manager_id=self.manager_id
+            )
+        except Exception:
+            _writeoffs_bulk = {}
         for _ctx in self._packaging_items:
             _cid = str((_ctx or {}).get("id") or "").strip()
             if not _cid:
                 continue
-            _rid_ctx = str((_ctx or {}).get("region_id") or "").strip()
             _wo_rows: list[dict] = []
             _db_ids: set[str] = set()
             with contextlib.suppress(Exception):
-                _raw = (
-                    self.db.get_packaging_writeoffs(
-                        _cid, manager_id=self.manager_id, region_id=_rid_ctx
-                    )
-                    or []
-                )
+                _raw = _writeoffs_bulk.get(_cid) or []
                 _del_pend2 = self._local_writeoff_delete_pending
                 for _r in _raw:
                     if isinstance(_r, dict):
@@ -3229,6 +3247,20 @@ class PackagingStockView:
             # 1. Always load metadata (suppliers, products, packaging, contexts) from DB.
             await _aio.to_thread(self._load_packaging_metadata)
 
+            # Capture the reference-data pulse AFTER loading, same spot
+            # orders_view.py's initial load does it — _bg_pack_ref_data_check
+            # compares against this on every resume() and every ~20s tick,
+            # and _ref_data_pulse_ts was never actually assigned anywhere in
+            # this load path (only in the unused _load_packaging_data), so
+            # it stayed at its __init__ value of 0 forever. Any real pulse
+            # is > 0, so that check always saw "newer" data and re-triggered
+            # a full reload in an endless loop — this is what looked like
+            # the page constantly resetting/reloading itself.
+            with contextlib.suppress(Exception):
+                self._ref_data_pulse_ts = await _aio.to_thread(
+                    self.db.get_reference_data_pulse, self.company_id
+                )
+
             # 2. Load whatever is in the file cache (may be empty / stale).
             await _aio.to_thread(self._load_pack_orders_cache)
 
@@ -3426,7 +3458,14 @@ class PackagingStockView:
                 self._refresh_pack_ctx_inplace(_cid)
 
     async def _bg_sync_loop(self) -> None:
-        _last_pulse_check = 0.0
+        # DB pulse polling removed (_bg_pack_ref_data_check /
+        # _bg_pack_orders_pulse_check) — this was the mechanism that kept
+        # re-triggering a FULL _async_initial_load() (DDL + N+1 heavy) every
+        # 20s while the tab stayed open, causing the repeated multi-minute
+        # freezes. Not needed anymore: 1 менеджер = 1 категорія means no
+        # other device/session can change this manager's data; Ctrl+F5
+        # covers the manual case explicitly. The cheap in-memory
+        # __sync_seq__ check stays (no DB call, just a local dict read).
         while True:
             try:
                 await asyncio.sleep(1.5)
@@ -3434,14 +3473,6 @@ class PackagingStockView:
                 if seq != getattr(self, "_bg_sync_seq", 0):
                     self._bg_sync_seq = seq
                     self._bg_apply_sync()
-                # Periodically poll DB pulses for changes made from another
-                # device/session, even while this tab stays open the whole
-                # time (not just when the user switches away and back).
-                _now = time.monotonic()
-                if self._pack_ui_ready and (_now - _last_pulse_check) >= 20.0:
-                    _last_pulse_check = _now
-                    await self._bg_pack_ref_data_check()
-                    await self._bg_pack_orders_pulse_check()
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -3512,7 +3543,15 @@ class PackagingStockView:
             )
             if new_pulse > int(getattr(self, "_ref_data_pulse_ts", 0) or 0):
                 _pg2 = self._page()
-                if _pg2 and hasattr(_pg2, "run_task"):
+                if not _pg2 or getattr(_pg2, "_active_view", None) != "show_pack_stock":
+                    # Leave _ref_data_pulse_ts stale — don't run a full
+                    # _async_initial_load (DB fetch + synchronous full-tree
+                    # render) for a tab nobody is looking at right now; it
+                    # blocks the single shared event loop for every OTHER
+                    # open tab too. resume() re-runs this same check once
+                    # the user actually switches back to Packaging Stock.
+                    return
+                if hasattr(_pg2, "run_task"):
                     with contextlib.suppress(Exception):
                         _pg2.run_task(self._async_initial_load)
         except Exception:
@@ -3533,6 +3572,13 @@ class PackagingStockView:
         try:
             new_pulse = await asyncio.to_thread(self._pack_scope_pulse)
             if new_pulse <= int(getattr(self, "_pack_cache_pulse_ts", 0) or 0):
+                return
+            _pg3 = self._page()
+            if not _pg3 or getattr(_pg3, "_active_view", None) != "show_pack_stock":
+                # Leave _pack_cache_pulse_ts stale so this same check redoes
+                # the (per-context N+1) sync + full render once resume()
+                # calls it for real, instead of paying that cost — and
+                # blocking the shared event loop — for a backgrounded tab.
                 return
             changed = await asyncio.to_thread(self._incremental_sync_from_db)
             await asyncio.to_thread(self._save_pack_orders_cache, new_pulse)
@@ -3992,8 +4038,17 @@ class PackagingStockView:
             wrapper.content = new_section
             pg = self._page()
             if pg:
-                with contextlib.suppress(Exception):
+                try:
                     wrapper.update()
+                except Exception:
+                    logger.warning(
+                        "pack_stock: wrapper.update() failed ctx=%s, falling back to page.update()",
+                        ctx_id,
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        pg.update()
+            logger.info("pack_stock: _refresh_pack_ctx_inplace OK ctx=%s", ctx_id)
             return True
         except Exception:
             logger.exception("pack_stock _refresh_pack_ctx_inplace ctx=%s", ctx_id)
@@ -4765,10 +4820,6 @@ class PackagingStockView:
             with contextlib.suppress(Exception):
                 self._initial_load_task = pg.run_task(self._async_initial_load)
             self._start_auto_refresh_loop(pg)
-            if not self._ops_sync_loop_started:
-                self._ops_sync_loop_started = True
-                with contextlib.suppress(Exception):
-                    pg.run_task(self._ops_sync_loop)
             try:
                 self._attach_resize_handler()
             except Exception:
@@ -7153,16 +7204,49 @@ class PackagingStockView:
             return
 
         def _do_delete(_):
-            self.db.delete_packaging_supply_order(oid0)
-            # Clean any pending outbox patch for this order so flush doesn't
-            # try to update the now-deleted row and stay in "Не збережено" state.
+            # Close + remove from UI immediately (optimistic) — the actual
+            # DB call used to run synchronously right here on the UI thread,
+            # blocking the whole app for the length of the network
+            # round-trip to the remote Postgres server on every delete.
+            self._close_dlg(dlg)
+            ctx_id = self._pack_order_ctx_map.get(oid0)
+            if ctx_id:
+                cached = self._local_orders_cache.get(ctx_id)
+                if isinstance(cached, list):
+                    self._local_orders_cache[ctx_id] = [
+                        r for r in cached
+                        if str((r or {}).get("id") or "").strip() != oid0
+                    ]
             outbox_key = f"order:{oid0}"
             if outbox_key in self._ops_outbox:
                 self._ops_outbox.pop(outbox_key, None)
                 with contextlib.suppress(Exception):
                     self._save_pack_outbox()
-            self._close_dlg(dlg)
-            self.reload()
+            if not (ctx_id and self._refresh_pack_ctx_inplace(ctx_id)):
+                self._render_tree(force_full=True)
+
+            page_ref = self._page()
+
+            async def _delete_in_bg():
+                try:
+                    await asyncio.to_thread(
+                        self.db.delete_packaging_supply_order, oid0
+                    )
+                except Exception:
+                    logger.exception(
+                        "pack_stock: delete_packaging_supply_order failed oid=%s",
+                        oid0,
+                    )
+                    # DB delete failed — reload for real to restore the row
+                    # instead of leaving the UI showing it as gone.
+                    with contextlib.suppress(Exception):
+                        self.reload()
+
+            if page_ref and hasattr(page_ref, "run_task"):
+                page_ref.run_task(_delete_in_bg)
+            else:
+                with contextlib.suppress(Exception):
+                    self.db.delete_packaging_supply_order(oid0)
 
         dlg = ft.AlertDialog(
             title=self._text_wrap(
@@ -7605,8 +7689,8 @@ class PackagingStockView:
 
             picker = ft.DatePicker(
                 value=initial_d,
-                first_date=date(2018, 1, 1),
-                last_date=date(2100, 12, 31),
+                first_date=date(2020, 1, 1),
+                last_date=date(2035, 12, 31),
                 entry_mode=ft.DatePickerEntryMode.CALENDAR_ONLY,
                 date_picker_mode=ft.DatePickerMode.DAY,
                 locale=ft.Locale("uk", "UA"),
@@ -7626,26 +7710,20 @@ class PackagingStockView:
                         date_f.value = _datepicker_value_to_iso_date(raw)
                     except Exception:
                         date_f.value = str(raw)[:10]
+                # Close via the proper Page API (matches the fast calendars
+                # elsewhere in this file) instead of manually poking
+                # page.overlay + control.update() — that manual dance is what
+                # made this specific calendar open/close slowly.
                 try:
-                    date_f.update()
-                    dlg.update()
-                except Exception:
-                    pass
-                try:
-                    picker.open = False
-                    picker.update()
+                    page.close_dialog()
                 except Exception:
                     pass
                 with contextlib.suppress(Exception):
-                    if picker in (page.overlay or []):
-                        page.overlay.remove(picker)
-                        page.update()
+                    date_f.update()
+                    dlg.update()
 
             picker.on_change = _picked_supply_cal
-            page.overlay.append(picker)
-            picker.open = True
-            with contextlib.suppress(Exception):
-                picker.update()
+            page.show_dialog(picker)
 
         date_f.on_click = _open_supply_material_calendar
         calendar_btn.on_click = _open_supply_material_calendar
@@ -8120,8 +8198,8 @@ class PackagingStockView:
 
             picker = ft.DatePicker(
                 value=initial_d,
-                first_date=date(2018, 1, 1),
-                last_date=date(2100, 12, 31),
+                first_date=date(2020, 1, 1),
+                last_date=date(2035, 12, 31),
                 entry_mode=ft.DatePickerEntryMode.CALENDAR_ONLY,
                 date_picker_mode=ft.DatePickerMode.DAY,
                 locale=ft.Locale("uk", "UA"),
@@ -8141,26 +8219,19 @@ class PackagingStockView:
                         date_f.value = _datepicker_value_to_iso_date(raw)
                     except Exception:
                         date_f.value = str(raw)[:10]
+                # Proper Page API (see matching comment on
+                # _open_supply_material_calendar) instead of the slow manual
+                # page.overlay + control.update() dance.
                 try:
-                    date_f.update()
-                    dlg.update()
-                except Exception:
-                    pass
-                try:
-                    picker.open = False
-                    picker.update()
+                    page.close_dialog()
                 except Exception:
                     pass
                 with contextlib.suppress(Exception):
-                    if picker in (page.overlay or []):
-                        page.overlay.remove(picker)
-                        page.update()
+                    date_f.update()
+                    dlg.update()
 
             picker.on_change = _picked
-            page.overlay.append(picker)
-            picker.open = True
-            with contextlib.suppress(Exception):
-                picker.update()
+            page.show_dialog(picker)
 
         date_f.on_click = _open_writeoff_calendar
         calendar_btn.on_click = _open_writeoff_calendar

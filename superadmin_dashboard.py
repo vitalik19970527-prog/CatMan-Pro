@@ -20,6 +20,7 @@ from views import themes as _themes
 from views.copy_setup_view import CopySetupView
 from views.extensions_view import ExtensionsView
 from views.languages_view import LanguagesView
+from views.notebook_view import get_notebook_badge_counts, open_notebook_modal
 from views.web_site_view import WebSiteView
 
 try:
@@ -1258,6 +1259,7 @@ class SuperAdminDashboard:
                     height=button_h,
                     style=ft.ButtonStyle(color=_th_text),
                 ),
+                self._make_notebook_toolbar_btn(_th_text, button_h),
                 self._build_sa_lang_switcher_box(_sa_mgr_id, _active_sa_theme.get("chip_bg")),
                 ft.OutlinedButton(
                     self.t("nav.logout_short", "Вийти"),
@@ -1372,9 +1374,13 @@ class SuperAdminDashboard:
             )
         )
         if not self._sync_poll_started:
+            # Background cross-client polling removed — see matching comment
+            # in dashboard.py/admin_dashboard.py. Ctrl+F5 (_handle_ctrl_f5)
+            # is now the only manual "pull fresh data from DB" path.
             self._sync_last_pulses = self._load_sync_snapshot()
             self._sync_poll_started = True
-            self.page.run_task(self._sync_poll_loop)
+        with contextlib.suppress(Exception):
+            self.page.on_keyboard_event = self._on_keyboard_event
         # gsm_local_tg_flush_loop no longer started — the server-side
         # daemon (gsm_parser_scheduler.py's run_daemon, running
         # independently of any laptop being open) already flushes the
@@ -1391,6 +1397,35 @@ class SuperAdminDashboard:
             setattr(self.page, "_refresh_background_now", self._refresh_background_now)
         except Exception:
             pass
+
+    def _on_keyboard_event(self, e: ft.KeyboardEvent) -> None:
+        try:
+            if e.ctrl and str(e.key or "").strip() == "F5":
+                self.page.run_task(self._handle_ctrl_f5)
+        except Exception:
+            pass
+
+    async def _handle_ctrl_f5(self) -> None:
+        def _snack(text: str, color: str = "#1D4ED8") -> None:
+            with contextlib.suppress(Exception):
+                self.page.snack_bar = ft.SnackBar(
+                    content=ft.Text(text, color="#FFFFFF", weight="bold"),
+                    bgcolor=color,
+                    duration=2500,
+                )
+                self.page.snack_bar.open = True
+                self.page.update()
+
+        _snack("Перевірка оновлень з БД…")
+        company_ids = self._sync_company_ids()
+        all_scopes = self._sync_scopes()
+        for cid in company_ids:
+            for scope in all_scopes:
+                with contextlib.suppress(Exception):
+                    self.db.invalidate_scope_cache(cid, scope)
+        with contextlib.suppress(Exception):
+            self._show_current_tab()
+        _snack("Дані оновлено з БД.", "#15803D")
 
     def _show_current_tab(self):
         if self.current_tab == "approvals":
@@ -1524,6 +1559,74 @@ class SuperAdminDashboard:
         except Exception:
             logger.exception("Impersonation open failed")
             self._show_snack("Не вдалося відкрити режим користувача", "red")
+
+    def _open_notebook(self, _=None) -> None:
+        # Superadmin isn't scoped to one company — this is a pure personal
+        # task diary, not tied to any customer's data (see open_notebook_
+        # modal's company_id param: only used for the optional order-
+        # schedule sync, which naturally just no-ops without one —
+        # superadmin has no Розклад Замовлень of their own anyway).
+        open_notebook_modal(
+            self.page, self.db,
+            manager_id=str(self.user_data.get("id") or ""),
+            on_close=self._refresh_notebook_badge,
+        )
+
+    def _make_notebook_toolbar_btn(self, th_text, btn_h) -> ft.Stack:
+        btn = ft.OutlinedButton(
+            "",
+            icon=ft.Icons.MENU_BOOK,
+            icon_color=th_text,
+            tooltip=self.t("nav.notebook_tooltip", "Блокнот"),
+            on_click=self._open_notebook,
+            height=btn_h,
+            style=ft.ButtonStyle(color=th_text),
+        )
+        today_n, overdue_n = get_notebook_badge_counts(
+            self.db, str(self.user_data.get("id") or "")
+        )
+        today_badge = ft.Container(
+            content=ft.Text(
+                str(today_n) if today_n else "",
+                size=8, color="#000000", weight=ft.FontWeight.W_700,
+                text_align=ft.TextAlign.CENTER,
+            ),
+            bgcolor="#FFD600", border_radius=8, height=16,
+            padding=ft.padding.symmetric(horizontal=3),
+            alignment=ft.alignment.Alignment(0, 0),
+            top=-6, right=-6, visible=today_n > 0,
+        )
+        overdue_badge = ft.Container(
+            content=ft.Text(
+                str(overdue_n) if overdue_n else "",
+                size=8, color="#FFFFFF", weight=ft.FontWeight.W_700,
+                text_align=ft.TextAlign.CENTER,
+            ),
+            bgcolor="#E53935", border_radius=8, height=16,
+            padding=ft.padding.symmetric(horizontal=3),
+            alignment=ft.alignment.Alignment(0, 0),
+            bottom=-6, right=-6, visible=overdue_n > 0,
+        )
+        self._notebook_badge_today_cont = today_badge
+        self._notebook_badge_overdue_cont = overdue_badge
+        return ft.Stack([btn, today_badge, overdue_badge])
+
+    def _refresh_notebook_badge(self) -> None:
+        if getattr(self, "_notebook_badge_today_cont", None) is None:
+            return
+        today_n, overdue_n = get_notebook_badge_counts(
+            self.db, str(self.user_data.get("id") or "")
+        )
+        tc = self._notebook_badge_today_cont
+        oc = self._notebook_badge_overdue_cont
+        tc.content.value = str(today_n) if today_n else ""
+        tc.visible = today_n > 0
+        oc.content.value = str(overdue_n) if overdue_n else ""
+        oc.visible = overdue_n > 0
+        with contextlib.suppress(Exception):
+            tc.update()
+        with contextlib.suppress(Exception):
+            oc.update()
 
     def show_overview(self, e):
         self.current_tab = "overview"
@@ -2533,19 +2636,19 @@ class SuperAdminDashboard:
                     self.page.update()
                     return
 
-                    if self.db.manager_contact_exists(
-                        company_f.value,
-                        (email_f.value or "").strip(),
-                        (phone_f.value or "").strip(),
-                        exclude_manager_id=manager_id,
-                    ):
-                        self._mark_required(email_f, "Email або телефон вже існує")
-                        self._mark_required(phone_f, "Email або телефон вже існує")
-                        self._show_snack(
-                            "Користувач з таким email або телефоном вже існує", "orange"
-                        )
-                        self.page.update()
-                        return
+                if self.db.manager_contact_exists(
+                    company_f.value,
+                    (email_f.value or "").strip(),
+                    (phone_f.value or "").strip(),
+                    exclude_manager_id=manager_id,
+                ):
+                    self._mark_required(email_f, "Email або телефон вже існує")
+                    self._mark_required(phone_f, "Email або телефон вже існує")
+                    self._show_snack(
+                        "Користувач з таким email або телефоном вже існує", "orange"
+                    )
+                    self.page.update()
+                    return
 
                 payload = {
                     "company_id": (
@@ -4818,25 +4921,188 @@ class SuperAdminDashboard:
             value=update_policy.get("download_url", "")
             or (Config.UPDATE_DOWNLOAD_URL or ""),
         )
-        update_url_android_f = ft.TextField(
-            label="Посилання на оновлення Android (.apk)",
-            hint_text="https://github.com/<owner>/<repo>/releases/latest/download/CatManPro-android.apk",
-            border_radius=10,
-            value=update_policy.get("download_url_android", ""),
-        )
+        # Android APK field intentionally not shown right now — only .exe
+        # builds are being produced for the 4 apps at the moment. Any
+        # previously-saved download_url_android is preserved as-is below
+        # (set_app_update_policy replaces the whole policy record, so it
+        # must be passed through unchanged rather than silently dropped).
+        _existing_android_url = str(update_policy.get("download_url_android") or "")
 
         def save_updates(_):
             ok = self.db.set_app_update_policy(
                 {
                     "min_required": (min_version_f.value or "").strip(),
                     "download_url": (update_url_f.value or "").strip(),
-                    "download_url_android": (update_url_android_f.value or "").strip(),
+                    "download_url_android": _existing_android_url,
                 }
             )
             if ok:
                 self._show_saved_dialog("Політику оновлення застосунку збережено.")
             else:
                 self._show_snack("Не вдалося зберегти політику оновлення", "red")
+
+        supadm_policy = self.db.get_supadm_update_policy()
+        supadm_min_version_f = ft.TextField(
+            label="Мінімальна версія CatMan SupAdm",
+            hint_text="Наприклад: 1.2.8",
+            border_radius=10,
+            value=supadm_policy.get("min_required", ""),
+        )
+        supadm_update_url_f = ft.TextField(
+            label="Посилання на оновлення (Windows .exe)",
+            hint_text="https://github.com/<owner>/<repo>/releases/download/v-supadm-1.2.8/CatManSupAdm-Setup-1.2.8.exe",
+            border_radius=10,
+            value=supadm_policy.get("download_url", ""),
+        )
+
+        def save_supadm_update(_):
+            ok = self.db.set_supadm_update_policy(
+                {
+                    "min_required": (supadm_min_version_f.value or "").strip(),
+                    "download_url": (supadm_update_url_f.value or "").strip(),
+                }
+            )
+            if ok:
+                self._show_saved_dialog("Політику оновлення CatMan SupAdm збережено.")
+            else:
+                self._show_snack("Не вдалося зберегти політику оновлення", "red")
+
+        gsm_policy = self.db.get_gsm_parser_update_policy()
+        gsm_min_version_f = ft.TextField(
+            label="Мінімальна версія CatMan GSM Parser",
+            hint_text="Наприклад: 1.0.1",
+            border_radius=10,
+            value=gsm_policy.get("min_required", ""),
+        )
+        gsm_update_url_f = ft.TextField(
+            label="Посилання на оновлення (Windows .exe)",
+            hint_text="https://github.com/<owner>/<repo>/releases/download/v-gsmparser-1.0.1/CatManGSMParser-Setup-1.0.1.exe",
+            border_radius=10,
+            value=gsm_policy.get("download_url", ""),
+        )
+
+        def save_gsm_update(_):
+            ok = self.db.set_gsm_parser_update_policy(
+                {
+                    "min_required": (gsm_min_version_f.value or "").strip(),
+                    "download_url": (gsm_update_url_f.value or "").strip(),
+                }
+            )
+            if ok:
+                self._show_saved_dialog("Політику оновлення CatMan GSM Parser збережено.")
+            else:
+                self._show_snack("Не вдалося зберегти політику оновлення", "red")
+
+        # Calculator — one combined block (password + version + links),
+        # moved here from its own former "Калькулятор" tab so every one of
+        # the 4 apps is managed from this single "Оновлення" tab. No web
+        # password field anymore — that's set directly in code now, not
+        # via superadmin (see calculator_web_app.py).
+        calc_access_policy = self.db.get_calculator_access_policy()
+        calc_password_f = ft.TextField(
+            label="Пароль для встановленого калькулятора (Windows)",
+            hint_text="Від 4 до 12 символів",
+            border_radius=10,
+            value=calc_access_policy.get("password", ""),
+            password=True,
+            can_reveal_password=True,
+        )
+        calc_update_policy = self.db.get_calculator_update_policy()
+        calc_min_version_f = ft.TextField(
+            label="Мінімальна версія CatMan Калькулятори",
+            hint_text="Наприклад: 1.0.7",
+            border_radius=10,
+            value=calc_update_policy.get("min_required", ""),
+        )
+        calc_update_url_f = ft.TextField(
+            label="Посилання на оновлення (Windows .exe)",
+            hint_text="https://github.com/<owner>/<repo>/releases/download/v-calc-1.0.7/CatManCalculator-Setup-1.0.7.exe",
+            border_radius=10,
+            value=calc_update_policy.get("download_url", ""),
+        )
+        calc_update_url_web_f = ft.TextField(
+            label="Посилання на веб-версію",
+            hint_text="https://<owner>.github.io/<repo>/",
+            border_radius=10,
+            value=calc_update_policy.get("download_url_web", ""),
+        )
+        # Web version's own password — separate from calc_password_f above
+        # (that one is only for the installed Windows exe). Pre-filled with
+        # the current value (same UX as calc_password_f) from a SuperAdmin-
+        # only DB record — never sent anywhere public. What actually gates
+        # the live site is a one-way SHA-256 hash pushed to
+        # catman-calculator-web's own repo (see calculator_web_app.py's
+        # _pw_fingerprint); this plaintext copy exists purely so this field
+        # isn't permanently blank.
+        _calc_web_access_policy = self.db.get_calculator_web_access_policy()
+        _calc_web_pw_initial = str(_calc_web_access_policy.get("password") or "")
+        calc_web_password_f = ft.TextField(
+            label="Пароль веб-версії (GitHub)",
+            hint_text="Від 4 до 12 символів",
+            border_radius=10,
+            value=_calc_web_pw_initial,
+            password=True,
+            can_reveal_password=True,
+        )
+
+        async def _push_calc_web_password(new_pw: str) -> tuple[bool, str]:
+            try:
+                from github_publisher import GitHubPublisher
+
+                gh_cfg = self.db.get_calculator_web_github_config()
+                if not (gh_cfg.get("token") and gh_cfg.get("owner") and gh_cfg.get("repo")):
+                    return False, "GitHub-доступ для веб-калькулятора ще не налаштовано в БД"
+                pub = GitHubPublisher(config=gh_cfg)
+                pw_hash = hashlib.sha256(new_pw.encode("utf-8")).hexdigest()
+                content = json.dumps({"password_hash": pw_hash}, ensure_ascii=False).encode("utf-8")
+                ok, err = await asyncio.to_thread(
+                    pub.put_file,
+                    "access/calculator_web_access.json",
+                    content,
+                    "Update calculator web access password",
+                )
+                return ok, err
+            except Exception as exc:
+                return False, str(exc)
+
+        def save_calc_all(_):
+            pw = (calc_password_f.value or "").strip()
+            if not (4 <= len(pw) <= 12):
+                self._show_snack("Пароль має бути від 4 до 12 символів", "red")
+                return
+            new_web_pw = (calc_web_password_f.value or "").strip()
+            if new_web_pw and not (4 <= len(new_web_pw) <= 12):
+                self._show_snack("Пароль веб-версії має бути від 4 до 12 символів", "red")
+                return
+            web_pw_changed = new_web_pw != _calc_web_pw_initial
+
+            async def _do():
+                ok_pw = self.db.set_calculator_access_policy(pw)
+                ok_update = self.db.set_calculator_update_policy(
+                    {
+                        "min_required": (calc_min_version_f.value or "").strip(),
+                        "download_url": (calc_update_url_f.value or "").strip(),
+                        "download_url_web": (calc_update_url_web_f.value or "").strip(),
+                    }
+                )
+                ok_web_pw = True
+                web_pw_err = ""
+                if web_pw_changed and new_web_pw:
+                    ok_web_pw, web_pw_err = await _push_calc_web_password(new_web_pw)
+                    if ok_web_pw:
+                        self.db.set_calculator_web_access_policy(new_web_pw)
+                if ok_pw and ok_update and ok_web_pw:
+                    self._show_saved_dialog("Дані CatMan Калькулятори збережено.")
+                elif not ok_web_pw:
+                    self._show_snack(
+                        f"Інші дані збережено, але пароль веб-версії не оновився: {web_pw_err}",
+                        "red",
+                    )
+                else:
+                    self._show_snack("Не вдалося зберегти деякі дані", "red")
+
+            if self.page:
+                self.page.run_task(_do)
 
         self.content_area.controls.extend(
             [
@@ -4854,11 +5120,83 @@ class SuperAdminDashboard:
                                 ),
                                 min_version_f,
                                 update_url_f,
-                                update_url_android_f,
                                 ft.FilledButton(
                                     "Зберегти політику оновлення",
                                     icon=ft.Icons.SAVE,
                                     on_click=save_updates,
+                                ),
+                            ],
+                            spacing=10,
+                        ),
+                    )
+                ),
+                ft.Card(
+                    ft.Container(
+                        padding=15,
+                        content=ft.Column(
+                            [
+                                ft.Text(
+                                    "Мінімальна версія та посилання на оновлення для"
+                                    " окремого застосунку CatMan SupAdm.",
+                                    size=12,
+                                    color="grey700",
+                                ),
+                                supadm_min_version_f,
+                                supadm_update_url_f,
+                                ft.FilledButton(
+                                    "Зберегти політику оновлення CatMan SupAdm",
+                                    icon=ft.Icons.SAVE,
+                                    on_click=save_supadm_update,
+                                ),
+                            ],
+                            spacing=10,
+                        ),
+                    )
+                ),
+                ft.Card(
+                    ft.Container(
+                        padding=15,
+                        content=ft.Column(
+                            [
+                                ft.Text(
+                                    "Мінімальна версія та посилання на оновлення для"
+                                    " окремого застосунку CatMan GSM Parser.",
+                                    size=12,
+                                    color="grey700",
+                                ),
+                                gsm_min_version_f,
+                                gsm_update_url_f,
+                                ft.FilledButton(
+                                    "Зберегти політику оновлення CatMan GSM Parser",
+                                    icon=ft.Icons.SAVE,
+                                    on_click=save_gsm_update,
+                                ),
+                            ],
+                            spacing=10,
+                        ),
+                    )
+                ),
+                ft.Card(
+                    ft.Container(
+                        padding=15,
+                        content=ft.Column(
+                            [
+                                ft.Text(
+                                    "CatMan Калькулятори — спільний пароль для встановленого"
+                                    " Windows-застосунку, мінімальна версія та посилання на"
+                                    " оновлення.",
+                                    size=12,
+                                    color="grey700",
+                                ),
+                                calc_password_f,
+                                calc_min_version_f,
+                                calc_update_url_f,
+                                calc_update_url_web_f,
+                                calc_web_password_f,
+                                ft.FilledButton(
+                                    "Зберегти дані CatMan Калькулятори",
+                                    icon=ft.Icons.SAVE,
+                                    on_click=save_calc_all,
                                 ),
                             ],
                             spacing=10,

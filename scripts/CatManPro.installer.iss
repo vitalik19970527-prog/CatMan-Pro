@@ -75,6 +75,16 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
+// Belt-and-suspenders: force-close any lingering old-version process at the
+// EXACT moment we're about to launch the freshly-installed one (both are
+// "postinstall", run in listed order, right after the Finish page) — the
+// user should never see the new version open side-by-side with a stale
+// old window. The earlier file-copy step is already handled separately by
+// CloseApplications=yes/RestartApplications=yes above (+ the /CLOSEAPPLICATIONS
+// /FORCECLOSEAPPLICATIONS switches main.py's updater passes on the command
+// line), via Inno's own Restart Manager integration — this entry does NOT
+// replace that, it's an extra guarantee for this specific instant.
+Filename: "{cmd}"; Parameters: "/C taskkill /IM {#MyAppExeName} /F /T >nul 2>&1"; Flags: runhidden postinstall skipifsilent; StatusMsg: "Закриття попередньої версії..."; Check: IsUpdateInstall
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [Code]
@@ -100,24 +110,25 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: no
 //    - Separation: dev test accounts != release production accounts
 // ============================================================================
 
-function IsFirstInstall: Boolean;
+var
+  WasAlreadyInstalled: Boolean;
+
+// {app} cannot be expanded inside InitializeSetup — Inno Setup hasn't
+// resolved the install directory that early yet, and doing so crashes the
+// installer immediately with "Internal error: An attempt was made to
+// expand the 'app' constant before it was initialized" (confirmed live —
+// this broke BOTH CatMan Pro's and CatMan SupAdm's installers outright,
+// before the wizard could show anything at all). ssInstall is the correct,
+// documented point: it fires right as installation is about to begin,
+// after the directory page has already resolved {app}, and BEFORE [Files]
+// has copied anything (so FileExists still reflects the pre-update state).
+procedure CurStepChanged(CurStep: TSetupStep);
 begin
-  Result := not FileExists(ExpandConstant('{app}\{#MyAppExeName}'));
+  if CurStep = ssInstall then
+    WasAlreadyInstalled := FileExists(ExpandConstant('{app}\{#MyAppExeName}'));
 end;
 
-function InitializeSetup: Boolean;
-var
-  ResultCode: Integer;
+function IsUpdateInstall: Boolean;
 begin
-  // Extra safety for in-app updates: terminate running app so files can be replaced
-  // and post-install launch starts the new version, not the old locked process.
-  Exec(
-    ExpandConstant('{cmd}'),
-    '/C taskkill /IM {#MyAppExeName} /F /T >nul 2>&1',
-    '',
-    SW_HIDE,
-    ewWaitUntilTerminated,
-    ResultCode
-  );
-  Result := True;
+  Result := WasAlreadyInstalled;
 end;

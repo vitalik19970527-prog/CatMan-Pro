@@ -16,10 +16,12 @@ from dashboard import MainDashboard
 from database import DataManager
 from logger import logger
 from views import themes as _themes
+from views.calculators_view import open_calculators_modal
 from views.categories_brands_view import CategoriesBrandsView
 from views.copy_setup_view import CopySetupView
 from views.extensions_view import ExtensionsView
 from views.home_view import HomeView
+from views.notebook_view import get_notebook_badge_counts, open_notebook_modal
 from views.packaging_view import PackagingView
 from views.settings_view import SettingsView
 from views.suppliers_view import SuppliersView
@@ -674,6 +676,16 @@ class AdminDashboard:
                     height=button_h,
                     style=ft.ButtonStyle(color=_th_text),
                 ),
+                ft.OutlinedButton(
+                    "",
+                    icon=ft.Icons.CALCULATE,
+                    icon_color=_th_text,
+                    tooltip=self.t("nav.calculators", "Калькулятори"),
+                    on_click=self._open_calculator,
+                    height=button_h,
+                    style=ft.ButtonStyle(color=_th_text),
+                ),
+                self._make_notebook_toolbar_btn(_th_text, button_h),
                 self._build_admin_lang_switcher_box(_admin_mgr_id, _active_theme.get("chip_bg")),
                 ft.OutlinedButton(
                     self.t("nav.logout_short", "Вийти"),
@@ -753,9 +765,14 @@ class AdminDashboard:
             )
         )
         if not self._sync_poll_started:
+            # Background cross-client polling removed — 1 менеджер = 1
+            # категорія means nobody else can change what this admin is
+            # looking at. Fresh data now only comes from Ctrl+F5
+            # (_handle_ctrl_f5) or a normal tab switch.
             self._sync_last_pulses = self._load_sync_snapshot()
             self._sync_poll_started = True
-            self.page.run_task(self._sync_poll_loop)
+        with contextlib.suppress(Exception):
+            self.page.on_keyboard_event = self._on_keyboard_event
         self._show_current_tab()
         self.page.run_task(self._background_warmup)
         # Expose callback so Settings can refresh background without restart.
@@ -800,6 +817,35 @@ class AdminDashboard:
         if from_sync and self.current_tab == "overview":
             return
         self.show_overview(None)
+
+    def _on_keyboard_event(self, e: ft.KeyboardEvent) -> None:
+        try:
+            if e.ctrl and str(e.key or "").strip() == "F5":
+                self.page.run_task(self._handle_ctrl_f5)
+        except Exception:
+            pass
+
+    async def _handle_ctrl_f5(self) -> None:
+        def _snack(text: str, color: str = "#1D4ED8") -> None:
+            with contextlib.suppress(Exception):
+                self.page.snack_bar = ft.SnackBar(
+                    content=ft.Text(text, color="#FFFFFF", weight="bold"),
+                    bgcolor=color,
+                    duration=2500,
+                )
+                self.page.snack_bar.open = True
+                self.page.update()
+
+        _snack("Перевірка оновлень з БД…")
+        company_ids = self._sync_company_ids()
+        all_scopes = self._sync_scopes()
+        for cid in company_ids:
+            for scope in all_scopes:
+                with contextlib.suppress(Exception):
+                    self.db.invalidate_scope_cache(cid, scope)
+        with contextlib.suppress(Exception):
+            self._show_current_tab()
+        _snack("Дані оновлено з БД.", "#15803D")
 
     def _is_company_scoped(self):
         return not self.allow_all_companies and bool(self.locked_company_id)
@@ -1391,6 +1437,90 @@ class AdminDashboard:
         except Exception:
             logger.exception("Impersonation open failed")
             self._show_snack("Не вдалося відкрити режим користувача", "red")
+
+    def _open_notebook(self, _=None) -> None:
+        # Pure personal task diary — no company_id, same as superadmin's.
+        # Passing one triggers _sync_order_schedule_tasks (see notebook_
+        # view.py), which pulls in "Розклад Замовлень" tasks scoped to
+        # this company — an admin isn't a category manager who owns any
+        # of those tasks personally (admin/superadmin have no Розклад
+        # Замовлень at all), so that sync surfaced OTHER users' order-
+        # schedule tasks in the admin's own notebook (confirmed live: an
+        # admin opening their notebook saw a regular manager's "Замовити
+        # ..." task list). Admin's notebook only ever shows admin's own
+        # manually-typed notes/tasks.
+        open_notebook_modal(
+            self.page, self.db,
+            manager_id=str(self.user_data.get("id") or ""),
+            on_close=self._refresh_notebook_badge,
+        )
+
+    def _make_notebook_toolbar_btn(self, th_text, btn_h) -> ft.Stack:
+        btn = ft.OutlinedButton(
+            "",
+            icon=ft.Icons.MENU_BOOK,
+            icon_color=th_text,
+            tooltip=self.t("nav.notebook_tooltip", "Блокнот"),
+            on_click=self._open_notebook,
+            height=btn_h,
+            style=ft.ButtonStyle(color=th_text),
+        )
+        today_n, overdue_n = get_notebook_badge_counts(
+            self.db, str(self.user_data.get("id") or "")
+        )
+        today_badge = ft.Container(
+            content=ft.Text(
+                str(today_n) if today_n else "",
+                size=8, color="#000000", weight=ft.FontWeight.W_700,
+                text_align=ft.TextAlign.CENTER,
+            ),
+            bgcolor="#FFD600", border_radius=8, height=16,
+            padding=ft.padding.symmetric(horizontal=3),
+            alignment=ft.alignment.Alignment(0, 0),
+            top=-6, right=-6, visible=today_n > 0,
+        )
+        overdue_badge = ft.Container(
+            content=ft.Text(
+                str(overdue_n) if overdue_n else "",
+                size=8, color="#FFFFFF", weight=ft.FontWeight.W_700,
+                text_align=ft.TextAlign.CENTER,
+            ),
+            bgcolor="#E53935", border_radius=8, height=16,
+            padding=ft.padding.symmetric(horizontal=3),
+            alignment=ft.alignment.Alignment(0, 0),
+            bottom=-6, right=-6, visible=overdue_n > 0,
+        )
+        self._notebook_badge_today_cont = today_badge
+        self._notebook_badge_overdue_cont = overdue_badge
+        return ft.Stack([btn, today_badge, overdue_badge])
+
+    def _refresh_notebook_badge(self) -> None:
+        if getattr(self, "_notebook_badge_today_cont", None) is None:
+            return
+        today_n, overdue_n = get_notebook_badge_counts(
+            self.db, str(self.user_data.get("id") or "")
+        )
+        tc = self._notebook_badge_today_cont
+        oc = self._notebook_badge_overdue_cont
+        tc.content.value = str(today_n) if today_n else ""
+        tc.visible = today_n > 0
+        oc.content.value = str(overdue_n) if overdue_n else ""
+        oc.visible = overdue_n > 0
+        with contextlib.suppress(Exception):
+            tc.update()
+        with contextlib.suppress(Exception):
+            oc.update()
+
+    def _open_calculator(self, _=None) -> None:
+        if not self.selected_company_id or self.selected_company_id == ALL_COMPANIES_KEY:
+            self._show_snack("Оберіть компанію", "orange")
+            return
+        open_calculators_modal(
+            self.page, self.db,
+            manager_id=str(self.user_data.get("id") or ""),
+            company_id=str(self.selected_company_id or ""),
+            region_id=str(getattr(self, "selected_region_name", "") or ""),
+        )
 
     def show_overview(self, e):
         self.current_tab = "overview"
@@ -2005,19 +2135,19 @@ class AdminDashboard:
                     self.page.update()
                     return
 
-                    if self.db.manager_contact_exists(
-                        company_f.value,
-                        (email_f.value or "").strip(),
-                        (phone_f.value or "").strip(),
-                        exclude_manager_id=manager_id,
-                    ):
-                        self._mark_required(email_f, "Email або телефон вже існує")
-                        self._mark_required(phone_f, "Email або телефон вже існує")
-                        self._show_snack(
-                            "Користувач з таким email або телефоном вже існує", "orange"
-                        )
-                        self.page.update()
-                        return
+                if self.db.manager_contact_exists(
+                    company_f.value,
+                    (email_f.value or "").strip(),
+                    (phone_f.value or "").strip(),
+                    exclude_manager_id=manager_id,
+                ):
+                    self._mark_required(email_f, "Email або телефон вже існує")
+                    self._mark_required(phone_f, "Email або телефон вже існує")
+                    self._show_snack(
+                        "Користувач з таким email або телефоном вже існує", "orange"
+                    )
+                    self.page.update()
+                    return
 
                 payload = {
                     "company_id": (
@@ -6282,7 +6412,7 @@ class AdminDashboard:
                 levels_rows_container.controls.append(level_row.get("row"))
 
         managers_block = ft.Column(spacing=4)
-        manager_checks = {}
+        manager_radio_group = ft.RadioGroup(content=ft.Column(spacing=4))
 
         def load_regions():
             regions = self.db.get_company_regions(company_id)
@@ -6298,26 +6428,22 @@ class AdminDashboard:
             region_f.visible = len(region_options) >= 1
 
         def load_managers():
-            managers_block.controls.clear()
-            manager_checks.clear()
+            manager_radio_group.content.controls.clear()
+            manager_radio_group.value = None
             managers = self.db.get_company_managers(company_id)
+            manager_radio_group.content.controls.append(
+                ft.Radio(value="", label="Без власника (призначити пізніше)")
+            )
             for m in managers:
                 if not isinstance(m, dict) or not m.get("id"):
                     continue
-                cb = ft.Checkbox(
-                    label=f"{(m.get('full_name') or '').strip()} ({(m.get('role') or '').strip()})".strip(),
-                    value=False,
-                )
-                manager_checks[m.get("id")] = cb
-                managers_block.controls.append(cb)
-            if not managers_block.controls:
-                managers_block.controls.append(
-                    ft.Text(
-                        "Немає користувачів у вибраній компанії",
-                        size=12,
-                        color="grey600",
+                manager_radio_group.content.controls.append(
+                    ft.Radio(
+                        value=m.get("id"),
+                        label=f"{(m.get('full_name') or '').strip()} ({(m.get('role') or '').strip()})".strip(),
                     )
                 )
+            managers_block.controls = [manager_radio_group]
 
         def on_region_change(_):
             load_default_levels(
@@ -6377,9 +6503,9 @@ class AdminDashboard:
                 self._show_snack("Не вдалося створити категорію", "red")
                 return
 
-            selected_manager_ids = [
-                mid for mid, cb in manager_checks.items() if cb.value
-            ]
+            selected_manager_ids = (
+                [manager_radio_group.value] if manager_radio_group.value else []
+            )
             if not self.db.replace_category_access(category_id, selected_manager_ids):
                 self._show_snack(
                     "Категорія створена, але доступи не збережено", "orange"
@@ -6402,7 +6528,7 @@ class AdminDashboard:
                         ft.Text("Конфігурація рівнів", weight="bold", size=12),
                         levels_rows_container,
                         use_prod_row,
-                        ft.Text("Доступи менеджерам (одразу):", weight="bold", size=12),
+                        ft.Text("Власник категорії (одразу):", weight="bold", size=12),
                         managers_block,
                     ],
                     spacing=10,

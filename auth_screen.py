@@ -13,11 +13,29 @@ from logger import logger
 
 
 class AuthScreen:
-    def __init__(self, page: ft.Page, on_success):
+    def __init__(
+        self,
+        page: ft.Page,
+        on_success,
+        *,
+        allow_registration: bool = True,
+        on_settings_click=None,
+    ):
         self.page = page
         self.db = DataManager()
         i18n.init_i18n(self.db)
         self.t = i18n.bind("")  # pre-login: always session-level language
+        # Standalone single-purpose apps (CatManGSMParser.exe) reuse this
+        # exact same login screen/saved-account logic as CatMan Pro, but
+        # must not let visitors self-register a brand new account through
+        # them — only main.py's own AuthScreen() call leaves this True.
+        self.allow_registration = bool(allow_registration)
+        # Opt-in gear icon on the login card — lets a standalone app expose
+        # app_storage's cache-relocation setting (move from C: to D:, same
+        # as views/settings_view.py's Settings tab) without needing a full
+        # dashboard around it. None (the default, main.py's own usage)
+        # means no gear icon at all.
+        self.on_settings_click = on_settings_click
         # Translation seeding used to run here, synchronously, before any UI
         # painted — over localhost that was fast enough to be invisible, but
         # over a remote VPS connection it added several real round trips
@@ -779,6 +797,21 @@ class AuthScreen:
                                                     tooltip=self.t("auth.help.tooltip", "Довідка"),
                                                     on_click=lambda _e: self._show_login_help(),
                                                 ),
+                                                *(
+                                                    [
+                                                        ft.IconButton(
+                                                            icon=ft.Icons.SETTINGS_OUTLINED,
+                                                            icon_size=20,
+                                                            tooltip=self.t(
+                                                                "auth.login.settings_tooltip",
+                                                                "Налаштування (папка кешу)",
+                                                            ),
+                                                            on_click=lambda _e: self.on_settings_click(),
+                                                        )
+                                                    ]
+                                                    if self.on_settings_click
+                                                    else []
+                                                ),
                                             ],
                                             spacing=2,
                                             tight=True,
@@ -813,12 +846,18 @@ class AuthScreen:
                                                 shape=ft.RoundedRectangleBorder(radius=10)
                                             ),
                                         ),
-                                        ft.TextButton(
-                                            self.t(
-                                                "auth.login.go_register",
-                                                "Створити новий акаунт (Реєстрація)",
-                                            ),
-                                            on_click=self.show_register,
+                                        *(
+                                            [
+                                                ft.TextButton(
+                                                    self.t(
+                                                        "auth.login.go_register",
+                                                        "Створити новий акаунт (Реєстрація)",
+                                                    ),
+                                                    on_click=self.show_register,
+                                                )
+                                            ]
+                                            if self.allow_registration
+                                            else []
                                         ),
                                     ],
                                     horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -1708,6 +1747,95 @@ class AuthScreen:
                 " підтвердити адміністратор, перш ніж ви зможете увійти.",
             ),
         )
+
+    def open_storage_settings_dialog(self) -> None:
+        """Standalone single-purpose apps (no dashboard/Settings tab around
+        them) reach app_storage's cache-relocation setting through this
+        gear-icon dialog instead — same underlying app_storage functions
+        and flow as views/settings_view.py's Settings tab uses."""
+        import app_storage
+
+        path_text = ft.Text(
+            app_storage.get_current_storage_dir(), size=12,
+            color=ft.Colors.GREY_700, selectable=True,
+        )
+        status_text = ft.Text("", size=11)
+        busy = [False]
+
+        async def _pick_folder(_e=None):
+            if busy[0]:
+                return
+            fp = ft.FilePicker()
+            self.page.services.append(fp)
+            self.page.update()
+            await asyncio.sleep(0.2)
+            new_dir = await fp.get_directory_path(
+                dialog_title=self.t(
+                    "auth.settings.pick_folder_title", "Оберіть папку для збереження кешу"
+                ),
+            )
+            try:
+                self.page.services.remove(fp)
+                self.page.update()
+            except Exception:
+                pass
+            if not new_dir:
+                return
+            busy[0] = True
+            status_text.value = self.t("auth.settings.moving", "Переносимо файли...")
+            status_text.color = ft.Colors.GREY_700
+            try:
+                status_text.update()
+            except Exception:
+                pass
+            ok, msg = await asyncio.to_thread(app_storage.set_storage_dir, new_dir)
+            busy[0] = False
+            status_text.value = msg
+            status_text.color = "#15803D" if ok else "#DC2626"
+            if ok:
+                path_text.value = app_storage.get_current_storage_dir()
+            try:
+                path_text.update()
+                status_text.update()
+            except Exception:
+                pass
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(self.t("auth.settings.title", "Налаштування")),
+            content=ft.Container(
+                width=420,
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            self.t(
+                                "auth.settings.storage_hint",
+                                "Тут кешуються локальні файли цього застосунку на цьому"
+                                " пристрої. Поточна папка:",
+                            ),
+                            size=12,
+                            color=ft.Colors.GREY_700,
+                        ),
+                        path_text,
+                        ft.FilledButton(
+                            self.t("auth.settings.pick_folder", "Обрати іншу папку"),
+                            on_click=_pick_folder,
+                        ),
+                        status_text,
+                    ],
+                    tight=True,
+                    spacing=8,
+                ),
+            ),
+            actions=[
+                ft.FilledButton(
+                    self.t("common.help.close", "Зрозуміло"),
+                    on_click=lambda _e: self.page.pop_dialog(),
+                ),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.show_dialog(dlg)
 
     def _show_snack(self, text, color):
         bar = ft.SnackBar(ft.Text(text), bgcolor=color)

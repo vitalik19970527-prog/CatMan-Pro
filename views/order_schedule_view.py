@@ -1193,7 +1193,10 @@ class OrderScheduleView:
             self._visible_months_count = cnt
             self._save_month_view_settings()
             self._schedule_rebuild()
-            self._snack(self.t("media.months_saved", f"Збережено: {cnt} міс."), "#10B981")
+            self._snack(
+                self.t("media.months_saved", "Збережено: {n} міс.").format(n=cnt),
+                "#10B981",
+            )
 
         months_row = ft.Row(
             [
@@ -1892,7 +1895,10 @@ class OrderScheduleView:
             self._visible_months_count = cnt
             self._save_month_view_settings()
             self._schedule_rebuild()
-            self._snack(self.t("media.months_saved", f"Збережено: {cnt} міс."), "#10B981")
+            self._snack(
+                self.t("media.months_saved", "Збережено: {n} міс.").format(n=cnt),
+                "#10B981",
+            )
 
         months_row = ft.Row(
             [
@@ -2522,7 +2528,15 @@ class OrderScheduleView:
                 or []
             )
             self._save_schedule_cache(db_pulse)
-        # else: self._tasks / self._groups populated from cache
+        else:
+            # Cache hit — self._tasks/self._groups already populated by
+            # _load_schedule_cache(). _schedule_cache_pulse used to only get
+            # set on a miss (_save_schedule_cache), so it stayed 0 through
+            # every cache-hit load — resume()'s guard then always treated
+            # that as "no cached pulse to compare", defaulted _data_changed
+            # to True, and re-fetched everything on every single
+            # tab-switch-back even when nothing had actually changed.
+            self._schedule_cache_pulse = cached_pulse
         self._set_loading_text(f"Задачі: {len(self._tasks or [])}")
 
         # Re-apply any pending (un-flushed) outbox items.
@@ -5412,7 +5426,7 @@ class OrderScheduleView:
             dp = ft.DatePicker(
                 value=datetime.combine(current, datetime.min.time()),
                 first_date=date(2020, 1, 1),
-                last_date=date(2100, 12, 31),
+                last_date=date(2035, 12, 31),
                 entry_mode=ft.DatePickerEntryMode.CALENDAR_ONLY,
                 date_picker_mode=ft.DatePickerMode.DAY,
                 locale=ft.Locale("uk", "UA"),

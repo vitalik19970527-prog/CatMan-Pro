@@ -35,8 +35,7 @@ def _th_from_view(view) -> dict:
     return get_active_theme(str(getattr(view, 'manager_id', '') or ''))
 
 
-from gsm_parser_runner import (FIELD_CATALOG, LAST_PARSE_LOG_PATH,
-                               run_gsm_parser)
+from gsm_parser_runner import FIELD_CATALOG, LAST_PARSE_LOG_PATH
 from logger import logger
 from views.gsm_parser_view import GsmParserView
 from views.mobile_layout_helpers import is_mobile, make_scrollable_chip_row
@@ -1191,19 +1190,7 @@ class ExtensionsView:
                     with contextlib.suppress(Exception):
                         page.update()
 
-                _ov_show_running("Запуск...")
-
-                # Throttled progress callback (max 2 updates/sec)
-                _last_upd = [0.0]
-                def _progress_cb(msg: str):
-                    if _ms is None:
-                        return
-                    _ms.value = str(msg)[:120]
-                    now = _time.monotonic()
-                    if now - _last_upd[0] >= 0.5:
-                        _last_upd[0] = now
-                        with contextlib.suppress(Exception):
-                            page.update()
+                _ov_show_running("Підключення до сервера...")
 
                 try:
                     if self._page():
@@ -1211,25 +1198,47 @@ class ExtensionsView:
                 except Exception:
                     pass
 
+                # Parsing runs EXCLUSIVELY on the VPS (parser_service.py) —
+                # never locally. The desktop build doesn't ship GSM_Parser/
+                # main.py+ekatalog.py the way the VPS deployment does (and
+                # even where it does, running a multi-hour scrape on
+                # whichever admin's laptop happens to click this button,
+                # tying up their machine and IP, defeats the entire point of
+                # hosting the parser on a VPS). If the VPS trigger service
+                # isn't reachable, this must fail loudly — never silently
+                # fall back to a local run.
                 ok = False
+                msg = ""
                 try:
-                    ok, msg = await asyncio.to_thread(
-                        run_gsm_parser,
-                        "__global__",
-                        "",
-                        "",
-                        mode,
-                        True,
-                        _progress_cb,
-                    )
+                    svc_cfg = await asyncio.to_thread(self.db.get_parser_service_config)
+                    vps_url = str((svc_cfg or {}).get("vps_service_url") or "").strip().rstrip("/")
+                    vps_key = str((svc_cfg or {}).get("vps_api_key") or "").strip()
+                    if not vps_url:
+                        raise RuntimeError(
+                            "VPS-сервіс парсера не налаштований (Розширення → GSM Parser → "
+                            "адреса сервісу). Запуск можливий лише на віддаленому сервері."
+                        )
+                    import httpx
+
+                    headers = {"x-api-key": vps_key} if vps_key else {}
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        resp = await client.post(
+                            f"{vps_url}/trigger", json={"mode": mode}, headers=headers
+                        )
+                        resp.raise_for_status()
+                        data = resp.json()
+                    ok = bool(data.get("ok"))
+                    msg = str(data.get("message") or "")
                     state["status"] = (
-                        f"Готово: {mode} (успіх)"
+                        f"Запущено на сервері: {mode}"
                         if ok
-                        else f"Завершено з помилкою: {mode}"
+                        else f"Сервер відхилив запуск: {msg or 'невідома причина'}"
                     )
-                    state["last_result"] = str(msg or "")
+                    state["last_result"] = msg or (
+                        "Стежте за прогресом у вкладці «Лог»." if ok else ""
+                    )
                 except Exception as exc:
-                    logger.exception("Manual parser launch failed: %s", exc)
+                    logger.exception("VPS parser trigger failed: %s", exc)
                     state["status"] = f"Помилка запуску: {mode}"
                     state["last_result"] = str(exc)
                 finally:
@@ -1256,7 +1265,12 @@ class ExtensionsView:
                             page.update()
                     return
                 if page:
-                    page.run_task(_run_async(page))
+                    # run_task requires a coroutine FUNCTION (it calls
+                    # inspect.iscoroutinefunction on the arg with no
+                    # fallback) — passing the already-invoked _run_async(page)
+                    # coroutine object here raised TypeError before ever
+                    # scheduling it.
+                    page.run_task(_run_async, page)
 
             return _handler
 
@@ -1368,29 +1382,75 @@ class ExtensionsView:
         )
 
     def _build_schedule_tab(self):
-        """Build schedule configuration tab for automated parser execution."""
+        """Build schedule configuration tab for automated parser execution.
+
+        The VPS daemon (gsm_parser_scheduler.py --daemon) compares run_times
+        against datetime.utcnow(), so the DB storage format stays UTC "HH:MM"
+        strings — only this UI's INPUT/DISPLAY is in Kyiv time now (that's
+        what was actually confusing: the UI was labeled "(UTC)" but nothing
+        stopped an admin from typing what they meant as Kyiv time, and the
+        desktop's own now-removed local scheduler compared the same strings
+        against local time instead of UTC — two different silent
+        interpretations of the same stored value)."""
+        from zoneinfo import ZoneInfo
+
+        _KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+        def _utc_to_kyiv(hhmm: str) -> str:
+            try:
+                h, m = map(int, str(hhmm).strip().split(":"))
+                anchor = datetime.now(_KYIV_TZ).date()
+                dt_utc = datetime(anchor.year, anchor.month, anchor.day, h, m, tzinfo=ZoneInfo("UTC"))
+                dt_kyiv = dt_utc.astimezone(_KYIV_TZ)
+                return f"{dt_kyiv.hour:02d}:{dt_kyiv.minute:02d}"
+            except Exception:
+                return str(hhmm)
+
+        def _kyiv_to_utc(hhmm: str) -> str:
+            try:
+                h, m = map(int, str(hhmm).strip().split(":"))
+                anchor = datetime.now(_KYIV_TZ).date()
+                dt_kyiv = datetime(anchor.year, anchor.month, anchor.day, h, m, tzinfo=_KYIV_TZ)
+                dt_utc = dt_kyiv.astimezone(ZoneInfo("UTC"))
+                return f"{dt_utc.hour:02d}:{dt_utc.minute:02d}"
+            except Exception:
+                return str(hhmm)
+
+        def _fmt_next_run_kyiv(iso_str) -> str:
+            if not iso_str:
+                return ""
+            try:
+                dt_utc = datetime.fromisoformat(str(iso_str)).replace(tzinfo=ZoneInfo("UTC"))
+                dt_kyiv = dt_utc.astimezone(_KYIV_TZ)
+                return dt_kyiv.strftime("%Y-%m-%d %H:%M") + " (Київ)"
+            except Exception:
+                return str(iso_str)
+
         schedule_cfg = self.db.get_gsm_parser_schedule()
         enabled = schedule_cfg.get("enabled", False)
-        run_times = schedule_cfg.get("run_times", ["02:00", "14:00"])
+        run_times_utc = schedule_cfg.get("run_times", ["02:00", "14:00"])
+        run_times_kyiv = {_utc_to_kyiv(t) for t in run_times_utc}
         next_run = schedule_cfg.get("next_run")
 
-        # Time selection checkboxes — 6 columns × 4 rows
+        # Time selection checkboxes, labeled in Kyiv time, 30-minute steps —
+        # 8 columns × 6 rows = 48 slots (00:00..23:30).
         time_checks = {}
         grid_cols = []
-        for col_idx in range(6):
+        for col_idx in range(8):
             col_cbs = []
-            for row_idx in range(4):
-                hour = col_idx * 4 + row_idx
-                time_str = f"{hour:02d}:00"
+            for row_idx in range(6):
+                slot = col_idx * 6 + row_idx
+                hour, minute = divmod(slot * 30, 60)
+                time_str = f"{hour:02d}:{minute:02d}"
                 cb = ft.Checkbox(
                     label=time_str,
-                    value=time_str in run_times,
+                    value=time_str in run_times_kyiv,
                 )
                 time_checks[time_str] = cb
                 col_cbs.append(cb)
-            grid_cols.append(ft.Column(col_cbs, spacing=4, tight=True))
+            grid_cols.append(ft.Column(col_cbs, spacing=2, tight=True))
 
-        times_col = ft.Row(grid_cols, spacing=16)
+        times_col = ft.Row(grid_cols, spacing=12)
 
         enable_cb = ft.Checkbox(
             label="Увімкнути автоматичний запуск",
@@ -1398,26 +1458,55 @@ class ExtensionsView:
         )
 
         next_run_lbl = ft.Text(
-            f"Наступний: {next_run or 'не розраховується'}",
+            f"Наступний: {_fmt_next_run_kyiv(next_run) or 'не розраховується'}",
             size=11,
             color=ft.Colors.GREEN_700 if next_run else ft.Colors.BLUE_GREY_700,
         )
 
         def save_schedule(_):
-            selected_times = [t for t, cb in time_checks.items() if cb.value]
+            selected_kyiv = [t for t, cb in time_checks.items() if cb.value]
+            selected_utc = sorted({_kyiv_to_utc(t) for t in selected_kyiv})
             ok = self.db.set_gsm_parser_schedule(
                 enabled=bool(enable_cb.value),
-                run_times=selected_times or ["02:00", "14:00"],
+                run_times=selected_utc or [_kyiv_to_utc("02:00"), _kyiv_to_utc("14:00")],
             )
             if ok:
                 with contextlib.suppress(Exception):
                     _nr = (self.db.get_gsm_parser_schedule() or {}).get("next_run")
-                    next_run_lbl.value = f"Наступний: {_nr or 'не розраховується'}"
+                    next_run_lbl.value = f"Наступний: {_fmt_next_run_kyiv(_nr) or 'не розраховується'}"
                     next_run_lbl.color = ft.Colors.GREEN_700 if _nr else ft.Colors.BLUE_GREY_700
                     next_run_lbl.update()
-                self._show_saved_dialog("Розклад збережено.")
+                self._show_saved_dialog("Розклад збережено. Виконується на ВПС (незалежно від того, чи відкрита програма).")
             else:
                 self._show_snack("Не вдалося зберегти розклад", "red")
+
+        svc_cfg = self.db.get_parser_service_config()
+        vps_url_tf = ft.TextField(
+            label="Адреса VPS-сервісу парсера",
+            value=str(svc_cfg.get("vps_service_url") or ""),
+            hint_text="http://31.131.18.228:8765",
+            width=320,
+            dense=True,
+            border_radius=8,
+        )
+        vps_key_tf = ft.TextField(
+            label="API-ключ",
+            value=str(svc_cfg.get("vps_api_key") or ""),
+            width=280,
+            dense=True,
+            border_radius=8,
+            password=True,
+            can_reveal_password=True,
+        )
+
+        def save_vps_config(_):
+            ok = self.db.set_parser_service_config(
+                vps_url_tf.value or "", vps_key_tf.value or ""
+            )
+            if ok:
+                self._show_saved_dialog("Адресу VPS-сервісу збережено.")
+            else:
+                self._show_snack("Не вдалося зберегти", "red")
 
         def show_crontab(_):
             selected_times = [t for t, cb in time_checks.items() if cb.value]
@@ -1459,12 +1548,12 @@ class ExtensionsView:
                 ],
             )
             if _page:
-                _page.open(dlg)
+                _page.show_dialog(dlg)
 
         return ft.Column(
             [
                 enable_cb,
-                ft.Text("Оберіть години запуску (UTC):", size=12, weight="bold"),
+                ft.Text("Оберіть час запуску (за Києвом, крок 30 хв):", size=12, weight="bold"),
                 ft.Container(
                     border=ft.border.all(1, ft.Colors.BLUE_GREY_200),
                     border_radius=8,
@@ -1486,6 +1575,19 @@ class ExtensionsView:
                         ),
                     ],
                     spacing=10,
+                ),
+                ft.Divider(height=24),
+                ft.Text(
+                    "VPS-сервіс парсера (запуск відбувається виключно тут — "
+                    "і автоматичний, і ручний з кнопки «Запустити»):",
+                    size=12,
+                    weight="bold",
+                ),
+                ft.Row([vps_url_tf, vps_key_tf], spacing=10, wrap=True),
+                ft.FilledButton(
+                    "Зберегти адресу сервісу",
+                    icon=ft.Icons.SAVE,
+                    on_click=save_vps_config,
                 ),
             ],
             spacing=12,
@@ -1954,6 +2056,9 @@ class ExtensionsView:
             ("compat_glass", "Скло"),
             ("xiaomi_sizes", "Розміри Xiaomi"),
             ("run_parser", "Запуск парсингу"),
+            ("manage_devices", "Видалення/виключення пристроїв"),
+            ("region_availability", "Наявність по регіонах"),
+            ("manual_gsm_link", "Ручні посилання ГСМ Арена"),
         ]
         _SA_ROLES = {"admin", "админ", "адмін", "superadmin", "суперадмин", "суперадмін"}
 

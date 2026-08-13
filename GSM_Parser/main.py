@@ -613,11 +613,22 @@ def ensure_url_fields(sheet, row_idx, info):
         instant_print(f"⚠️ Не вдалося оновити URL поля: {e}")
 
 
-def parse_device_details(url, brand_name):
+def parse_device_details(url, brand_name, skip_pacing: bool = False, fetch_photos: bool = True):
+    """skip_pacing=True skips the ~32-56s anti-bot delay before the request —
+    that pacing exists to space out a BULK crawl's many sequential requests,
+    which doesn't apply to a single one-off manual-link fetch (see the
+    "Ручне посилання" dialogs' callers, which pass skip_pacing=True).
+
+    fetch_photos=False skips the main-photo/gallery download (2 extra
+    requests) — used for the "recent N devices" re-check of already-known
+    devices, where the goal is to catch every spec/name/date change from
+    the page we're already fetching anyway, without paying for photos that
+    essentially never change once a device has them."""
     try:
-        _soft_ban_extra_sleep()
-        wait = random.uniform(32.0, 56.0)
-        time.sleep(wait)
+        if not skip_pacing:
+            _soft_ban_extra_sleep()
+            wait = random.uniform(32.0, 56.0)
+            time.sleep(wait)
         res = http_get(url, timeout=30, max_retries=3)
 
         if res.status_code == 429:
@@ -626,6 +637,32 @@ def parse_device_details(url, brand_name):
 
         if res.status_code != 200:
             return None
+
+        # A maintenance/anti-bot-block/CDN challenge page can still return
+        # HTTP 200 with real HTML content — status code alone doesn't catch
+        # it. Same class of bug as E-Katalog's parse_ekatalog_item (see its
+        # comment): a bad page slipping through here would have its own
+        # <title>/og:title picked up as the device's real name via the
+        # fallback below. Two layers, same as the E-Katalog fix: check the
+        # raw page text first, then refuse to accept an extracted name that
+        # IS one of these phrases regardless of where it slipped through.
+        _bad_page_markers = (
+            "сайт на обслуговуванні",
+            "технічні роботи",
+            "under maintenance",
+            "access denied",
+            "403 forbidden",
+            "attention required",
+            "just a moment",
+            "service unavailable",
+            "502 bad gateway",
+            "503 service",
+        )
+        _res_text_lower = res.text.lower()
+        if any(marker in _res_text_lower for marker in _bad_page_markers):
+            instant_print(f"      ⏳ Сторінка виглядає як блок/технічні роботи: {url}")
+            return None
+
         soup = BeautifulSoup(res.text, "html.parser")
 
         name_tag = soup.find("h1", class_="specs-phone-name-title")
@@ -640,6 +677,9 @@ def parse_device_details(url, brand_name):
                 name = title.get_text().strip() if title else ""
             if not name:
                 return None
+        if name.strip().lower() in _bad_page_markers:
+            instant_print(f"      ⏳ Назва виявилась текстом помилки сторінки: {url}")
+            return None
         name = re.sub(r"Xiaomi\s+Poco", "Poco", name, flags=re.IGNORECASE).strip()
 
         net_tech = get_spec(soup, "nettech")
@@ -676,20 +716,22 @@ def parse_device_details(url, brand_name):
         # fire the device page, the main photo and the gallery page back to
         # back with no gap.
         main_photo_bytes = None
-        if img_url:
-            time.sleep(random.uniform(1.6, 3.2))
-            main_photo_bytes, _main_photo_blocked = _download_image_bytes(img_url)
-            if _main_photo_blocked:
-                instant_print("      ⚠️ 429 на головному фото — пропускаємо фото для цього пристрою")
-                _mark_soft_ban(420.0)
-                pause = random.uniform(300.0, 480.0)
-                instant_print(f"      💤 Пауза {int(pause)}с після 429 на фото...")
-                time.sleep(pause)
-                gallery_photo_bytes = []
+        gallery_photo_bytes = []
+        if fetch_photos:
+            if img_url:
+                time.sleep(random.uniform(1.6, 3.2))
+                main_photo_bytes, _main_photo_blocked = _download_image_bytes(img_url)
+                if _main_photo_blocked:
+                    instant_print("      ⚠️ 429 на головному фото — пропускаємо фото для цього пристрою")
+                    _mark_soft_ban(420.0)
+                    pause = random.uniform(300.0, 480.0)
+                    instant_print(f"      💤 Пауза {int(pause)}с після 429 на фото...")
+                    time.sleep(pause)
+                    gallery_photo_bytes = []
+                else:
+                    gallery_photo_bytes = _fetch_gallery_photo_bytes(url)
             else:
                 gallery_photo_bytes = _fetch_gallery_photo_bytes(url)
-        else:
-            gallery_photo_bytes = _fetch_gallery_photo_bytes(url)
 
         raw_announced = get_spec(soup, "year") or get_spec(soup, "announced")
         announced_date = parse_gsm_date(raw_announced)

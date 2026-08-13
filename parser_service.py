@@ -86,23 +86,44 @@ except ImportError:
 _parse_lock = threading.Lock()
 
 
-def _run_parse() -> None:
-    """Execute the parser. Called by scheduler or /trigger endpoint."""
+def _run_parse(mode: str = "full") -> None:
+    """Execute the parser. Called by scheduler or /trigger endpoint.
+
+    _parse_lock only guards against two /trigger calls racing each other
+    IN THIS PROCESS. gsm_parser_scheduler.py's --daemon is a separate
+    process with its own scheduled run_times check — a manual trigger
+    landing close to that schedule used to run fully in parallel with it
+    (confirmed live: two overlapping ~5h scrapes, one shared corrupted log,
+    two Telegram digests). The DB-backed lock below is the cross-process
+    guard; whichever side asks first wins, the other skips."""
     if not _parse_lock.acquire(blocking=False):
         print(f"[{datetime.now():%H:%M:%S}] Parser already running — skipped", flush=True)
         return
+    db_lock_owner = "trigger-service"
+    db_lock_acquired = False
+    _lock_db = None
     try:
         db_url = str(_cfg.get("database_url") or "").strip()
         if db_url:
             os.environ["DATABASE_URL"] = db_url
+        from database import DataManager
         from gsm_parser_runner import run_gsm_parser
-        run_gsm_parser("__global__", "", "", "full", True)
+
+        _lock_db = DataManager()
+        db_lock_acquired, lock_msg = _lock_db.try_acquire_gsm_parser_run_lock(db_lock_owner)
+        if not db_lock_acquired:
+            print(f"[{datetime.now():%H:%M:%S}] Пропущено — {lock_msg}", flush=True)
+            return
+        run_gsm_parser("__global__", "", "", mode or "full", True)
     except Exception as exc:
         msg = f"[{datetime.now():%H:%M:%S}] ПОМИЛКА: {exc}\n"
         print(msg, flush=True)
         with contextlib.suppress(Exception):
             _LOG_PATH.write_text(msg, encoding="utf-8")
     finally:
+        if db_lock_acquired and _lock_db is not None:
+            with contextlib.suppress(Exception):
+                _lock_db.release_gsm_parser_run_lock(db_lock_owner)
         _parse_lock.release()
 
 
@@ -136,6 +157,27 @@ class ConfigPayload(BaseModel):
 
 class SchedulePayload(BaseModel):
     schedule_time: str
+
+
+class TriggerPayload(BaseModel):
+    mode: str = "full"
+
+
+class ManualLinkPayload(BaseModel):
+    brand: str
+    device_type: str
+    url: str
+
+
+class ManualGsmLinkPayload(BaseModel):
+    device_id: str
+    url: str
+
+
+class ManualGsmDevicePayload(BaseModel):
+    brand: str
+    device_type: str
+    url: str
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -177,13 +219,89 @@ def set_schedule(data: SchedulePayload, x_api_key: str = Header("")):
 
 
 @app.post("/trigger")
-def trigger(x_api_key: str = Header("")):
+def trigger(data: TriggerPayload = TriggerPayload(), x_api_key: str = Header("")):
     """Manually trigger a parse run (runs in background thread)."""
     _require_auth(x_api_key)
     if _parse_lock.locked():
         return {"ok": False, "message": "Парсинг вже виконується"}
-    threading.Thread(target=_run_parse, daemon=True).start()
-    return {"ok": True, "message": "Парсинг запущено у фоні"}
+    mode = str(data.mode or "full").strip() or "full"
+    threading.Thread(target=_run_parse, args=(mode,), daemon=True).start()
+    return {"ok": True, "message": f"Парсинг запущено у фоні (mode={mode})"}
+
+
+@app.post("/fetch-manual-link")
+def fetch_manual_link(data: ManualLinkPayload, x_api_key: str = Header("")):
+    """Immediately fetch a single manually-pinned E-Katalog URL and store it
+    as a standalone device — instant feedback for the "Посилання ЄК" dialog
+    instead of waiting for the next scheduled/triggered full parse run.
+    Fast (one page fetch), safe to call synchronously — unlike /trigger,
+    which only ever starts the multi-hour full scrape in the background."""
+    _require_auth(x_api_key)
+    db_url = str(_cfg.get("database_url") or "").strip()
+    if db_url:
+        os.environ["DATABASE_URL"] = db_url
+    try:
+        from database import DataManager
+        from gsm_parser_runner import fetch_and_add_manual_ek_device
+
+        db = DataManager()
+        ok, msg_or_name, dev_id, _ch, _ev = fetch_and_add_manual_ek_device(
+            db, data.brand, data.device_type, data.url
+        )
+        return {"ok": ok, "message": msg_or_name, "device_id": dev_id}
+    except Exception as exc:
+        return {"ok": False, "message": str(exc)}
+
+
+@app.post("/fetch-manual-gsm-link")
+def fetch_manual_gsm_link(data: ManualGsmLinkPayload, x_api_key: str = Header("")):
+    """Immediately fetch a single manually-pinned GSM Arena URL and attach it
+    to an existing standalone E-Katalog device — instant feedback for the
+    "Посилання GSM Arena" dialog instead of waiting for the next scheduled/
+    triggered full parse run to discover the match on its own. Synchronous
+    like /fetch-manual-link, but this one page fetch has its own built-in
+    anti-bot pacing (~30-55s, see GSM_Parser/main.py's parse_device_details)
+    so it runs noticeably slower than the E-Katalog equivalent."""
+    _require_auth(x_api_key)
+    db_url = str(_cfg.get("database_url") or "").strip()
+    if db_url:
+        os.environ["DATABASE_URL"] = db_url
+    try:
+        from database import DataManager
+        from gsm_parser_runner import fetch_and_attach_manual_gsm_url
+
+        db = DataManager()
+        ok, msg_or_name, gsm_dev_id = fetch_and_attach_manual_gsm_url(
+            db, data.device_id, data.url
+        )
+        return {"ok": ok, "message": msg_or_name, "device_id": gsm_dev_id}
+    except Exception as exc:
+        return {"ok": False, "message": str(exc)}
+
+
+@app.post("/fetch-manual-gsm-device")
+def fetch_manual_gsm_device(data: ManualGsmDevicePayload, x_api_key: str = Header("")):
+    """Immediately fetch a manually-pinned GSM Arena URL for a device that
+    has NO row on either side yet (unlike /fetch-manual-gsm-link, which
+    attaches to an EXISTING standalone E-Katalog device) — instant feedback
+    for the toolbar "Посилання GSM Arena" dialog, mirroring /fetch-manual-
+    link's E-Katalog equivalent. Same anti-bot-pacing note as /fetch-manual-
+    gsm-link — skipped for this one-off manual fetch."""
+    _require_auth(x_api_key)
+    db_url = str(_cfg.get("database_url") or "").strip()
+    if db_url:
+        os.environ["DATABASE_URL"] = db_url
+    try:
+        from database import DataManager
+        from gsm_parser_runner import fetch_and_add_manual_gsm_device
+
+        db = DataManager()
+        ok, msg_or_name, gsm_dev_id = fetch_and_add_manual_gsm_device(
+            db, data.brand, data.device_type, data.url
+        )
+        return {"ok": ok, "message": msg_or_name, "device_id": gsm_dev_id}
+    except Exception as exc:
+        return {"ok": False, "message": str(exc)}
 
 
 @app.get("/logs")

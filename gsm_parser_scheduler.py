@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import logging
 import os
 import sys
@@ -57,7 +58,20 @@ def init_db() -> Optional[DataManager]:
 
 
 def run_parser_once(db: DataManager) -> bool:
-    """Execute parser once and record results in DB."""
+    """Execute parser once and record results in DB.
+
+    parser_service.py's /trigger endpoint (hit by the desktop app's
+    "Запустити"/"Запланувати запуск" buttons) runs in a SEPARATE process
+    with its own in-process lock, which can't see this daemon's schedule —
+    a manual trigger landing close to a scheduled run used to execute in
+    full parallel with it (confirmed live: two overlapping ~5h scrapes, one
+    shared corrupted log, two Telegram digests). Claim the shared DB lock
+    before running so whichever side asks first wins; the other skips."""
+    owner = "scheduler-daemon"
+    acquired, lock_msg = db.try_acquire_gsm_parser_run_lock(owner)
+    if not acquired:
+        logger.info("Scheduled run skipped — %s", lock_msg)
+        return False
     try:
         logger.info("Starting GSM Parser execution...")
         from gsm_parser_runner import run_gsm_parser
@@ -73,6 +87,9 @@ def run_parser_once(db: DataManager) -> bool:
     except Exception as exc:
         logger.exception("Parser execution failed: %s", exc)
         return False
+    finally:
+        with contextlib.suppress(Exception):
+            db.release_gsm_parser_run_lock(owner)
 
 
 def show_schedule(db: DataManager) -> None:

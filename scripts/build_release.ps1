@@ -3,7 +3,7 @@
     [switch]$SkipCodeProtection,
     [switch]$NoSetup,
     [switch]$BuildApk,
-    [ValidateSet("main", "superadmin", "both")]
+    [ValidateSet("main", "superadmin", "gsmparser", "both")]
     [string]$App = "main",
     [switch]$CopyToDesktop
 )
@@ -28,6 +28,15 @@ $buildSetup = -not $NoSetup
 $appProfiles = @{
     main       = @{
         EntryScript       = "main.py"
+        # Where THIS app's own APP_VERSION constant lives — main.py reads it
+        # from config.py's Config class; superadmin_app.py/gsm_parser_app.py
+        # each carry their own standalone module-level constant instead
+        # (see those profiles below). Only patched when this profile is
+        # actually part of $appsToBuild — see the version-sync loop below,
+        # which replaced an old unconditional config.py-only patch that used
+        # to silently overwrite Pro's version even when building ONLY
+        # SupAdm/GSM Parser with a different version number.
+        VersionFile       = "config.py"
         ExeBaseName       = "CatManPro"
         HiddenImports     = @(
             "flet", "auth_screen", "dashboard", "superadmin_dashboard",
@@ -35,7 +44,7 @@ $appProfiles = @{
             "views.categories_brands_view", "views.packaging_view",
             "views.products_view", "views.settings_view", "views.suppliers_view",
             "views.notebook_view", "views.languages_view", "views.help_utils",
-            "views.web_site_view", "gsm_scheduler",
+            "views.web_site_view",
             # matplotlib (GSM Parser device-card charts) imports this dynamically —
             # PyInstaller's static analysis never sees the reference, so just NOT
             # excluding "unittest" isn't enough; it must be forced in explicitly
@@ -62,6 +71,7 @@ $appProfiles = @{
     }
     superadmin = @{
         EntryScript       = "superadmin_app.py"
+        VersionFile       = "superadmin_app.py"
         ExeBaseName       = "CatManSupAdm"
         HiddenImports     = @(
             "flet", "superadmin_dashboard", "database", "config", "logger", "bcrypt", "unittest",
@@ -74,6 +84,27 @@ $appProfiles = @{
         ApkProject        = "CatManSupAdm"
         ApkProduct        = "CatMan SupAdm"
         StubModuleName    = "superadmin_app"
+        StubHasCrashHooks = $false
+    }
+    gsmparser  = @{
+        EntryScript       = "gsm_parser_app.py"
+        VersionFile       = "gsm_parser_app.py"
+        ExeBaseName       = "CatManGSMParser"
+        HiddenImports     = @(
+            "flet", "auth_screen", "database", "config", "logger", "bcrypt",
+            "app_storage", "app_updater", "views.gsm_parser_view", "views.help_utils",
+            # Same GSM Parser device-card chart requirement as "main" — see that
+            # profile's own comment for why this must be forced explicitly.
+            "unittest",
+            "cryptography", "cryptography.fernet", "tkinter"
+        )
+        InstallerAppName  = "CatMan GSM Parser"
+        InstallerAppId    = "{{5A6E2F13-8C4B-4A29-9D71-6E3F0B9C2D48}"
+        ApkModuleName     = "gsm_parser_app"
+        ApkOrg            = "com.catmanpro.gsmparser"
+        ApkProject        = "CatManGSMParser"
+        ApkProduct        = "CatMan GSM Parser"
+        StubModuleName    = "gsm_parser_app"
         StubHasCrashHooks = $false
     }
 }
@@ -99,10 +130,21 @@ if (Test-Path "requirements.txt") {
 & $python -m pip install pyinstaller pyarmor nuitka
 
 if (-not [string]::IsNullOrWhiteSpace($Version)) {
-    $cfg = Get-Content "config.py" -Raw
-    $cfg = $cfg -replace 'APP_VERSION\s*=\s*"[^"]+"', "APP_VERSION = `"$Version`""
-    Set-Content "config.py" $cfg -Encoding UTF8
-    Write-Host "Updated APP_VERSION to $Version"
+    # Only patch the VersionFile belonging to a profile actually being built
+    # this run — each of the 4 apps now carries its own independent version
+    # number (Pro/SupAdm/GSMParser can each ship a different release), so
+    # unconditionally rewriting config.py here (the old behavior) would
+    # silently clobber Pro's own version any time this script ran for just
+    # "superadmin" or "gsmparser" with a different -Version value.
+    $patchedVersionFiles = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($appKey in $appsToBuild) {
+        $versionFile = $appProfiles[$appKey].VersionFile
+        if (-not $versionFile -or -not $patchedVersionFiles.Add($versionFile)) { continue }
+        $cfg = Get-Content $versionFile -Raw
+        $cfg = $cfg -replace 'APP_VERSION\s*=\s*"[^"]+"', "APP_VERSION = `"$Version`""
+        Set-Content $versionFile $cfg -Encoding UTF8
+        Write-Host "Updated APP_VERSION to $Version in $versionFile"
+    }
 }
 
 if (-not $buildSetup -and -not $BuildApk) {
@@ -262,15 +304,22 @@ finally:
 '@
                 }
                 else {
-                    $stubContent = @'
+                    # Interpolating here-string (not the '@ literal form used
+                    # above) — the module to import/lock and the app's own
+                    # display name differ per profile (superadmin_app vs
+                    # gsm_parser_app), so those two spots are substituted from
+                    # $appProfile itself instead of being hardcoded.
+                    $stubModule = $appProfile.StubModuleName
+                    $stubAppName = $appProfile.InstallerAppName
+                    $stubContent = @"
 import sys
 
 import flet as ft
 
-import superadmin_app
+import $stubModule
 from logger import logger
 
-_lock = superadmin_app._acquire_single_instance_lock()
+_lock = $stubModule._acquire_single_instance_lock()
 if _lock is None:
     try:
         import tkinter as tk
@@ -279,8 +328,8 @@ if _lock is None:
         root = tk.Tk()
         root.withdraw()
         messagebox.showwarning(
-            "CatMan SupAdm",
-            "Програма вже запущена!\n\nЗнайдіть вікно CatMan SupAdm на панелі задач.",
+            "$stubAppName",
+            "Програма вже запущена!\n\nЗнайдіть вікно $stubAppName на панелі задач.",
         )
         root.destroy()
     except Exception:
@@ -288,10 +337,10 @@ if _lock is None:
     sys.exit(0)
 
 try:
-    ft.run(superadmin_app.main)
+    ft.run($stubModule.main)
 finally:
     _lock.close()
-'@
+"@
                 }
                 Set-Content -Path $stubPath -Value $stubContent -Encoding UTF8
 
@@ -350,6 +399,37 @@ finally:
                 }
                 else {
                     Write-Warning "vendor/pgsql not found — build will not support Локал (local Postgres) storage mode."
+                }
+
+                # gsm_parser_runner.py loads GSM_Parser/main.py + ekatalog.py
+                # at runtime via importlib.util.spec_from_file_location, NOT
+                # a regular `import` — PyInstaller's static analysis can't
+                # see that reference, so the folder was never bundled and
+                # every manual "Запустити" click in the installed app failed
+                # with "No such file or directory: ...\_internal\GSM_Parser\
+                # main.py" (confirmed live). Only these two files are
+                # actually loaded by gsm_parser_runner.py (_legacy_gsm /
+                # _legacy_ek) — neither imports GSM_Parser's other sibling
+                # scripts (auto.py, compatibility_builder.py,
+                # telegram_report.py, xiaomi_sync.py, all dead weight here).
+                # Deliberately NOT bundling the whole GSM_Parser folder:
+                # it also contains a Google service-account JSON key and a
+                # possibly-populated proxy.txt with live proxy credentials —
+                # shipping those inside a distributed installer would leak
+                # them to every user. Neither file is needed here: the
+                # Google Sheets export functions that read the JSON key are
+                # legacy code gsm_parser_runner.py never calls, and
+                # proxy.txt is read via `if path.exists()` (silently
+                # skipped when absent).
+                foreach ($legacyFile in @("main.py", "ekatalog.py")) {
+                    $legacyPath = "GSM_Parser/$legacyFile"
+                    if (Test-Path $legacyPath) {
+                        $legacyAbs = (Resolve-Path $legacyPath).Path
+                        $basePyiArgs += @("--add-data", "$legacyAbs;GSM_Parser")
+                    }
+                    else {
+                        Write-Warning "$legacyPath not found — manual GSM Parser runs will fail in the installed build."
+                    }
                 }
             }
 

@@ -14,6 +14,7 @@ import logging
 import os
 import queue
 import re
+import shutil
 import threading
 import time
 import unittest  # noqa: F401 — matplotlib (charts below) imports this
@@ -76,6 +77,27 @@ _ACCENT = "#1D4ED8"
 _MUTED = "#475569"
 _BORDER = "#CBD5E1"
 _PANEL = "#FFFFFF"
+
+# Xiaomi regional-variant badges (_build_regional_variants_section) — one
+# distinct, readable (bg, fg, border) triple per market so a device's whole
+# region spread is scannable by color at a glance, not just by text. Global/
+# Europe are also the two sized markets (get a table row too, not just a
+# badge); everything else here is badge-only. Falls back to a neutral grey
+# for any region name not listed (future markets GitHub adds).
+_REGION_BADGE_COLORS: dict[str, tuple[str, str, str]] = {
+    "Global": ("#DBEAFE", "#1D4ED8", "#BFDBFE"),
+    "Europe": ("#E0E7FF", "#4338CA", "#C7D2FE"),
+    "China": ("#FEE2E2", "#B91C1C", "#FECACA"),
+    "India": ("#FFEDD5", "#C2410C", "#FED7AA"),
+    "Japan": ("#FCE7F3", "#BE185D", "#FBCFE8"),
+    "Korea": ("#CCFBF1", "#0F766E", "#99F6E4"),
+    "Thailand": ("#FEF3C7", "#92400E", "#FDE68A"),
+    "Taiwan": ("#CFFAFE", "#0E7490", "#A5F3FC"),
+    "Brazil": ("#DCFCE7", "#15803D", "#BBF7D0"),
+    "Latin America": ("#FFE4D5", "#C2410C", "#FED0B3"),
+    "Saudi Arabia": ("#ECFCCB", "#4D7C0F", "#D9F99D"),
+}
+_REGION_BADGE_FALLBACK = ("#F1F5F9", "#475569", "#E2E8F0")
 
 # ── Column specs (key, width, label, sortable) ─────────────────────────────
 # Single source of truth — used by BOTH header row and data rows.
@@ -272,33 +294,56 @@ def _parse_ek_date_added(raw: str) -> tuple[int, int]:
 
 
 def _gsm_native_order_key(d: dict):
-    """Mirrors get_gsm_merged_results' default ORDER BY (database.py) in
-    Python — belt-and-suspenders so the intended order (GSM Arena "Coming
-    soon" devices on top, then newest release date, falling back to
-    announce date, then standalone E-Katalog-only devices by "Дата
-    додавання") holds even if a caller ends up re-sorting an already
-    DB-ordered list (e.g. the in-memory device cache, which persists across
-    tab visits and isn't guaranteed to always reflect the latest query).
+    """Default per-brand order (no explicit column sort active). "Coming
+    soon" GSM Arena devices stay pinned on top; everything else is ordered
+    newest-first by the SAME unified date priority as the explicit "Дата"
+    column sort (_ek_date_key below): E-Katalog's own date first, else GSM
+    Arena release date, else GSM Arena announce date (both reduced to
+    E-Katalog's year+month granularity), else last.
+
+    Previously a device with real GSM Arena data (any release/announce
+    date, however old) always ranked above an E-Katalog-only device
+    (tier 3, always last-but-one) — REGARDLESS of which one was actually
+    newer. That put a brand-new manually-pinned E-Katalog device (real EK
+    date this month, no GSM Arena match yet) below GSM-matched devices from
+    2018, because "has any GSM date" outranked "has a newer EK date". Now
+    the actual date decides in every case; only the true "no date
+    anywhere" devices sink to the bottom.
 
     Ascending sort on the returned tuple reproduces: tier ascending, date
-    descending (newest first) — hence the negated year/month/day."""
+    descending (newest first) — hence the negated year/month/day.
+
+    A trailing region_split_group_id tie-break keeps split siblings
+    ("(Global)"/"(Europe)"/... cards from split_gsm_device_by_region)
+    adjacent to each other instead of scattered across the list — they
+    always share an identical date tier (their specs, including
+    released/announced/date_added, are cloned verbatim at split time), so
+    without this they'd only stay together by accident of insertion order.
+    Empty string (non-split devices) sorts first within each date tier —
+    stable sort keeps their own relative order unaffected — real group ids
+    sort after, clustering every device that shares one together."""
     gs = d.get("gsm_specs") or {}
     es = d.get("ek_specs") or {}
     if d.get("gsm_name"):
         released = str(gs.get("released") or "").strip()
         if "coming" in released.lower():
-            return (0, 0, 0, 0)
-        rel = _parse_gsm_ddmmyyyy(released)
-        if rel:
-            y, m, day = rel
-            return (1, -y, -m, -day)
-        ann = _parse_gsm_ddmmyyyy(str(gs.get("announced") or "").strip())
-        if ann:
-            y, m, day = ann
-            return (2, -y, -m, -day)
-        return (4, 0, 0, 0)
+            return (0, 0, 0, "")
+
+    split_group = str(gs.get("region_split_group_id") or "").strip()
+
     year, month = _parse_ek_date_added(str(es.get("date_added") or ""))
-    return (3, -year, -month, 0)
+    if not year and not month:
+        rel = _parse_gsm_ddmmyyyy(str(gs.get("released") or "").strip())
+        if rel:
+            year, month = rel[0], rel[1]
+        else:
+            ann = _parse_gsm_ddmmyyyy(str(gs.get("announced") or "").strip())
+            if ann:
+                year, month = ann[0], ann[1]
+
+    if not year and not month:
+        return (2, 0, 0, split_group)
+    return (1, -year, -month, split_group)
 
 
 # ---------------------------------------------------------------------------
@@ -310,11 +355,27 @@ _CACHE_TRIGGER_TS = None  # datetime | None — trigger timestamp when cache was
 _CACHE_LOADING = False
 # Pre-computed filter option sets — refreshed once per cache load, not per click.
 _FILTER_OPTIONS: dict = {"brands": [], "types": [], "years": [], "statuses": []}
+# Set once the lightweight DB-only filter-options query (see
+# _build_filter_panel) has been tried, so a cold start with genuinely no
+# devices anywhere doesn't re-query on every single rebuild.
+_LIGHT_FILTER_OPTIONS_LOADED = False
 
 # Per-device detail cache: compat, comment, variants, chart history
 _DETAIL_CACHE: dict[str, dict] = {}
 _DETAIL_LOCK = threading.Lock()
 _DETAIL_TS = None  # trigger_ts when _DETAIL_CACHE was fully built
+
+# _get_xiaomi_size_groups' result per device_id — that function re-parses
+# the full regional-variants list into size groups from scratch on every
+# call, and it's called for every Xiaomi row on every single table render
+# (column display, filter-by-size, sort, comparison) — with 271+ Xiaomi
+# devices in a filtered view, that's the same non-trivial parse repeated
+# dozens of times per click, which is exactly what made "Фільтри"
+# toggling and size filtering feel like they hang. Keyed off the same
+# device_id as _DETAIL_CACHE and invalidated together with it (see
+# _set_device_detail) since a size group is only ever derived from that
+# device's cached variants.
+_SIZE_GROUPS_CACHE: dict[str, list] = {}
 
 # Per-device gallery photo cache: device_id -> list of LOCAL file paths
 # (downloaded from the DB once, written to disk under _photo_cache_dir()).
@@ -355,6 +416,12 @@ _CACHE_LOAD_TS: datetime | None = None
 # history actually changed (see the "sig" check in _build_adaptive_charts).
 _CHART_RENDER_LOCK = threading.Lock()
 _CHART_RENDER_CACHE: dict[str, dict] = {}
+
+# Same idea as _CHART_RENDER_CACHE but for the comparison modal's "Діаграми"
+# tab — keyed by the tuple of compared entry keys (not a single device_id,
+# since it's one render covering every selected model at once).
+_CMP_CHART_RENDER_LOCK = threading.Lock()
+_CMP_CHART_RENDER_CACHE: dict[tuple, dict] = {}
 
 
 # Which size-group tab was last active in the compat-editing UI, per
@@ -408,6 +475,7 @@ def _get_device_detail(device_id: str) -> dict | None:
 def _set_device_detail(device_id: str, data: dict):
     with _DETAIL_LOCK:
         _DETAIL_CACHE[device_id] = data
+        _SIZE_GROUPS_CACHE.pop(device_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +549,7 @@ def _load_cache_from_disk() -> bool:
                 _FILTER_OPTIONS = _compute_filter_options(devices)
         with _DETAIL_LOCK:
             _DETAIL_CACHE = dict(detail_by_id) if isinstance(detail_by_id, dict) else {}
+            _SIZE_GROUPS_CACHE.clear()
         _LAST_SYNC_TS = datetime.fromisoformat(last_sync_raw) if last_sync_raw else None
         return True
     except Exception:
@@ -558,11 +627,11 @@ def _save_chart_cache_to_disk() -> None:
             logger.exception("[GSM] failed to save on-disk chart cache")
 
 
-def _last_9am_boundary(now: datetime | None = None) -> datetime:
+def _last_8am_boundary(now: datetime | None = None) -> datetime:
     """The most recent 8:00 — today's if we're past it, otherwise yesterday's."""
     now = now or datetime.now()
-    today_9 = now.replace(hour=8, minute=0, second=0, microsecond=0)
-    return today_9 if now >= today_9 else today_9 - timedelta(days=1)
+    today_8 = now.replace(hour=8, minute=0, second=0, microsecond=0)
+    return today_8 if now >= today_8 else today_8 - timedelta(days=1)
 
 
 def _needs_daily_sync(last_sync_ts: datetime | None) -> bool:
@@ -573,7 +642,7 @@ def _needs_daily_sync(last_sync_ts: datetime | None) -> bool:
     before 8:00, which silently skipped the missed-yesterday case.)"""
     if last_sync_ts is None:
         return True
-    return last_sync_ts < _last_9am_boundary()
+    return last_sync_ts < _last_8am_boundary()
 
 
 # ---------------------------------------------------------------------------
@@ -593,20 +662,6 @@ _PARSER_BUTTONS_CB = (
 )
 _PARSER_REFRESH_TABLE_CB = None  # callable() | None — current view's table refresh
 _MONITOR_TASKS_ACTIVE = False  # guards against duplicate monitor task spawns
-
-# ---------------------------------------------------------------------------
-# Scheduled (delayed) manual launch — lets whoever is allowed to run the
-# parser ("Запустити") pick a future time instead of launching immediately
-# (e.g. running it locally late at night, delayed past midnight so today's
-# changes get recorded under tomorrow's date). Session-only, same lifetime
-# as the run-state above — does not survive an app restart, matching how
-# _PARSER_RUNNING itself doesn't either.
-# ---------------------------------------------------------------------------
-_PARSER_SCHEDULE_TARGET_TS: float | None = None  # epoch seconds; None = nothing scheduled
-_PARSER_SCHEDULE_MODE = "full"
-_PARSER_SCHEDULE_STATUS_CB = None  # callable(str) | None — current view's countdown updater
-_PARSER_SCHEDULE_LAUNCH_CB = None  # callable(Any, str) -> awaitable | None — current view's _launch_async
-
 
 def _parser_is_running() -> bool:
     with _PARSER_LOCK:
@@ -638,92 +693,6 @@ def _parser_notify_buttons(running: bool, paused: bool) -> None:
     if cb:
         with contextlib.suppress(Exception):
             cb(running, paused)
-
-
-def _parser_schedule_target() -> float | None:
-    with _PARSER_LOCK:
-        return _PARSER_SCHEDULE_TARGET_TS
-
-
-def _parser_schedule_set_status(s: str) -> None:
-    cb = _PARSER_SCHEDULE_STATUS_CB
-    if cb:
-        with contextlib.suppress(Exception):
-            cb(s)
-
-
-def _schedule_countdown_parts(target_ts: float) -> tuple[str, str]:
-    remaining = max(0, int(target_ts - time.time()))
-    h, rem = divmod(remaining, 3600)
-    m, s = divmod(rem, 60)
-    when = datetime.fromtimestamp(target_ts).strftime("%H:%M")
-    if h:
-        left = f"{h} год {m} хв"
-    elif m:
-        left = f"{m} хв {s} с"
-    else:
-        left = f"{s} с"
-    return when, left
-
-
-def _format_schedule_countdown(target_ts: float) -> str:
-    when, left = _schedule_countdown_parts(target_ts)
-    return i18n.t(
-        "gsm.schedule.active_status", "Заплановано на {time} (через {left})"
-    ).format(time=when, left=left)
-
-
-def _parser_cancel_schedule() -> None:
-    global _PARSER_SCHEDULE_TARGET_TS
-    with _PARSER_LOCK:
-        _PARSER_SCHEDULE_TARGET_TS = None
-    _parser_schedule_set_status("")
-
-
-async def _parser_schedule_waiter(target_ts: float, mode: str) -> None:
-    """Background waiter for a scheduled launch. Runs on the page's own event
-    loop (started via page_ctrl.run_task at schedule time), independent of
-    which view/tab happens to be visible when the target time arrives — the
-    same "keeps running regardless of tab visibility" model the running
-    parser's own progress-monitor tasks already rely on."""
-    global _PARSER_SCHEDULE_TARGET_TS
-    try:
-        while True:
-            with _PARSER_LOCK:
-                cur = _PARSER_SCHEDULE_TARGET_TS
-            if cur != target_ts:
-                return  # cancelled, or superseded by a newer schedule
-            remaining = cur - time.time()
-            if remaining <= 0:
-                break
-            _parser_schedule_set_status(_format_schedule_countdown(cur))
-            await asyncio.sleep(1.0 if remaining < 5 else min(5.0, remaining))
-        with _PARSER_LOCK:
-            if _PARSER_SCHEDULE_TARGET_TS == target_ts:
-                _PARSER_SCHEDULE_TARGET_TS = None
-        _parser_schedule_set_status("")
-        if _parser_is_running():
-            return
-        launch_cb = _PARSER_SCHEDULE_LAUNCH_CB
-        if launch_cb is not None:
-            with contextlib.suppress(Exception):
-                await launch_cb(None, mode)
-    except asyncio.CancelledError:
-        pass
-
-
-def _parser_start_schedule(page_ctrl, delay_seconds: float, mode: str) -> bool:
-    global _PARSER_SCHEDULE_TARGET_TS, _PARSER_SCHEDULE_MODE
-    if not page_ctrl or not hasattr(page_ctrl, "run_task"):
-        return False
-    target_ts = time.time() + max(1.0, float(delay_seconds or 0))
-    with _PARSER_LOCK:
-        _PARSER_SCHEDULE_TARGET_TS = target_ts
-        _PARSER_SCHEDULE_MODE = mode
-    _parser_schedule_set_status(_format_schedule_countdown(target_ts))
-    with contextlib.suppress(Exception):
-        page_ctrl.run_task(_parser_schedule_waiter, target_ts, mode)
-    return True
 
 
 _PARSER_BANNER_REF: ft.Stack | None = (
@@ -812,6 +781,21 @@ def _fmt_price(v) -> str:
     if f is None:
         return "—"
     return f"{f:,.0f} ₴".replace(",", " ")
+
+
+def _norm_size_num(v) -> str:
+    """Normalize one L/W/T/diagonal value for size-group comparison — two
+    regions typed as "8.5" and "8.50" (or "8,5") are the SAME physical
+    size and must never split into separate comparison/split cards just
+    because of formatting. Raw string equality was doing exactly that."""
+    s = str(v or "").strip().replace(",", ".")
+    if not s:
+        return ""
+    try:
+        f = float(s)
+    except Exception:
+        return s
+    return f"{f:.2f}".rstrip("0").rstrip(".")
 
 
 # ---------------------------------------------------------------------------
@@ -955,7 +939,7 @@ def open_sidebar_device_card(db, page, device_id: str, t_fn=None) -> None:
     dlg.actions_alignment = ft.MainAxisAlignment.END
     _sidebar_card_dialog[pid] = dlg
     with contextlib.suppress(Exception):
-        page.open(dlg)
+        page.show_dialog(dlg)
 
 
 # ---------------------------------------------------------------------------
@@ -1012,12 +996,45 @@ class GsmParserView:
             self.is_superadmin or "xiaomi_sizes" in _granted_gsm_perms
         )
         self.can_run_parser = self.is_superadmin or "run_parser" in _granted_gsm_perms
+        # Delete/exclude a single GSM Arena or E-Katalog device, and the
+        # Xiaomi manual region-size split/merge action — same gate as every
+        # other GSM Parser edit: superadmin, or a manager explicitly granted
+        # this permission (see extensions.py's _PERM_DEFS).
+        self.can_manage_devices = (
+            self.is_superadmin or "manage_devices" in _granted_gsm_perms
+        )
+        # Per-region "Є в продажу" toggle inside the regional-variants table
+        # (see set_gsm_region_in_stock) — its own gate, separate from
+        # manage_devices, since it's a routine editorial call rather than a
+        # structural/destructive device action.
+        self.can_edit_region_availability = (
+            self.is_superadmin or "region_availability" in _granted_gsm_perms
+        )
+        # Manually pinning/detaching a GSM Arena page for a device (mirror
+        # of the existing manual E-Katalog link buttons) — its own gate
+        # since it can delete a device's GSM Arena data (migrating history
+        # to the E-Katalog row) or attach an arbitrary external page.
+        self.can_manage_gsm_links = (
+            self.is_superadmin or "manual_gsm_link" in _granted_gsm_perms
+        )
 
         # Per-instance UI state
         self._search = ""
         self._sort_col = "brand"
         self._sort_asc = True
         self._page_idx = 0
+        # Table's own vertical scroll position — captured continuously via
+        # on_scroll so it can be restored after _build_results_content()
+        # constructs a brand-new scrollable Column (closing a device/compare
+        # modal, split/merge, a background sync's full rebuild, etc. all
+        # replace this Column outright, and a freshly-built Flet/Flutter
+        # scrollable always starts at 0 regardless of what the OLD one's
+        # offset was — nothing here jumps the user around on its own,
+        # Flet just has no way to carry scroll state across a swapped-out
+        # control unless something explicitly restores it, which is what
+        # _table_v_scroll_ref + this offset are for).
+        self._table_v_scroll_ref: ft.Ref[ft.Column] = ft.Ref[ft.Column]()
+        self._table_scroll_pixels: float = 0.0
         # Toggled by the "Групування" toolbar button — when True, the table
         # is a single flat list of every device (no brand headers/dividers/
         # collapse state at all) instead of the normal brand-grouped view.
@@ -1029,14 +1046,6 @@ class GsmParserView:
         self._reveal_rows_total: int = 0
         self._reveal_charts_done: int = 0
         self._reveal_charts_total: int = 0
-        # Device ids whose chart+photo are already warmed (either by the
-        # initial full preload, or by a later catch-up — see
-        # _catch_up_new_devices). Lets a filter change that reveals
-        # devices outside what was originally preloaded (e.g. a user who
-        # only ever filters to one device type) top up just the delta
-        # instead of assuming everything is already ready.
-        self._warm_device_ids: set[str] = set()
-        self._catch_up_running: bool = False
         self._brand_devs_by_name: dict[str, list[dict]] = {}
         self._brand_body_by_name: dict[str, ft.Container] = {}
         self._color_maps: tuple = ({}, {}, {}, {})
@@ -1101,7 +1110,24 @@ class GsmParserView:
         return False
 
     def _load_devices_sync(self) -> list[dict]:
-        return self.db.get_gsm_merged_results(limit=50000) or []
+        rows = self.db.get_gsm_merged_results(limit=50000) or []
+        # A region-split sibling with "Є в продажу Україна" unchecked isn't
+        # actually sold here — its E-Katalog price/shop columns (cloned onto
+        # it during the split, see split_gsm_device_by_region) must read as
+        # absent, not as real market data, everywhere this row is used
+        # (table cells, product card, charts).
+        for r in rows:
+            gsm_specs = r.get("gsm_specs") if isinstance(r.get("gsm_specs"), dict) else None
+            if (
+                gsm_specs
+                and gsm_specs.get("region_split_group_id")
+                and gsm_specs.get("available_ua") is False
+            ):
+                r["ek_id"] = None
+                r["ek_name"] = None
+                r["ek_url"] = None
+                r["ek_specs"] = None
+        return rows
 
     def _fetch_device_detail_sync(self, device_id: str, dev: dict) -> dict:
         """Fetch all card-level DB data for one device (runs in thread)."""
@@ -1427,34 +1453,28 @@ class GsmParserView:
             self._hide_loading_overlay()
 
     async def _load_data_for_filters(self, page) -> None:
-        """Quietly loads device DATA only (disk cache, or a DB sync if the
-        daily boundary was missed) so the filter panel has real
-        brand/type/year options to offer — without building a single row,
-        chart, or photo. That expensive work stays gated behind "Показати
-        результати" (explicit product decision); this just makes it
-        possible to actually SET a filter beforehand, since the filter
-        panel's options are derived from the loaded device list and would
-        otherwise show nothing until the very button that's supposed to
-        use those filters. Auto-started once per tab open — see
-        _build_results_content."""
+        """Quietly loads device DATA only from the on-disk cache (never a DB
+        sync) so the filter panel has real brand/type/year options to offer
+        — without building a single row, chart, or photo. That expensive
+        work — AND any DB sync — stays gated behind "Показати результати"
+        (explicit product requirement: nothing loads in the background
+        outside that click; _reveal_sync owns the sync entirely). This just
+        makes it possible to actually SET a filter beforehand from whatever
+        is already cached on disk, since the filter panel's options are
+        derived from the loaded device list and would otherwise show
+        nothing until the very button that's supposed to use those
+        filters. A DB sync started here used to also set the global
+        `loading` flag, which made a click on "Показати результати" that
+        landed mid-sync sit in _reveal_sync's wait loop for up to the full
+        10-minute cap — i.e. the button appearing to hang for minutes with
+        the fan spinning, for a sync the user never asked for. Auto-started
+        once per tab open — see _build_results_content."""
         try:
             devices, _, loading = _get_cache()
             if loading:
                 return  # someone else (_background_load, another session) already on it
             if devices is None:
-                loaded_from_disk = await asyncio.to_thread(_load_cache_from_disk)
-                if not loaded_from_disk and self._needs_reload():
-                    _set_loading(True)
-                    try:
-                        await asyncio.to_thread(self._sync_cache_from_db, False)
-                    finally:
-                        _set_loading(False)
-            elif self._needs_reload() and not _parser_is_running():
-                _set_loading(True)
-                try:
-                    await asyncio.to_thread(self._sync_cache_from_db, False)
-                finally:
-                    _set_loading(False)
+                await asyncio.to_thread(_load_cache_from_disk)
             # Refresh just the filter panel (now has real options) and the
             # "Знайдено: N" count — never the table/reveal state.
             if self._filter_panel_ref is not None:
@@ -1541,10 +1561,18 @@ class GsmParserView:
                 self._update_reveal_progress_text()
                 await self._fill_expanded_brands_async(_to_fill, color_maps)
 
-            # Diagrams — batched, and cache-aware (_build_adaptive_charts
-            # skips anything already rendered whose price history hasn't
-            # changed since last time), so this is only slow the very
-            # first time it ever runs.
+            # Explicit product decision (confirmed twice): ALL loading,
+            # including every device's chart, happens HERE — behind the
+            # "Показати результати" click — never later, not even a small
+            # per-card render the first time a card is opened. Tried
+            # deferring this to lazy per-card rendering (cheap, cache-aware,
+            # off the UI thread) since eager rendering is genuinely the
+            # dominant cost of this whole reveal (~90s for ~650-850 devices,
+            # one render at a time, the very first time each day — see
+            # _build_adaptive_charts's on-disk cache for why repeat reveals
+            # the same day are fast) — rejected: any loading after the
+            # table appears, however small and non-blocking, is still
+            # loading after the click.
             await self._preload_charts_for_current_page()
 
             # Local photo cache — bulk-warmed from DB for the WHOLE
@@ -1552,10 +1580,11 @@ class GsmParserView:
             # covered, so no row's first paint ever falls back to fetching
             # from GSM Arena/E-Katalog directly.
             await self._warm_photo_cache_from_db()
-            with contextlib.suppress(Exception):
-                self._warm_device_ids = {
-                    str(d.get("id") or "") for d in self._get_filtered_devices()
-                }
+
+            # Gallery (extra) photos — same "warm everything now" rule as
+            # the main thumbnail above, just for the per-card photo
+            # gallery instead of the table row.
+            await self._warm_gallery_photo_cache_from_db()
             self._hide_loading_overlay()
             _catlog.info(
                 "[GSM] _reveal_sync completed: rows=%s/%s charts=%s/%s",
@@ -1605,6 +1634,57 @@ class GsmParserView:
                             f.write(photo_bytes)
             except Exception:
                 logger.exception("[GSM] photo cache warm failed for a chunk")
+            await asyncio.sleep(0)
+
+    async def _warm_gallery_photo_cache_from_db(self, devices: list[dict] | None = None) -> None:
+        """Bulk-warms the gallery (extra) photo cache — both on-disk files
+        AND the in-memory _PHOTO_CACHE dict a card's _load_photos_async
+        checks — for the given device set (default: the whole current
+        filtered catalog). Without this, _PHOTO_CACHE starts empty for
+        every device regardless of how warm everything else is, so a
+        card's gallery section always did one DB round trip (+ a spawned
+        thread) the first time each device's card was opened — real
+        "loading after the table is already built", just per-card instead
+        of catalog-wide. Explicit product requirement: nothing loads
+        outside this reveal, not even a small per-card fetch."""
+        try:
+            page_devs = devices if devices is not None else self._page_items(
+                self._get_filtered_devices()
+            )
+        except Exception:
+            logger.exception("[GSM] _warm_gallery_photo_cache_from_db: failed to compute device list")
+            return
+        with _PHOTO_LOCK:
+            missing_ids = [
+                did for d in page_devs
+                if (did := str(d.get("id") or "").strip()) and did not in _PHOTO_CACHE
+            ]
+        if not missing_ids:
+            return
+        CHUNK = 50
+        for i in range(0, len(missing_ids), CHUNK):
+            chunk_ids = missing_ids[i : i + CHUNK]
+            try:
+                galleries = await asyncio.to_thread(
+                    self.db.get_gsm_device_gallery_photos_bulk, chunk_ids
+                )
+            except Exception:
+                logger.exception("[GSM] gallery photo cache warm failed for a chunk")
+                await asyncio.sleep(0)
+                continue
+            for did in chunk_ids:
+                gallery_bytes = galleries.get(did) or []
+                paths = []
+                for gi, b in enumerate(gallery_bytes[:7]):
+                    p = _photo_cache_path(f"{did}_g{gi}")
+                    try:
+                        with open(p, "wb") as f:
+                            f.write(b)
+                        paths.append(p)
+                    except Exception:
+                        continue
+                with _PHOTO_LOCK:
+                    _PHOTO_CACHE[did] = paths
             await asyncio.sleep(0)
 
     async def _preload_charts_for_current_page(self, devices: list[dict] | None = None) -> None:
@@ -1747,15 +1827,83 @@ class GsmParserView:
             ]
         if self._filter_size:
             fs = self._filter_size
-            result = [
-                d
-                for d in result
-                if _fmt_dims(d.get("gsm_specs") or {}) == fs
-                or _fmt_dims(d.get("ek_specs") or {}) == fs
-            ]
+
+            def _size_matches(d: dict) -> bool:
+                if _fmt_dims(d.get("gsm_specs") or {}) == fs or _fmt_dims(d.get("ek_specs") or {}) == fs:
+                    return True
+                # A manually-entered Xiaomi region size (see
+                # _get_effective_xiaomi_size) is what the "Розмір" column
+                # actually DISPLAYS and what clicking it searches for — but
+                # it can differ from both GSM Arena's and E-Katalog's own
+                # raw scraped dimensions (that's the whole point of the
+                # override). Without this fallback, clicking a manually-set
+                # size never found the device it came from at all.
+                if str(d.get("brand") or "").strip().lower() != "xiaomi":
+                    return False
+                did = str(d.get("id") or "")
+                if not did or _get_device_detail(did) is None:
+                    # Cache-only check — _get_effective_xiaomi_size would
+                    # otherwise fall through to _get_or_fetch_device_detail
+                    # and do a BLOCKING live DB fetch for every not-yet-
+                    # opened Xiaomi device in the result set, one at a time,
+                    # on the UI thread — confirmed live as exactly why
+                    # clicking a size to filter by it went from instant to
+                    # very slow once this fallback was added. A device
+                    # whose detail was never cached (never opened, never
+                    # warmed) just doesn't match on its manual size until
+                    # that happens naturally in the background.
+                    return False
+                eff = self._get_effective_xiaomi_size(did, d)
+                if not eff:
+                    return False
+                eff_str = str(eff.get("size_str") or "").replace(" мм", "")
+                return eff_str == fs
+
+            result = [d for d in result if _size_matches(d)]
 
         reverse = not self._sort_asc
         col = self._sort_col
+
+        def _xiaomi_effective_axis(d: dict, axis_key: str) -> float | None:
+            """Numeric value for one axis ("L"/"W"/"T"/"diagonal"), preferring
+            a manually-split Xiaomi device's own region-specific size (see
+            _get_effective_xiaomi_size) over GSM Arena's/E-Katalog's shared
+            blanket figure — that override is what the "Розмір"/"Діагональ"
+            columns actually DISPLAY, so sorting must read the same value or
+            a Global/Europe pair (same base card, different real sizes) ends
+            up ordered by a shared figure that doesn't match what's on
+            screen (confirmed live: adjacent regional-variant rows with
+            visibly different lengths didn't sort in step). Cache-only check
+            first — same guard _size_matches above already uses — a live
+            _get_or_fetch_device_detail per not-yet-opened Xiaomi device
+            during a 1000+-row sort would reintroduce a real freeze."""
+            if str(d.get("brand") or "").strip().lower() != "xiaomi":
+                return None
+            did = str(d.get("id") or "")
+            if not did or _get_device_detail(did) is None:
+                return None
+            eff = self._get_effective_xiaomi_size(did, d)
+            if not eff:
+                return None
+            try:
+                raw = str(eff.get(axis_key) or "").strip()
+                return float(raw.replace(",", ".")) if raw else None
+            except Exception:
+                return None
+
+        def _xiaomi_effective_size_str(d: dict) -> str:
+            """Same override as _xiaomi_effective_axis, but the combined
+            "L×W×T" text _build_table_row's "Розмір" cell actually shows —
+            for the gsm_size/ek_size plain-arrow (string) sort."""
+            if str(d.get("brand") or "").strip().lower() != "xiaomi":
+                return ""
+            did = str(d.get("id") or "")
+            if not did or _get_device_detail(did) is None:
+                return ""
+            eff = self._get_effective_xiaomi_size(did, d)
+            if not eff:
+                return ""
+            return str(eff.get("size_str") or "").replace(" мм", "").strip()
 
         def _secondary_key(col):
             if col == "brand":
@@ -1789,17 +1937,26 @@ class GsmParserView:
                     return (2, 0, 0, 0)
                 return _rel_key
             if col == "gsm_size":
-                return lambda d: _fmt_dims(d.get("gsm_specs") or {}).lower()
+                return lambda d: (
+                    _xiaomi_effective_size_str(d) or _fmt_dims(d.get("gsm_specs") or {})
+                ).lower()
             if col in {"gsm_length", "gsm_width", "gsm_thickness"}:
                 _which = col[len("gsm_"):]
+                _axis_key = {"length": "L", "width": "W", "thickness": "T"}[_which]
 
-                def _gsm_dim_key(d, _w=_which):
+                def _gsm_dim_key(d, _w=_which, _ak=_axis_key):
+                    eff = _xiaomi_effective_axis(d, _ak)
+                    if eff is not None:
+                        return eff
                     v = _dim_value(d.get("gsm_specs") or {}, _w)
                     return v if v is not None else -1.0
 
                 return _gsm_dim_key
             if col == "gsm_diag":
                 def _diag_key(d):
+                    eff = _xiaomi_effective_axis(d, "diagonal")
+                    if eff is not None:
+                        return eff
                     try:
                         return float(str((d.get("gsm_specs") or {}).get("display_size") or ""))
                     except Exception:
@@ -1809,22 +1966,61 @@ class GsmParserView:
                 return lambda d: (d.get("ek_name") or "").lower()
             if col == "ek_date":
                 def _ek_date_key(d):
-                    return _parse_ek_date_added(
-                        str((d.get("ek_specs") or {}).get("date_added") or "")
+                    es = d.get("ek_specs") or {}
+                    gs = d.get("gsm_specs") or {}
+                    year, month = _parse_ek_date_added(
+                        str(es.get("date_added") or "")
                     )
+                    if not year and not month:
+                        # No E-Katalog date — fall back to GSM Arena's
+                        # release date, else its announce date, reduced to
+                        # the same (year, month) granularity E-Katalog uses
+                        # (GSM Arena's DD.MM.YYYY has a day; E-Katalog's own
+                        # date is just a month name + year, so the day is
+                        # dropped here purely for comparability).
+                        rel = _parse_gsm_ddmmyyyy(
+                            str(gs.get("released") or "").strip()
+                        )
+                        if rel:
+                            year, month = rel[0], rel[1]
+                        else:
+                            ann = _parse_gsm_ddmmyyyy(
+                                str(gs.get("announced") or "").strip()
+                            )
+                            if ann:
+                                year, month = ann[0], ann[1]
+                    has_date = bool(year or month)
+                    # Devices with no date at all (from any source) must
+                    # stay last regardless of sort direction — negate the
+                    # date components by hand instead of relying on the
+                    # caller's `reverse` flag, since a plain reverse=True
+                    # would flip the "no date" tier to the FRONT instead of
+                    # keeping it at the end (this column is sorted without
+                    # `reverse` below for exactly this reason).
+                    sign = -1 if reverse else 1
+                    return (0 if has_date else 1, sign * year, sign * month)
                 return _ek_date_key
             if col == "ek_size":
-                return lambda d: _fmt_dims(d.get("ek_specs") or {}).lower()
+                return lambda d: (
+                    _xiaomi_effective_size_str(d) or _fmt_dims(d.get("ek_specs") or {})
+                ).lower()
             if col in {"ek_length", "ek_width", "ek_thickness"}:
                 _which = col[len("ek_"):]
+                _axis_key = {"length": "L", "width": "W", "thickness": "T"}[_which]
 
-                def _ek_dim_key(d, _w=_which):
+                def _ek_dim_key(d, _w=_which, _ak=_axis_key):
+                    eff = _xiaomi_effective_axis(d, _ak)
+                    if eff is not None:
+                        return eff
                     v = _dim_value(d.get("ek_specs") or {}, _w)
                     return v if v is not None else -1.0
 
                 return _ek_dim_key
             if col == "ek_diag":
                 def _ek_diag_key(d):
+                    eff = _xiaomi_effective_axis(d, "diagonal")
+                    if eff is not None:
+                        return eff
                     try:
                         return float(str((d.get("ek_specs") or {}).get("display") or ""))
                     except Exception:
@@ -1855,11 +2051,13 @@ class GsmParserView:
 
         key_fn = _secondary_key(col)
         if key_fn is not None:
-            if col == "brand":
-                # _gsm_native_order_key already encodes "newest first" via
-                # negated date components — asc/desc toggling on the brand
-                # header isn't a meaningful concept for this tiered key, so
-                # `reverse` is intentionally not applied here.
+            if col in {"brand", "ek_date"}:
+                # _gsm_native_order_key (brand) and _ek_date_key (ek_date)
+                # both bake direction into the key itself (see their
+                # definitions above) so a "no date"/tiered group can stay
+                # pinned to one end regardless of direction — applying the
+                # outer `reverse` here too would flip that pinned group to
+                # the wrong end instead of just reversing the dated items.
                 result = sorted(result, key=key_fn)
             else:
                 # Pass 1: order everything by the chosen column/direction.
@@ -1870,6 +2068,19 @@ class GsmParserView:
         # sense for the brand-grouped view — in flat mode (grouping off)
         # the user expects one true global sort by the chosen column, not
         # a sort-within-brand-then-brand-order, so skip it entirely there.
+        #
+        # Dimension columns (Довжина/Ширина/Товщина/Діагональ) also go
+        # through this regroup, same as every other column — a genuine
+        # cross-brand global order was tried (rendering the whole filtered
+        # catalog as one flat, ungrouped list, bypassing this regroup) but
+        # reverted: at 1000+ devices that flat render is a real, confirmed
+        # freeze (the same cost flat-mode's own sort already disables for —
+        # see _hdr_cell), worse than the win of a within-brand-only sort
+        # order. See _xiaomi_effective_axis for the still-correct part of
+        # that work: the VALUE each device sorts by now matches what the
+        # "Розмір"/"Діагональ" columns actually display for split Xiaomi
+        # regional variants, even though the visible ordering is still only
+        # within-brand.
         if not self._flat_mode:
             result = sorted(result, key=lambda d: (d.get("brand") or "").lower())
         return result
@@ -1925,7 +2136,6 @@ class GsmParserView:
             self.t("gsm.help.step3", "3. Клік на рядок — відкриває картку пристрою (характеристики, сумісність, діаграма цін)."),
             self.t("gsm.help.step4", "4. «Синхронізація» оновлює кеш з бази даних."),
             self.t("gsm.help.step5", "5. «Запустити» — запускає парсер (повний / лише GSM / лише E-Katalog)."),
-            self.t("gsm.help.step6", "6. «Запланувати запуск…» у тому ж меню — запускає парсер не одразу, а через заданий час (застосунок має лишатись відкритим)."),
         ])
 
     # ------------------------------------------------------------------ #
@@ -2543,6 +2753,424 @@ class GsmParserView:
             vertical_alignment=ft.CrossAxisAlignment.START,
         )
 
+    _CMP_PALETTE = [
+        "#2563EB", "#DC2626", "#059669", "#D97706", "#7C3AED",
+        "#DB2777", "#0891B2", "#65A30D", "#EA580C", "#4338CA",
+    ]
+
+    def _build_comparison_charts_view(self, compare_entries: list[dict]) -> ft.Control:
+        """The comparison modal's "Діаграми" tab: 3 stacked charts (EK min
+        price / EK max price / shop count), one line per compared model.
+        Same PNG+hover-hotspot technique as _build_adaptive_charts (see its
+        docstring), generalized to N series — cached by the exact set of
+        compared entries so re-opening the tab is instant. All 3 charts
+        share the SAME sampled hotspot dates and hover state, so moving
+        along one chart moves the reticle/panel on all three together."""
+        if not compare_entries:
+            return ft.Text("Немає даних", color=ft.Colors.BLUE_GREY_400, size=12)
+
+        series_names: list[str] = []
+        series_dates: list[list] = []
+        series_min: list[list] = []
+        series_max: list[list] = []
+        series_shops: list[list] = []
+        for idx, e in enumerate(compare_entries):
+            did = str(e.get("id") or "")
+            name = str(
+                e.get("_compare_name") or e.get("gsm_name") or e.get("ek_name") or f"#{idx + 1}"
+            )
+            detail = self._get_or_fetch_device_detail(did, e) if did else {}
+            hist = detail.get("hist730") or []
+            dates, mn, mx, sh = [], [], [], []
+            for h in hist:
+                raw = str(h.get("record_date") or "")[:10]
+                try:
+                    dates.append(datetime.fromisoformat(raw))
+                except Exception:
+                    continue
+                mn.append(_safe_float(h.get("price_ek_min")))
+                mx.append(_safe_float(h.get("price_ek_max")))
+                sh.append(_safe_float(h.get("shops_count")))
+
+            def _ffill(vals):
+                out, last = [], None
+                for v in vals:
+                    if v is not None:
+                        last = v
+                    out.append(last)
+                return out
+
+            series_names.append(name)
+            series_dates.append(dates)
+            series_min.append(_ffill(mn))
+            series_max.append(_ffill(mx))
+            series_shops.append(_ffill(sh))
+
+        if not any(series_dates):
+            return ft.Text(
+                "Недостатньо даних для діаграм", color=ft.Colors.BLUE_GREY_400, size=12
+            )
+
+        sig = tuple(
+            (series_names[i], len(series_dates[i]),
+             str(series_dates[i][-1].date()) if series_dates[i] else "")
+            for i in range(len(compare_entries))
+        )
+        with _CMP_CHART_RENDER_LOCK:
+            cached = _CMP_CHART_RENDER_CACHE.get(sig)
+        if cached is not None:
+            return self._render_cmp_chart_from_data(cached)
+
+        try:
+            import base64
+            import bisect
+            import io
+            import math
+
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.dates as mdates
+            import matplotlib.pyplot as plt
+            from matplotlib.ticker import FixedLocator, FuncFormatter, MaxNLocator
+
+            all_dates = sorted({d for ds in series_dates for d in ds})
+            if not all_dates:
+                return ft.Text("Немає дат", color=ft.Colors.BLUE_GREY_400, size=12)
+
+            colors = [self._CMP_PALETTE[i % len(self._CMP_PALETTE)] for i in range(len(compare_entries))]
+
+            def _value_as_of(dates_i, vals_i, d):
+                j = bisect.bisect_right(dates_i, d) - 1
+                return vals_i[j] if 0 <= j < len(vals_i) else None
+
+            def _mk_fmt_loc(dates):
+                uniq_days = sorted({d.date() for d in dates})
+                if len(uniq_days) <= 100:
+                    tick_days = uniq_days
+                    if len(tick_days) > 12:
+                        step = max(1, round(len(tick_days) / 10))
+                        tick_days = tick_days[::step]
+                        if uniq_days[-1] not in tick_days:
+                            tick_days = tick_days + [uniq_days[-1]]
+                    ticks = [mdates.date2num(d) for d in tick_days]
+                    return mdates.DateFormatter("%d.%m"), FixedLocator(ticks)
+                uniq_months = sorted({(d.year, d.month) for d in dates})
+                if len(uniq_months) <= 50:
+                    ticks = [mdates.date2num(datetime(y, m, 1)) for y, m in uniq_months]
+                    return mdates.DateFormatter("%m.%y"), FixedLocator(ticks)
+                uniq_years = sorted({d.year for d in dates})
+                ticks = [mdates.date2num(datetime(y, 1, 1)) for y in uniq_years]
+                return mdates.DateFormatter("%Y"), FixedLocator(ticks)
+
+            # Hotspot dates are sampled ONCE and shared by all 3 charts — the
+            # whole point of a synced reticle: hovering chart A must be able
+            # to look up the exact same date's values on charts B and C.
+            MAX_HOTSPOTS = 40
+            n_dates = len(all_dates)
+            if n_dates <= MAX_HOTSPOTS:
+                idxs = list(range(n_dates))
+            else:
+                step = n_dates / MAX_HOTSPOTS
+                idxs = sorted({int(k * step) for k in range(MAX_HOTSPOTS)} | {n_dates - 1})
+            hotspot_dates = [all_dates[k] for k in idxs]
+
+            shared_date_vals: dict[str, dict[str, list]] = {}
+            for d in hotspot_dates:
+                day_str = d.strftime("%d.%m.%Y")
+                shared_date_vals[day_str] = {
+                    "min": [_value_as_of(series_dates[i], series_min[i], d) for i in range(len(compare_entries))],
+                    "max": [_value_as_of(series_dates[i], series_max[i], d) for i in range(len(compare_entries))],
+                    "shops": [_value_as_of(series_dates[i], series_shops[i], d) for i in range(len(compare_entries))],
+                }
+            last_date_str = all_dates[-1].strftime("%d.%m.%Y")
+            if last_date_str not in shared_date_vals:
+                shared_date_vals[last_date_str] = {
+                    "min": [_value_as_of(series_dates[i], series_min[i], all_dates[-1]) for i in range(len(compare_entries))],
+                    "max": [_value_as_of(series_dates[i], series_max[i], all_dates[-1]) for i in range(len(compare_entries))],
+                    "shops": [_value_as_of(series_dates[i], series_shops[i], all_dates[-1]) for i in range(len(compare_entries))],
+                }
+
+            COL_GRID = "#EEF0F3"
+            COL_AXIS = _BORDER
+            COL_MUTED = _MUTED
+            COL_TITLE = _TEXT
+            FIG_W_IN = 7.4
+            CHART_DPI = 120
+            DISPLAY_W = 680
+
+            # Legend goes BELOW the plot, not overlaid on top of it (an
+            # in-plot legend covered the data near the top of the chart —
+            # confirmed live). Figure height and the axes' top/bottom
+            # margins are sized to the actual number of legend rows so N
+            # series (up to _MAX_COMPARE=10) never get clipped.
+            n_series = len(series_names)
+            ncol = 3 if n_series > 4 else max(1, n_series)
+            legend_rows = max(1, math.ceil(n_series / ncol))
+            PLOT_IN = 1.9
+            TITLE_IN = 0.32
+            XTICKS_IN = 0.5
+            LEGEND_IN = 0.20 * legend_rows + 0.18
+            FIG_H_IN = TITLE_IN + PLOT_IN + XTICKS_IN + LEGEND_IN
+            top = 1 - TITLE_IN / FIG_H_IN
+            bottom = (XTICKS_IN + LEGEND_IN) / FIG_H_IN
+            legend_anchor_y = -(XTICKS_IN / PLOT_IN) - 0.12
+
+            def _render_metric(title, per_series_vals, value_fmt):
+                fig, ax = plt.subplots(figsize=(FIG_W_IN, FIG_H_IN), facecolor="#FFFFFF", dpi=CHART_DPI)
+                fig.subplots_adjust(left=0.09, right=0.98, top=top, bottom=bottom)
+                ax.set_facecolor("#FFFFFF")
+                ax.text(0.0, 1.1, title, transform=ax.transAxes, fontsize=10.5,
+                        fontweight="bold", color=COL_TITLE, va="bottom")
+                ax.tick_params(axis="both", labelsize=7, colors=COL_MUTED, length=0)
+                for side in ("top", "right", "left"):
+                    ax.spines[side].set_visible(False)
+                ax.spines["bottom"].set_color(COL_AXIS)
+                ax.set_axisbelow(True)
+                ax.grid(axis="y", color=COL_GRID, linestyle="-", linewidth=1.0)
+                fmt, loc = _mk_fmt_loc(all_dates)
+                ax.xaxis.set_major_formatter(fmt)
+                ax.xaxis.set_major_locator(loc)
+                plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+                ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
+                ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _p: f"{v:,.0f}".replace(",", " ")))
+
+                any_plotted = False
+                for i, name in enumerate(series_names):
+                    ds, vals = series_dates[i], per_series_vals[i]
+                    pts = [(d, v) for d, v in zip(ds, vals) if v is not None]
+                    if not pts:
+                        continue
+                    any_plotted = True
+                    pd_, pv_ = zip(*pts)
+                    ax.plot(
+                        pd_, pv_, color=colors[i], linewidth=1.6, marker="o",
+                        markersize=2.6, markerfacecolor="#FFFFFF",
+                        markeredgecolor=colors[i], markeredgewidth=1.0,
+                        zorder=3, label=name,
+                    )
+                if any_plotted:
+                    ax.legend(
+                        loc="upper center", fontsize=6.5, ncol=ncol, framealpha=0.9,
+                        bbox_to_anchor=(0.5, legend_anchor_y), borderaxespad=0.0,
+                    )
+                else:
+                    ax.set_xlim(min(all_dates), max(all_dates))
+
+                buf = io.BytesIO()
+                fig.savefig(buf, format="png")
+                FIG_W_PX = FIG_W_IN * CHART_DPI
+                FIG_H_PX = FIG_H_IN * CHART_DPI
+                scale = DISPLAY_W / FIG_W_PX
+                display_h = round(FIG_H_PX * scale)
+
+                bbox = ax.get_window_extent()
+                y_top, y_bottom = FIG_H_PX - bbox.y1, FIG_H_PX - bbox.y0
+
+                def _x_px(d):
+                    y0 = ax.get_ylim()[0]
+                    return ax.transData.transform((mdates.date2num(d), y0))[0]
+
+                hotspot_w = max(6.0, (DISPLAY_W * 0.9) / max(len(hotspot_dates), 1))
+                hotspots = []
+                for d in hotspot_dates:
+                    px = _x_px(d) * scale
+                    hotspots.append(
+                        (
+                            max(0.0, px - hotspot_w / 2), y_top * scale,
+                            hotspot_w, max(4.0, (y_bottom - y_top) * scale),
+                            d.strftime("%d.%m.%Y"),
+                        )
+                    )
+                plt.close(fig)
+                buf.seek(0)
+                b64 = base64.b64encode(buf.read()).decode()
+                last_vals = [
+                    _value_as_of(series_dates[i], per_series_vals[i], all_dates[-1])
+                    for i in range(len(compare_entries))
+                ]
+                return {
+                    "b64": b64, "w": DISPLAY_W, "h": display_h,
+                    "hotspots": hotspots,
+                    "last_vals": last_vals,
+                    "value_fmt": value_fmt,
+                    "metric_key": value_fmt,
+                }
+
+            metric_min = _render_metric("ЄК мін. ціна", series_min, "price")
+            metric_min["metric_key"] = "min"
+            metric_max = _render_metric("ЄК макс. ціна", series_max, "price")
+            metric_max["metric_key"] = "max"
+            metric_shops = _render_metric("Кількість магазинів", series_shops, "int")
+            metric_shops["metric_key"] = "shops"
+
+            render_data = {
+                "sig": sig,
+                "series_names": series_names,
+                "colors": colors,
+                "last_date_str": last_date_str,
+                "shared_date_vals": shared_date_vals,
+                "metrics": [metric_min, metric_max, metric_shops],
+            }
+            with _CMP_CHART_RENDER_LOCK:
+                _CMP_CHART_RENDER_CACHE[sig] = render_data
+            return self._render_cmp_chart_from_data(render_data)
+        except Exception as exc:
+            logger.error("[GSM] _build_comparison_charts_view failed: %s", exc)
+            return ft.Text(
+                f"Діаграми недоступні: {exc}", color=ft.Colors.BLUE_GREY_400, size=11
+            )
+
+    def _render_cmp_chart_from_data(self, data: dict) -> ft.Control:
+        """Rebuild the lightweight Flet control tree from a cached
+        _build_comparison_charts_view render payload — no matplotlib
+        involved, cheap enough to call on every tab switch. A single shared
+        hover state drives all 3 panels together: hovering a hotspot on ANY
+        of the 3 charts looks the date up in shared_date_vals and updates
+        every panel, not just the one under the cursor."""
+        series_names = data["series_names"]
+        colors = data["colors"]
+        shared_date_vals = data["shared_date_vals"]
+
+        def _fmt_val(v, kind):
+            if v is None:
+                return "—"
+            return _fmt_price(v) if kind == "price" else str(int(v))
+
+        panels_by_metric: dict[str, dict] = {}
+        rows = []
+        for metric in data["metrics"]:
+            mkey = metric["metric_key"]
+            value_fmt = metric["value_fmt"]
+            hover_date = ft.Text(
+                data["last_date_str"], size=11.5, weight=ft.FontWeight.W_600, color=_TEXT
+            )
+            value_texts = [
+                ft.Text(_fmt_val(v, value_fmt), size=12.5, weight=ft.FontWeight.W_700, color=colors[i])
+                for i, v in enumerate(metric["last_vals"])
+            ]
+            panels_by_metric[mkey] = {
+                "hover_date": hover_date, "value_texts": value_texts, "value_fmt": value_fmt,
+            }
+
+            def _panel_row(i, _vt=value_texts):
+                return ft.Row(
+                    [
+                        ft.Container(
+                            width=8, height=8, bgcolor=colors[i], border_radius=4,
+                            margin=ft.margin.only(top=4),
+                        ),
+                        ft.Column(
+                            [
+                                ft.Text(
+                                    series_names[i], size=9.5, color=_MUTED,
+                                    max_lines=1, no_wrap=False,
+                                ),
+                                _vt[i],
+                            ],
+                            spacing=0,
+                        ),
+                    ],
+                    spacing=6,
+                )
+
+            panel = ft.Container(
+                width=190,
+                padding=12,
+                bgcolor=_PANEL,
+                border=ft.border.all(1, _BORDER),
+                border_radius=12,
+                content=ft.Column(
+                    [
+                        ft.Text("Дата", size=9.5, color=_MUTED),
+                        hover_date,
+                        ft.Divider(height=10, color="#EEF0F3"),
+                        ft.Column(
+                            [_panel_row(i) for i in range(len(series_names))],
+                            spacing=8,
+                            scroll=ft.ScrollMode.AUTO,
+                            height=min(260, 44 * len(series_names)),
+                        ),
+                    ],
+                    spacing=2,
+                ),
+            )
+            metric["_panel"] = panel
+
+        # ---- ONE shared pending/apply/hover state for all 3 charts ----
+        _last_day = {"value": data["last_date_str"]}
+        _pending = {"day_str": None, "scheduled": False}
+
+        def _apply_pending():
+            day_str = _pending["day_str"]
+            if day_str is None:
+                return
+            vals_by_metric = shared_date_vals.get(day_str) or {}
+            to_update = []
+            for mkey, p in panels_by_metric.items():
+                p["hover_date"].value = day_str
+                vals = vals_by_metric.get(mkey) or []
+                for i, v in enumerate(vals):
+                    if i < len(p["value_texts"]):
+                        p["value_texts"][i].value = _fmt_val(v, p["value_fmt"])
+                to_update.append(p["hover_date"])
+                to_update.extend(p["value_texts"])
+            for t in to_update:
+                with contextlib.suppress(Exception):
+                    t.update()
+
+        async def _apply_pending_soon():
+            await asyncio.sleep(0.03)
+            _pending["scheduled"] = False
+            _apply_pending()
+
+        def _make_hover(day_str):
+            def _h(e):
+                if not e.data:
+                    return
+                if _last_day["value"] == day_str:
+                    return
+                _last_day["value"] = day_str
+                _pending["day_str"] = day_str
+                if _pending["scheduled"]:
+                    return
+                _pending["scheduled"] = True
+                pg = self._get_page_safe()
+                if pg is not None:
+                    with contextlib.suppress(Exception):
+                        pg.run_task(_apply_pending_soon)
+                        return
+                _pending["scheduled"] = False
+                _apply_pending()
+            return _h
+
+        for metric in data["metrics"]:
+            hover_overlays = [
+                ft.Container(
+                    left=left, top=top, width=w, height=h,
+                    on_hover=_make_hover(day_str),
+                )
+                for (left, top, w, h, day_str) in metric["hotspots"]
+            ]
+            chart_stack = ft.Stack(
+                [
+                    ft.Image(
+                        src=f"data:image/png;base64,{metric['b64']}",
+                        width=metric["w"], height=metric["h"],
+                    ),
+                    *hover_overlays,
+                ],
+                width=metric["w"], height=metric["h"],
+            )
+            rows.append(
+                ft.Row(
+                    [chart_stack, metric["_panel"]], spacing=14,
+                    vertical_alignment=ft.CrossAxisAlignment.START,
+                )
+            )
+
+        return ft.Column(rows, spacing=18, scroll=ft.ScrollMode.AUTO)
+
     @staticmethod
     def _close_top_dialog(page):
         """Close the topmost open AlertDialog in page.overlay (Flet 0.84)."""
@@ -2705,12 +3333,19 @@ class GsmParserView:
             if str(_dev.get("device_type") or "").strip().lower() == "watch"
             else "Чохли"
         )
-        _size_groups = self._get_xiaomi_size_groups(device_id, _dev)
-        _is_split = len(_size_groups) > 1
-
-        def _group_meta(g: dict) -> str:
-            parts = [g.get("size_str") or "", g.get("diag_str") or ""]
-            return "  •  ".join(p for p in parts if p)
+        # A not-yet-split Xiaomi card always uses the blanket GSM Arena/
+        # E-Katalog size above, even if its regions carry different sizes —
+        # only an ALREADY-split card (region_split_group_id set) overrides
+        # with its own claimed region's size. See
+        # _get_effective_xiaomi_size's docstring; this replaced the old
+        # "show a Розмір-1/Розмір-2 sub-section per size group inside one
+        # card" behavior, which no longer applies now that splitting
+        # creates real separate cards instead.
+        _effective_size = self._get_effective_xiaomi_size(device_id, _dev)
+        if _effective_size:
+            _length = _effective_size["L"]
+            _width = _effective_size["W"]
+            _display_size = _effective_size["diagonal"]
 
         def _dedupe(raw: list) -> list:
             # Deduplicate by other_device_id (DB may store both directions)
@@ -2802,11 +3437,19 @@ class GsmParserView:
                 )
             return rows
 
-        def _sub_block(label: str, items: list, rows: list | None = None) -> ft.Column:
+        def _sub_block(
+            label: str, items: list, rows: list | None = None, action_btn: ft.Control | None = None
+        ) -> ft.Column:
             _rows = rows if rows is not None else _rows_for(items)
+            header: ft.Control = ft.Text(label, size=12, weight=ft.FontWeight.W_600, color=_MUTED)
+            if action_btn is not None:
+                header = ft.Row(
+                    [header, ft.Container(expand=True), action_btn],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                )
             return ft.Column(
                 [
-                    ft.Text(label, size=12, weight=ft.FontWeight.W_600, color=_MUTED),
+                    header,
                     (
                         ft.Column(_rows, spacing=4, tight=True)
                         if _rows
@@ -2817,115 +3460,96 @@ class GsmParserView:
                 tight=True,
             )
 
-        def _possible_for(
-            accessory_type: str, exclude_ids: set[str], active_group: dict | None = None
-        ) -> list[tuple[dict, str]]:
+        def _add_all_possible_to_compare_btn(possible: list[tuple[dict, str]]) -> ft.Control | None:
+            """One click: this device + every "Можливо сумісний" candidate
+            shown below go straight into the compare selection, and the
+            comparison modal opens immediately — instead of manually
+            checking each one in the table by hand."""
+            if not possible:
+                return None
+            ids = [device_id] + [
+                str(p.get("id") or "") for p, _lbl in possible if str(p.get("id") or "")
+            ]
+            ids = list(dict.fromkeys(i for i in ids if i))[:_MAX_COMPARE]
+            if len(ids) < 2:
+                return None
+
+            def _do_add(_e=None):
+                global _COMPARE_SELECTED
+                _COMPARE_SELECTED.clear()
+                _COMPARE_SELECTED.update(ids)
+                cb = _COMPARE_BTN_CB
+                if cb:
+                    with contextlib.suppress(Exception):
+                        cb()
+                with contextlib.suppress(Exception):
+                    page.pop_dialog()
+                self._comparison_modal(page, set(ids))
+
+            return ft.TextButton(
+                f"Порівняти всі ({len(ids)})",
+                icon=ft.Icons.PLAYLIST_ADD_CHECK,
+                style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=4, vertical=0)),
+                on_click=_do_add,
+            )
+
+        def _possible_for(accessory_type: str, exclude_ids: set[str]) -> list[tuple[dict, str]]:
             # Same candidate search that powers the suggestions in the edit
             # tab: same brand + same physical footprint for cases, same
-            # brand + same diagonal for glass. When a size group is active,
-            # ITS OWN L/W/diagonal are used instead of the blanket specs.
+            # brand + same diagonal for glass. _length/_width/_display_size
+            # are already the effective size (blanket GSM/EK, or this
+            # card's own claimed region size once split — see
+            # _get_effective_xiaomi_size).
             if not _brand:
                 return []
             if accessory_type == "case":
-                _len = active_group["L"] if active_group else _length
-                _wid = active_group["W"] if active_group else _width
                 possible_raw = (
                     self.db.get_gsm_possible_compatible_by_size_expanded(
-                        _brand, _len, _wid, device_id
+                        _brand, _length, _width, device_id
                     )
-                    if _len and _wid
+                    if _length and _width
                     else []
                 )
             else:
-                _diag = active_group["diagonal"] if active_group else _display_size
                 possible_raw = (
-                    self.db.get_gsm_possible_compatible_expanded(_brand, _diag, device_id)
-                    if _diag
+                    self.db.get_gsm_possible_compatible_expanded(_brand, _display_size, device_id)
+                    if _display_size
                     else []
                 )
+            # One entry per candidate row — no more per-region-variant fan-
+            # out. A candidate that's itself split into 2+ regional sizes
+            # already exists as SEPARATE physical rows (see
+            # split_gsm_device_by_region), so each shows up as its own
+            # natural candidate here; a not-yet-split candidate with
+            # conflicting region sizes is treated the same as everywhere
+            # else — blanket, unlabeled, until IT gets split too.
             expanded: list[tuple[dict, str]] = []
             for p in possible_raw or []:
                 oid = str(p.get("id") or "")
                 if not oid or oid in exclude_ids:
                     continue
-                variants_raw = p.get("regional_variants") or []
-                sized_variants = [
-                    v for v in (variants_raw if isinstance(variants_raw, list) else [])
-                    if isinstance(v, dict)
-                    and str(v.get("region") or "").strip()
-                    and str(v.get("L") or "").strip()
-                ]
-                unique_lengths = {str(v.get("L") or "").strip() for v in sized_variants}
-                if len(unique_lengths) <= 1:
-                    expanded.append((p, ""))
-                else:
-                    for v in sized_variants:
-                        region = str(v.get("region") or "").strip()
-                        l_val = str(v.get("L") or "").strip()
-                        expanded.append((p, f"{region} ({l_val}мм)"))
+                expanded.append((p, ""))
             return expanded
 
         def _group_block(title: str, raw_items: list, accessory_type: str) -> ft.Column:
             items = _dedupe(raw_items)
-
-            if not _is_split:
-                compatible = [
-                    c for c in items if "partially" not in str(c.get("status") or "")
-                ]
-                partial = [c for c in items if "partially" in str(c.get("status") or "")]
-                confirmed_ids = {str(c.get("other_device_id") or "") for c in items}
-                possible = _possible_for(accessory_type, confirmed_ids)
-                return ft.Column(
-                    [
-                        ft.Text(title, size=13, weight=ft.FontWeight.W_700),
-                        _sub_block("Сумісні", compatible),
-                        _sub_block("Частково сумісні", partial),
-                        _sub_block("Можливо сумісні", [], rows=_possible_rows_for(possible)),
-                    ],
-                    spacing=6,
-                    tight=True,
-                )
-
-            # Multi-size device: this card covers several physically distinct
-            # sizes — show a separate, clearly delimited sub-section per size
-            # so nothing reads as "one shared list" for what are effectively
-            # different devices.
-            sub_sections = []
-            for i, g in enumerate(_size_groups):
-                g_label = g.get("label") or ""
-                g_items = [
-                    c for c in items
-                    if not str(c.get("variant_label") or "").strip()
-                    or str(c.get("variant_label") or "").strip() == g_label
-                ]
-                compatible = [
-                    c for c in g_items if "partially" not in str(c.get("status") or "")
-                ]
-                partial = [c for c in g_items if "partially" in str(c.get("status") or "")]
-                confirmed_ids = {str(c.get("other_device_id") or "") for c in g_items}
-                possible = _possible_for(accessory_type, confirmed_ids, active_group=g)
-                meta = _group_meta(g)
-                header = f"Розмір {i + 1}: {meta or '—'}" + (f"  ({g_label})" if g_label else "")
-                sub_sections.append(
-                    ft.Container(
-                        padding=ft.padding.only(left=12, top=6, bottom=6),
-                        border=ft.border.only(left=ft.BorderSide(3, _ACCENT)),
-                        content=ft.Column(
-                            [
-                                ft.Text(header, size=12, weight=ft.FontWeight.W_700, color=_ACCENT),
-                                _sub_block("Сумісні", compatible),
-                                _sub_block("Частково сумісні", partial),
-                                _sub_block("Можливо сумісні", [], rows=_possible_rows_for(possible)),
-                            ],
-                            spacing=4,
-                            tight=True,
-                        ),
-                    )
-                )
-
+            compatible = [
+                c for c in items if "partially" not in str(c.get("status") or "")
+            ]
+            partial = [c for c in items if "partially" in str(c.get("status") or "")]
+            confirmed_ids = {str(c.get("other_device_id") or "") for c in items}
+            possible = _possible_for(accessory_type, confirmed_ids)
             return ft.Column(
-                [ft.Text(title, size=13, weight=ft.FontWeight.W_700), *sub_sections],
-                spacing=10,
+                [
+                    ft.Text(title, size=13, weight=ft.FontWeight.W_700),
+                    _sub_block("Сумісні", compatible),
+                    _sub_block("Частково сумісні", partial),
+                    _sub_block(
+                        "Можливо сумісні", [], rows=_possible_rows_for(possible),
+                        action_btn=_add_all_possible_to_compare_btn(possible),
+                    ),
+                ],
+                spacing=6,
                 tight=True,
             )
 
@@ -3552,10 +4176,56 @@ class GsmParserView:
             return ft.Container(height=0)
 
         detail = self._get_or_fetch_device_detail(device_id, device)
-        variants = detail.get("variants") or []
+        # A manually-deleted region (delete_gsm_regional_variant_region)
+        # stays in storage as a source='excluded' tombstone so the GitHub
+        # sync never re-adds it — but it must never show up in the table.
+        variants = [
+            v for v in (detail.get("variants") or [])
+            if not (isinstance(v, dict) and str(v.get("source") or "") == "excluded")
+        ]
         can_edit = self.can_edit_xiaomi_sizes
+        # Every market this device is sold in, sized or not — Global/Europe
+        # come from the variants table itself (they have a size row); every
+        # other region GitHub reports (China, India, Japan, Korea, Thailand,
+        # Taiwan, Brazil, Latin America, Saudi Arabia, ...) is detected but
+        # never sized, stored as {region: models_str} in specs (see
+        # xiaomi_regions_sync.py / set_gsm_xiaomi_other_markets). Rendered
+        # together as one row of color-coded badges below.
+        _other_markets: dict[str, str] = {}
+        with contextlib.suppress(Exception):
+            _gsm_specs = device.get("gsm_specs") if isinstance(device.get("gsm_specs"), dict) else {}
+            _raw_other = _gsm_specs.get("xiaomi_other_markets")
+            if isinstance(_raw_other, dict):
+                _other_markets = {str(k): str(v or "") for k, v in _raw_other.items()}
+            elif isinstance(_raw_other, list):
+                # Backward-compat: older synced data stored just a name list
+                # (no model number) — still shows as a badge, just no tooltip model.
+                _other_markets = {str(k): "" for k in _raw_other}
 
-        _CW = [110, 175, 227, 84]  # Region, Models, Size, Diagonal
+        _CW = [100, 150, 200, 74, 90, 150]  # Region, Models, Size, Diagonal, Продаж, Ціна/Магазини
+
+        # This card's own E-Katalog price/shop data — the only stream we
+        # actually have (Ukraine E-Katalog listing is one per card, not
+        # per-region), so a region row marked "Є в продажу" just means
+        # "treat our one real price stream as reflecting this region too".
+        # Two regions both checked show the identical numbers — there's no
+        # way to tell which region a Ukraine shop's stock is actually for.
+        _ek_specs = device.get("ek_specs") if isinstance(device.get("ek_specs"), dict) else {}
+        _card_shops = str(_ek_specs.get("shops_count") or "").strip()
+        _card_price_min = str(_ek_specs.get("price_min") or "").strip()
+        _card_price_max = str(_ek_specs.get("price_max") or "").strip()
+
+        def _price_summary_str() -> str:
+            if not (_card_price_min or _card_price_max or _card_shops):
+                return "—"
+            price = (
+                f"{_card_price_min}–{_card_price_max} грн" if _card_price_min and _card_price_max
+                else f"{_card_price_min or _card_price_max} грн"
+            )
+            shops = f"{_card_shops} магаз." if _card_shops else ""
+            return " / ".join(p for p in (price, shops) if p) or "—"
+
+        _price_summary = _price_summary_str()
 
         def _fmt_dims(v: dict) -> str:
             parts = [
@@ -3608,6 +4278,24 @@ class GsmParserView:
                             ),
                             width=_CW[3],
                         ),
+                        ft.Container(
+                            ft.Text(
+                                "Продаж",
+                                size=11,
+                                weight=ft.FontWeight.W_700,
+                                color=_MUTED,
+                            ),
+                            width=_CW[4],
+                        ),
+                        ft.Container(
+                            ft.Text(
+                                "Ціна / Магазини",
+                                size=11,
+                                weight=ft.FontWeight.W_700,
+                                color=_MUTED,
+                            ),
+                            width=_CW[5],
+                        ),
                     ],
                     spacing=0,
                 ),
@@ -3636,6 +4324,7 @@ class GsmParserView:
                         .replace(",", ".")
                         .strip(),
                         "source": str(r.get("source", "")).strip(),
+                        "in_stock": bool(r.get("in_stock", True)),
                     }
                 )
 
@@ -3646,7 +4335,26 @@ class GsmParserView:
                 # control the user had just tabbed into mid-keystroke. The
                 # in-memory cache sync below keeps other views correct
                 # without touching what's currently being typed into.
-                ok = await asyncio.to_thread(self.db.save_gsm_regional_variants, device_id, clean)
+                #
+                # `variants` here is already filtered to exclude
+                # source='excluded' tombstones (see this function's top) —
+                # a plain overwrite with just `clean` would silently drop
+                # them, un-excluding a region the next GitHub sync would
+                # then re-add. Fetch and re-merge them back in.
+                _kept = {c["region"] for c in clean}
+                _tombstones = []
+                with contextlib.suppress(Exception):
+                    _tombstones = [
+                        v for v in (await asyncio.to_thread(
+                            self.db.get_gsm_regional_variants, device_id
+                        ) or [])
+                        if isinstance(v, dict)
+                        and str(v.get("source") or "") == "excluded"
+                        and str(v.get("region") or "").strip() not in _kept
+                    ]
+                ok = await asyncio.to_thread(
+                    self.db.save_gsm_regional_variants, device_id, clean + _tombstones
+                )
                 if ok:
                     await asyncio.to_thread(self._refresh_cached_detail, device_id)
                 else:
@@ -3657,6 +4365,28 @@ class GsmParserView:
         def _field_change(idx: int, key: str, value: str):
             _rows[idx][key] = value
             _persist_rows()
+
+        def _toggle_in_stock(idx: int, value: bool, price_text_ref: ft.Ref[ft.Text]):
+            _rows[idx]["in_stock"] = value
+            region = str(_rows[idx].get("region", "")).strip()
+            with contextlib.suppress(Exception):
+                price_text_ref.current.value = _price_summary if value else "—"
+                price_text_ref.current.update()
+
+            async def _do():
+                # Writes device_id's own row AND every region-split sibling's
+                # matching row in one call (see set_gsm_region_in_stock) —
+                # "Global available" must read the same everywhere this
+                # region appears, not just on the card currently open.
+                ok = await asyncio.to_thread(
+                    self.db.set_gsm_region_in_stock, device_id, region, value
+                )
+                if ok:
+                    await asyncio.to_thread(self._refresh_cached_detail, device_id)
+                else:
+                    self._show_snack(self.t("gsm.err.save_failed", "Не вдалося зберегти"), ft.Colors.RED)
+
+            page.run_task(_do)
 
         def _data_row(idx: int, v: dict, is_last: bool) -> ft.Column:
             if can_edit:
@@ -3696,6 +4426,24 @@ class GsmParserView:
                 diag_cell = ft.Text(_fmt_diag(v), size=12)
                 cell_align = ft.CrossAxisAlignment.START
 
+            _in_stock = bool(v.get("in_stock", True))
+            _price_text_ref: ft.Ref[ft.Text] = ft.Ref[ft.Text]()
+            if self.can_edit_region_availability:
+                stock_cell = ft.Checkbox(
+                    value=_in_stock,
+                    tooltip="Є в продажу — цей регіон показує наші реальні ціну/магазини;"
+                    " без галочки тут завжди «—»",
+                    on_change=lambda e, i=idx, ref=_price_text_ref: _toggle_in_stock(
+                        i, bool(e.control.value), ref
+                    ),
+                )
+            else:
+                stock_cell = ft.Icon(
+                    ft.Icons.CHECK_CIRCLE if _in_stock else ft.Icons.REMOVE_CIRCLE_OUTLINE,
+                    size=16,
+                    color=ft.Colors.GREEN_600 if _in_stock else ft.Colors.BLUE_GREY_300,
+                )
+
             return ft.Column(
                 [
                     ft.Container(
@@ -3720,6 +4468,16 @@ class GsmParserView:
                                 ),
                                 ft.Container(size_cell, width=_CW[2]),
                                 ft.Container(diag_cell, width=_CW[3]),
+                                ft.Container(stock_cell, width=_CW[4]),
+                                ft.Container(
+                                    ft.Text(
+                                        _price_summary if _in_stock else "—",
+                                        ref=_price_text_ref,
+                                        size=11,
+                                        color=_MUTED,
+                                    ),
+                                    width=_CW[5],
+                                ),
                             ],
                             spacing=0,
                             vertical_alignment=cell_align,
@@ -3733,9 +4491,17 @@ class GsmParserView:
             )
 
         if not variants:
-            if not can_edit:
+            if not can_edit and not _other_markets:
+                # Nothing sized AND nothing badge-worthy either — genuinely
+                # nothing to show. If _other_markets has entries (e.g. this
+                # device is only known to sell in Japan/China with no
+                # Global/Europe size data yet), fall through so those badges
+                # still render below instead of the whole section vanishing.
                 return ft.Container(height=0)
-            body = ft.Text("Немає даних", size=12, color=ft.Colors.BLUE_GREY_400)
+            body = (
+                ft.Text("Немає даних", size=12, color=ft.Colors.BLUE_GREY_400)
+                if can_edit else ft.Container(height=0)
+            )
         else:
             rows = [
                 _data_row(i, v, i == len(_rows) - 1) for i, v in enumerate(_rows)
@@ -3747,13 +4513,61 @@ class GsmParserView:
                 clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
             )
 
+        def _region_badge(region: str, models_str: str) -> ft.Container:
+            bg, fg, border = _REGION_BADGE_COLORS.get(region, _REGION_BADGE_FALLBACK)
+            tooltip_text = (
+                f"Модель: {models_str}" if models_str.strip()
+                else ("Розмір для цього ринку не відстежується — лише позначка,"
+                      " що модель там теж продається")
+            )
+            return ft.Container(
+                padding=ft.padding.symmetric(horizontal=8, vertical=3),
+                border_radius=999,
+                bgcolor=bg,
+                border=ft.border.all(1, border),
+                tooltip=ft.Tooltip(message=tooltip_text, wait_duration=0),
+                content=ft.Text(region, size=10.5, weight=ft.FontWeight.W_600, color=fg),
+            )
+
+        # One badge per market this device is sold in — Global/Europe (the
+        # sized ones, already in _rows/variants) plus everything else GitHub
+        # detected (_other_markets). Fixed display standard (superadmin's own
+        # ordering): Global/Europe always lead when present, then this exact
+        # sequence for the rest — any future region not in this list sorts
+        # last, alphabetically.
+        _badge_order = [
+            "Global", "Europe", "China", "India", "Latin America",
+            "Japan", "Thailand", "Korea", "Saudi Arabia", "Taiwan", "Brazil",
+        ]
+        _all_badges: dict[str, str] = {
+            str(v.get("region", "")).strip(): str(v.get("models", "")).strip()
+            for v in _rows if str(v.get("region", "")).strip()
+        }
+        _all_badges.update(_other_markets)
+        _sorted_regions = sorted(
+            _all_badges.keys(),
+            key=lambda r: (_badge_order.index(r) if r in _badge_order else 999, r),
+        )
+
         controls: list = [
             ft.Container(
-                ft.Text(
-                    "Регіональні варіанти",
-                    size=11,
-                    weight=ft.FontWeight.W_700,
-                    color=ft.Colors.BLUE_700,
+                ft.Row(
+                    [
+                        ft.Text(
+                            "Регіональні варіанти",
+                            size=11,
+                            weight=ft.FontWeight.W_700,
+                            color=ft.Colors.BLUE_700,
+                        ),
+                        *[
+                            _region_badge(_r, _all_badges[_r])
+                            for _r in _sorted_regions
+                        ],
+                    ],
+                    spacing=8,
+                    run_spacing=4,
+                    wrap=True,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
                 border=ft.border.only(bottom=ft.BorderSide(1, ft.Colors.BLUE_200)),
                 padding=ft.padding.only(bottom=4),
@@ -3771,6 +4585,71 @@ class GsmParserView:
                     ),
                 )
             )
+
+        if self.can_manage_devices:
+            gsm_specs = device.get("gsm_specs") if isinstance(device.get("gsm_specs"), dict) else {}
+            split_group_id = str((gsm_specs or {}).get("region_split_group_id") or "").strip()
+
+            if split_group_id:
+                # The old whole-card "Є в продажу Україна" checkbox lived
+                # here — removed: the per-region "Продаж" checkboxes in the
+                # regional-variants table above now cover this exact need,
+                # per-region instead of one blanket flag for the whole card.
+
+                def _do_merge(_e=None):
+                    async def _do():
+                        ok, msg = await asyncio.to_thread(self.db.merge_gsm_region_split, device_id)
+                        self._show_snack(msg, ft.Colors.GREEN if ok else ft.Colors.ORANGE)
+                        if ok:
+                            await asyncio.to_thread(self._refresh_cached_detail, device_id)
+                            with contextlib.suppress(Exception):
+                                page.pop_dialog()
+                            self._refresh_table()
+                    page.run_task(_do)
+
+                controls.append(
+                    ft.TextButton(
+                        "Об'єднати в одну модель",
+                        icon=ft.Icons.MERGE,
+                        tooltip="Поверне розділені картки назад в одну — розміри регіонів можуть "
+                        "лишатись різними, вони просто зберігаються кожен у своєму рядку таблиці",
+                        on_click=_do_merge,
+                    )
+                )
+            else:
+                _groups = self._get_xiaomi_size_groups(device_id, device)
+                if len(_groups) >= 2:
+                    def _do_split(_e=None):
+                        async def _do():
+                            ok, msg, new_ids = await asyncio.to_thread(
+                                self.db.split_gsm_device_by_region, device_id
+                            )
+                            self._show_snack(msg, ft.Colors.GREEN if ok else ft.Colors.ORANGE)
+                            if ok:
+                                # New sibling rows are cloned in the DB already
+                                # (see clone_gsm_device_photos) — also copy the
+                                # LOCAL cache file directly so the new card's
+                                # photo shows immediately, without waiting for
+                                # the next background warm-cache pass.
+                                src_path = _photo_cache_path(device_id)
+                                if os.path.exists(src_path):
+                                    for _nid in new_ids or []:
+                                        with contextlib.suppress(Exception):
+                                            shutil.copyfile(src_path, _photo_cache_path(_nid))
+                                with contextlib.suppress(Exception):
+                                    page.pop_dialog()
+                                self._refresh_table()
+                        page.run_task(_do)
+
+                    controls.append(
+                        ft.TextButton(
+                            f"Розділити за регіоном ({len(_groups)} картки)",
+                            icon=ft.Icons.CALL_SPLIT,
+                            tooltip="Регіони мають різні розміри — буде створено окрему картку на кожен розмір",
+                            on_click=_do_split,
+                        )
+                    )
+
         controls.append(ft.Divider(height=14))
         return ft.Column(controls, spacing=6, tight=True)
 
@@ -3910,6 +4789,10 @@ class GsmParserView:
             with contextlib.suppress(Exception):
                 save_btn.update()
 
+        _original_regions = {
+            str(v.get("region", "")).strip() for v in variants if str(v.get("region", "")).strip()
+        }
+
         def _save(_):
             clean = []
             for v in _rows:
@@ -3930,13 +4813,41 @@ class GsmParserView:
                         "source": str(v.get("source", "")).strip(),
                     }
                 )
+            # A region that existed before this edit and is now missing was
+            # deleted via the row's own 🗑 — tombstone it (source='excluded')
+            # instead of letting it silently vanish, or the next GitHub sync
+            # (xiaomi_regions_sync.py) just re-adds it right back.
+            kept_regions = {c["region"] for c in clean}
+            for removed_region in _original_regions - kept_regions:
+                clean.append({
+                    "region": removed_region, "models": "", "L": "", "W": "",
+                    "T": "", "diagonal": "", "source": "excluded",
+                })
             save_btn.text = "Збереження..."
             save_btn.disabled = True
             with contextlib.suppress(Exception):
                 save_btn.update()
 
             async def _do():
-                ok = await asyncio.to_thread(self.db.save_gsm_regional_variants, device_id, clean)
+                # Excluded tombstones for regions NOT touched by this edit
+                # session (see _build_regional_variants_section's filter —
+                # they're never loaded into _rows to begin with) must
+                # survive this save too, or an unrelated edit here would
+                # silently un-exclude them.
+                _existing_tombstones = []
+                with contextlib.suppress(Exception):
+                    _existing_tombstones = [
+                        v for v in (await asyncio.to_thread(
+                            self.db.get_gsm_regional_variants, device_id
+                        ) or [])
+                        if isinstance(v, dict)
+                        and str(v.get("source") or "") == "excluded"
+                        and str(v.get("region") or "").strip() not in kept_regions
+                        and str(v.get("region") or "").strip() not in _original_regions
+                    ]
+                ok = await asyncio.to_thread(
+                    self.db.save_gsm_regional_variants, device_id, clean + _existing_tombstones
+                )
                 if ok:
                     await asyncio.to_thread(self._refresh_cached_detail, device_id)
                     page.pop_dialog()
@@ -4037,7 +4948,7 @@ class GsmParserView:
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        page.open(dlg)
+        page.show_dialog(dlg)
 
     def _open_linked_device(self, page, device_id: str):
         async def _do():
@@ -4285,6 +5196,155 @@ class GsmParserView:
         )
         page.show_dialog(dlg)
 
+    def _manual_gsm_url_dialog(self, page, device_id: str):
+        """SA dialog: manually pin a GSM Arena URL to a standalone
+        E-Katalog device (no GSM Arena match yet) — the mirror of
+        _manual_ek_url_dialog above, for when the product hasn't shown up
+        on GSM Arena in our DB at all. Fetched immediately via the VPS
+        parser service (see parser_service.py's /fetch-manual-gsm-link) —
+        GSM Arena scraping never runs on the desktop client, same as the
+        scheduled parser itself — so the device gets its GSM Arena data
+        without waiting for the next scheduled/triggered run to discover
+        the match on its own."""
+        editor = ft.TextField(
+            label="Посилання на GSM Arena",
+            hint_text="https://www.gsmarena.com/...php",
+            expand=True,
+        )
+
+        save_btn = ft.FilledButton("Зберегти", icon=ft.Icons.SAVE)
+
+        def _reset_save_btn():
+            save_btn.text = "Зберегти"
+            save_btn.disabled = False
+            with contextlib.suppress(Exception):
+                save_btn.update()
+
+        def _save(_):
+            new_url = str(editor.value or "").strip()
+            if not new_url.startswith("http"):
+                self._show_snack(
+                    "Вкажіть коректне посилання (http/https)", ft.Colors.RED
+                )
+                return
+            save_btn.text = "Завантаження…"
+            save_btn.disabled = True
+            with contextlib.suppress(Exception):
+                save_btn.update()
+
+            async def _do():
+                # Everything below used to run with no outer safety net — if
+                # get_parser_service_config() (or anything else outside the
+                # inner httpx try/except) raised, the exception died silently
+                # inside this page.run_task'd coroutine: the button stayed
+                # stuck on "Завантаження…" forever and NOTHING visible ever
+                # told the user it failed ("натиснув зберегти, нічого не
+                # відбувається"). Wrapping the whole body guarantees a
+                # snackbar (and a reset button) no matter what breaks.
+                try:
+                    svc = await asyncio.to_thread(self.db.get_parser_service_config)
+                    vps_url = str((svc or {}).get("vps_service_url") or "").strip().rstrip("/")
+                    vps_key = str((svc or {}).get("vps_api_key") or "").strip()
+                    if not vps_url:
+                        _reset_save_btn()
+                        self._show_snack(
+                            "VPS-сервіс парсера не налаштований — прив'язати "
+                            "посилання зараз неможливо.",
+                            ft.Colors.ORANGE,
+                        )
+                        return
+                    self._show_snack("Завантажуємо з GSM Arena… (до хвилини)", ft.Colors.BLUE)
+                    try:
+                        import httpx
+
+                        headers = {"x-api-key": vps_key} if vps_key else {}
+                        async with httpx.AsyncClient(timeout=90.0) as client:
+                            resp = await client.post(
+                                f"{vps_url}/fetch-manual-gsm-link",
+                                json={"device_id": device_id, "url": new_url},
+                                headers=headers,
+                            )
+                            resp.raise_for_status()
+                            data = resp.json()
+                    except Exception as exc:
+                        _reset_save_btn()
+                        self._show_snack(f"Помилка запиту до VPS: {exc}", ft.Colors.RED)
+                        return
+
+                    if not data.get("ok"):
+                        _reset_save_btn()
+                        self._show_snack(
+                            f"Не вдалося завантажити: {data.get('message')}", ft.Colors.RED
+                        )
+                        return
+
+                    page.pop_dialog()
+                    # The merged device's primary id switches from the EK row's
+                    # id to the new GSM row's id once linked
+                    # (get_gsm_merged_results keys the joined row off the GSM
+                    # side) — a full resync from DB is the simplest correct fix,
+                    # same as the "Посилання ЄК" dialog's brand-new-device path,
+                    # instead of hand-patching the in-memory cache under a
+                    # changed key.
+                    resync_rows = await asyncio.to_thread(self._sync_cache_from_db, True)
+                    self._refresh_table(rebuild_filters=True)
+                    new_gsm_id = str(data.get("device_id") or "").strip()
+                    updated_merged = next(
+                        (
+                            r
+                            for r in (resync_rows or [])
+                            if str(r.get("id") or "") == new_gsm_id
+                        ),
+                        None,
+                    )
+                    # Reopen the SAME card with fresh merged data right away —
+                    # matches "Посилання ЄК"'s pattern — instead of making the
+                    # user close and reopen it by hand.
+                    if updated_merged is not None and self._active_device_dialog is not None:
+                        self._device_detail_modal(page, updated_merged)
+                    self._show_snack(
+                        f"GSM Arena прив'язано: {data.get('message')}", ft.Colors.GREEN
+                    )
+                except Exception as exc:
+                    _catlog.exception("manual GSM link save failed")
+                    _reset_save_btn()
+                    self._show_snack(f"Помилка збереження: {exc}", ft.Colors.RED)
+
+            page.run_task(_do)
+
+        save_btn.on_click = _save
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(
+                "Ручне посилання на GSM Arena", size=16, weight=ft.FontWeight.W_700
+            ),
+            content=ft.Container(
+                width=520,
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            "Товар ще не з'явився на GSM Arena в нашій базі —"
+                            " якщо ви знайшли його сторінку вручну, вставте"
+                            " посилання тут: воно завантажиться і прив'яжеться"
+                            " до цього товару одразу, без очікування наступного"
+                            " парсингу.",
+                            size=11,
+                            color=ft.Colors.BLUE_GREY_600,
+                        ),
+                        editor,
+                    ],
+                    spacing=10,
+                ),
+            ),
+            actions=[
+                ft.TextButton("Скасувати", on_click=lambda _: page.pop_dialog()),
+                save_btn,
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        page.show_dialog(dlg)
+
     def _merge_devices_dialog(self, page, device_id: str, is_gsm_side: bool, seed_query: str):
         """SA action: manually link a standalone GSM Arena row with a
         standalone E-Katalog row that are actually the same device but
@@ -4312,9 +5372,29 @@ class GsmParserView:
                 page.pop_dialog()
             self._show_snack(msg, ft.Colors.GREEN if ok else ft.Colors.RED)
             if ok:
-                await asyncio.to_thread(self._refresh_cached_detail, device_id)
-                with contextlib.suppress(Exception):
-                    self._refresh_table(rebuild_filters=False)
+                # Re-pointing a link can change which id represents the
+                # merged row in the results table — the OLD GSM side
+                # reverts to standalone (needs to show up on its own again),
+                # and a previously-standalone EK/GSM row's own id
+                # disappears in favor of the new GSM-keyed merged row.
+                # Patching the in-memory cache under a moving-target key
+                # was exactly the "old card lingers as a stale duplicate"
+                # bug already fixed for the manual GSM-link dialog above —
+                # a full resync from DB is the only way to guarantee both
+                # the old card actually goes away and the new one shows up
+                # immediately, without a manual "Синхронізація".
+                resync_rows = await asyncio.to_thread(self._sync_cache_from_db, True)
+                self._refresh_table(rebuild_filters=True)
+                updated_merged = next(
+                    (
+                        r
+                        for r in (resync_rows or [])
+                        if str(r.get("id") or "") == gsm_id_arg
+                    ),
+                    None,
+                )
+                if updated_merged is not None and self._active_device_dialog is not None:
+                    self._device_detail_modal(page, updated_merged)
 
         async def _do_search(_e=None):
             q = (search_field.value or "").strip()
@@ -4393,15 +5473,19 @@ class GsmParserView:
         page.run_task(_do_search)
 
     def _confirm_remove_ek_match(self, page, device_id: str, ek_id: str):
-        """SA action: delete only the E-Katalog side of a merged device (the
-        GSM Arena row stays untouched). Use when auto-matching picked the
-        wrong product — the next parser run will search again from scratch."""
+        """Delete only the E-Katalog side of a merged device (the GSM Arena
+        row stays untouched). delete_gsm_device also registers this
+        (source, model_key) as excluded, so future parses never silently
+        re-add it — the only way back is a manual link (see
+        _manual_ek_url_dialog / clear_gsm_excluded)."""
 
         def _do_remove(_):
             page.pop_dialog()
 
             async def _do():
-                ok = await asyncio.to_thread(self.db.delete_gsm_device, ek_id)
+                ok = await asyncio.to_thread(
+                    self.db.delete_gsm_device, ek_id, self.manager_id or ""
+                )
                 if ok:
                     await asyncio.to_thread(self._refresh_cached_detail, device_id)
 
@@ -4436,7 +5520,7 @@ class GsmParserView:
                     self._show_snack(
                         self.t(
                             "gsm.ek_match_removed",
-                            "Товар ЄК прибрано — наступний парсинг спробує знайти знову",
+                            "Товар ЄК видалено — автоматично більше не підтягнеться",
                         ),
                         ft.Colors.GREEN,
                     )
@@ -4447,17 +5531,84 @@ class GsmParserView:
 
         dlg = ft.AlertDialog(
             modal=True,
-            title=ft.Text("Прибрати товар ЄК?", size=16, weight=ft.FontWeight.W_700),
+            title=ft.Text("Видалити товар ЄК?", size=16, weight=ft.FontWeight.W_700),
             content=ft.Text(
-                "GSM Arena дані залишаться без змін. Товар E-Katalog буде видалено,"
-                " і при наступному парсингу парсер спробує знайти правильний"
-                " відповідник ще раз.",
+                "GSM Arena дані залишаться без змін. Товар E-Katalog буде видалено"
+                " і більше не підтягнеться автоматично на наступних парсингах —"
+                " повернути можна тільки вручну, через посилання.",
                 size=12,
             ),
             actions=[
                 ft.TextButton("Скасувати", on_click=lambda _: page.pop_dialog()),
                 ft.FilledButton(
-                    "Прибрати",
+                    "Видалити",
+                    icon=ft.Icons.DELETE_OUTLINE,
+                    style=ft.ButtonStyle(bgcolor=ft.Colors.RED_400, color=ft.Colors.WHITE),
+                    on_click=_do_remove,
+                ),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        page.show_dialog(dlg)
+
+    def _confirm_remove_gsm_match(self, page, gsm_device_id: str):
+        """Delete only the GSM Arena side of a merged device — the E-Katalog
+        side survives and becomes the card's new primary id (see
+        detach_gsm_side_keep_ek, which migrates comments/compat/price
+        history/regional variants across so nothing is silently lost). The
+        GSM Arena (source, model_key) is registered excluded so it never
+        silently re-matches on a future scheduled parse — the only way back
+        is a manual link (see _manual_gsm_url_dialog)."""
+
+        def _do_remove(_):
+            page.pop_dialog()
+
+            async def _do():
+                ok, msg, new_id = await asyncio.to_thread(
+                    self.db.detach_gsm_side_keep_ek, gsm_device_id, self.manager_id or ""
+                )
+                if not ok:
+                    self._show_snack(msg or self.t("gsm.err.save_failed", "Не вдалося зберегти"), ft.Colors.RED)
+                    return
+
+                # The primary id changes (GSM's id -> the E-Katalog row's
+                # own id) — a full resync is the correct fix here, same as
+                # _manual_gsm_url_dialog's own identity-switch path, rather
+                # than trying to hand-patch the in-memory cache under a
+                # now-deleted key.
+                resync_rows = await asyncio.to_thread(self._sync_cache_from_db, True)
+                self._refresh_table(rebuild_filters=True)
+
+                if self._active_device_dialog is not None:
+                    with contextlib.suppress(Exception):
+                        page.pop_dialog()
+                    self._active_device_dialog = None
+
+                updated_merged = next(
+                    (r for r in (resync_rows or []) if str(r.get("id") or "") == new_id),
+                    None,
+                )
+                if updated_merged is not None:
+                    self._device_detail_modal(page, updated_merged)
+                self._show_snack(msg, ft.Colors.GREEN)
+
+            page.run_task(_do)
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Видалити GSM Arena?", size=16, weight=ft.FontWeight.W_700),
+            content=ft.Text(
+                "Товар стане лише ЄК — коментарі, сумісність, історія цін і"
+                " регіональні варіанти переносяться на нього автоматично, нічого"
+                " не втратиться. GSM Arena більше не підтягнеться автоматично на"
+                " наступних парсингах — повернути можна тільки вручну, через"
+                " посилання.",
+                size=12,
+            ),
+            actions=[
+                ft.TextButton("Скасувати", on_click=lambda _: page.pop_dialog()),
+                ft.FilledButton(
+                    "Видалити",
                     icon=ft.Icons.DELETE_OUTLINE,
                     style=ft.ButtonStyle(bgcolor=ft.Colors.RED_400, color=ft.Colors.WHITE),
                     on_click=_do_remove,
@@ -4503,7 +5654,15 @@ class GsmParserView:
             ek_id = ""
             brand = str(merged.get("brand") or "—")
 
-        # Adapter dict for compatible/comments sections (expect flat-style keys)
+        # Adapter dict for compatible/comments/regional-variants sections
+        # (expect flat-style keys). Must ALSO carry gsm_specs/ek_specs under
+        # their real names, not just merged into "specs" — anything reading
+        # device.get("gsm_specs")/device.get("ek_specs") directly (e.g.
+        # _build_regional_variants_section's xiaomi_other_markets lookup and
+        # its E-Katalog price/shops summary) silently got {} through this
+        # adapter otherwise, even though the data was right there in `gs`/
+        # `es` — confirmed live as the reason region badges beyond Global/
+        # Europe never rendered no matter how fresh the underlying DB data was.
         _compat_dev = {
             "id": device_id,
             "brand": brand,
@@ -4511,6 +5670,8 @@ class GsmParserView:
                 merged.get("device_type") or gs.get("device_type") or ""
             ),
             "specs": {**gs, "display_size": gs.get("display_size", "")},
+            "gsm_specs": gs,
+            "ek_specs": es,
             "model_name": gsm_name,
         }
 
@@ -4566,7 +5727,7 @@ class GsmParserView:
                     page, "on_keyboard_event", _prev_kb_single[0]
                 ),
             )
-            page.open(_dlg_ref[0])
+            page.show_dialog(_dlg_ref[0])
 
         # Shared mutable list of all photo URLs (main + extras, up to 7)
         _all_photos: list = [image_url] if image_url else []
@@ -4700,7 +5861,7 @@ class GsmParserView:
                     page, "on_keyboard_event", _prev_kb_gal[0]
                 ),
             )
-            page.open(_gal_dlg_ref[0])
+            page.show_dialog(_gal_dlg_ref[0])
 
         # Thumbnail row — populated asynchronously with up to 6 extra photos
         _thumbs_row = ft.Row(
@@ -4790,6 +5951,17 @@ class GsmParserView:
             else net_label or net_full
         )
 
+        # An already-split Xiaomi card (region_split_group_id set) shows the
+        # size WE manually set for its own claimed region, not GSM Arena's
+        # one blanket figure — see _get_effective_xiaomi_size's docstring.
+        # A not-yet-split card always shows the blanket GSM Arena size.
+        _eff_size = self._get_effective_xiaomi_size(device_id, merged)
+        _eff_size_str = (
+            str(_eff_size.get("size_str") or "").replace(" мм", "") if _eff_size else ""
+        )
+        _size_display = _eff_size_str or _fmt_dims(gs) or gs.get("dimensions")
+        _diag_display = (_eff_size["diagonal"] if _eff_size else "") or gs.get("display_size")
+
         gsm_rows = [
             r
             for r in [
@@ -4801,8 +5973,8 @@ class GsmParserView:
                 _srow("Рік", gs.get("year")),
                 _srow("Анонс", gs.get("announced")),
                 _srow("Реліз", gs.get("released")),
-                _srow("Розмір", _fmt_dims(gs) or gs.get("dimensions")),
-                _srow("Діагональ", gs.get("display_size"), " дюйм"),
+                _srow("Розмір", _size_display),
+                _srow("Діагональ", _diag_display, " дюйм"),
                 _srow("Вага", gs.get("weight")),
                 _srow("Операційна система", gs.get("os")),
                 _srow("Процесор", gs.get("chipset")),
@@ -4819,6 +5991,35 @@ class GsmParserView:
             icon=ft.Icons.OPEN_IN_NEW,
             on_click=lambda _: page.launch_url(gsm_url) if gsm_url else None,
             disabled=not gsm_url,
+        )
+        # Only offered when this card has no GSM Arena match at all yet —
+        # once it does, gsm_link_btn above already covers it.
+        gsm_manual_btn = (
+            ft.IconButton(
+                icon=ft.Icons.LINK,
+                icon_size=16,
+                tooltip="Вказати посилання на GSM Arena вручну",
+                on_click=lambda _: self._manual_gsm_url_dialog(page, device_id),
+            )
+            if self.can_manage_gsm_links and not gsm_url
+            else None
+        )
+        # Mirror of ek_remove_btn (below) — only offered once GSM Arena IS
+        # matched (gsm_manual_btn above already covers the opposite case).
+        # See detach_gsm_side_keep_ek's own docstring for what "delete"
+        # means here: the E-Katalog side survives and becomes the new
+        # primary card, not a blank slate.
+        gsm_remove_btn = (
+            ft.IconButton(
+                icon=ft.Icons.DELETE_OUTLINE,
+                icon_size=16,
+                icon_color=ft.Colors.RED_400,
+                tooltip="Видалити GSM Arena (товар стане лише ЄК) — більше не"
+                " підтягнеться автоматично, тільки вручну через посилання",
+                on_click=lambda _: self._confirm_remove_gsm_match(page, device_id),
+            )
+            if self.can_manage_gsm_links and gsm_url
+            else None
         )
 
         # ---- Єкаталог tab ----
@@ -4838,8 +6039,8 @@ class GsmParserView:
                 _srow("Назва ЄК", ek_name or gsm_name),
                 _srow("Мережа", es.get("target_net")),
                 _srow("Дата додавання", es.get("date_added")),
-                _srow("Розмір", _fmt_dims(es) or es.get("dimensions")),
-                _srow("Діагональ", es.get("display"), " дюйм"),
+                _srow("Розмір", _size_display),
+                _srow("Діагональ", _diag_display, " дюйм"),
                 _srow("Вага", es.get("weight")),
                 _srow("Операційна система", es.get("os")),
                 _srow("Процесор", es.get("cpu")),
@@ -4982,7 +6183,7 @@ class GsmParserView:
                     page, device_id, _manual_ek_url_ref[0], refresh_cb=_on_manual_ek_url_saved
                 ),
             )
-            if self.is_superadmin
+            if self.can_manage_devices
             else None
         )
         ek_remove_btn = (
@@ -4990,15 +6191,18 @@ class GsmParserView:
                 icon=ft.Icons.DELETE_OUTLINE,
                 icon_size=16,
                 icon_color=ft.Colors.RED_400,
-                tooltip="Прибрати знайдений товар ЄК (ГСМ Arena залишиться) — наступний парсинг спробує знайти знову",
+                tooltip="Видалити товар ЄК (ГСМ Arena залишиться) — більше не підтягнеться автоматично, тільки вручну через посилання",
                 on_click=lambda _: self._confirm_remove_ek_match(page, device_id, ek_id),
             )
-            if self.is_superadmin and ek_id
+            if self.can_manage_devices and ek_id
             else None
         )
         # Manual-merge button: only when this card is missing its other
         # side (GSM-primary with no EK match, or a standalone EK-only
-        # card) — once both sides are present there's nothing to merge.
+        # card) — once both sides are present, use ek_reassign_btn below
+        # instead (auto-matching can pick the wrong GSM Arena counterpart —
+        # e.g. a regional variant like "(China)" — and there's nothing to
+        # "merge" here, only to re-point).
         _is_gsm_side = gsm_name != "—"
         _merge_missing_side = (_is_gsm_side and not ek_id) or not _is_gsm_side
         merge_btn = (
@@ -5015,6 +6219,29 @@ class GsmParserView:
                 ),
             )
             if self.is_superadmin and _merge_missing_side
+            else None
+        )
+        # Reassign EK to a DIFFERENT GSM Arena record — for when auto-match
+        # (or a manual merge) linked the right product to the wrong regional
+        # variant (e.g. EK's global "Redmi Note 17" got matched to GSM
+        # Arena's "Redmi Note 17 (China)", which isn't even sold here).
+        # merge_gsm_ek_devices always re-points/overwrites regardless of any
+        # existing link on either side (see its docstring) — the EK row
+        # itself, and all its price/shop history, is untouched by this;
+        # only which GSM Arena device it's linked to changes. Uses
+        # _merge_devices_dialog with is_gsm_side=False so the search targets
+        # GSM Arena and _do_merge re-points THIS ek_id, not the GSM side.
+        ek_reassign_btn = (
+            ft.IconButton(
+                icon=ft.Icons.SWAP_HORIZ,
+                icon_size=16,
+                icon_color=ft.Colors.ORANGE_700,
+                tooltip="Перепризначити Єкаталог на інший запис GSM Arena (історія цін збережеться)",
+                on_click=lambda _: self._merge_devices_dialog(
+                    page, ek_id, False, ek_name or brand
+                ),
+            )
+            if self.is_superadmin and ek_id and _is_gsm_side
             else None
         )
 
@@ -5045,7 +6272,13 @@ class GsmParserView:
                     ],
                     vertical_alignment=ft.CrossAxisAlignment.START,
                 ),
-                gsm_link_btn,
+                ft.Row(
+                    [gsm_link_btn]
+                    + ([gsm_manual_btn] if gsm_manual_btn else [])
+                    + ([gsm_remove_btn] if gsm_remove_btn else []),
+                    spacing=0,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
                 ft.Divider(height=14),
                 _section_title("Єкаталог"),
                 ft.Column(
@@ -5056,7 +6289,8 @@ class GsmParserView:
                             [ek_link_btn]
                             + ([ek_manual_btn] if ek_manual_btn else [])
                             + ([ek_remove_btn] if ek_remove_btn else [])
-                            + ([merge_btn] if merge_btn else []),
+                            + ([merge_btn] if merge_btn else [])
+                            + ([ek_reassign_btn] if ek_reassign_btn else []),
                             spacing=0,
                             vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         )
@@ -5360,12 +6594,22 @@ class GsmParserView:
             actions_alignment=ft.MainAxisAlignment.END,
         )
 
+        _prev_kb_device = [getattr(page, "on_keyboard_event", None)]
+
         def _close_this_modal():
+            with contextlib.suppress(Exception):
+                page.on_keyboard_event = _prev_kb_device[0]
             with contextlib.suppress(Exception):
                 page.pop_dialog()
             if self._active_device_dialog is dlg:
                 self._active_device_dialog = None
+            self._restore_table_scroll_soon(page)
 
+        def _on_device_kb(e):
+            if e.key == "Escape":
+                _close_this_modal()
+
+        page.on_keyboard_event = _on_device_kb
         self._active_device_dialog = dlg
         page.show_dialog(dlg)
 
@@ -5718,6 +6962,23 @@ class GsmParserView:
                     with contextlib.suppress(Exception):
                         _ref.update()
 
+            # _table_body_ref's CONTENT was just cleared and rebuilt with
+            # brand-new row Controls (not reused/keyed instances) inside
+            # the SAME outer scrollable Column — Flet/Flutter can still
+            # lose the scroll offset here even though the Column object
+            # itself wasn't replaced, since the child widget tree changed
+            # shape. Nudge it back to where it was, same offset this
+            # view's on_scroll last recorded (see _on_table_v_scroll /
+            # _build_results_content's own restore for the "whole Column
+            # got replaced outright" case, e.g. after a modal close).
+            if page_ctrl and self._table_scroll_pixels > 0 and self._table_v_scroll_ref.current:
+                async def _restore_table_scroll_inplace():
+                    with contextlib.suppress(Exception):
+                        await self._table_v_scroll_ref.current.scroll_to(
+                            offset=self._table_scroll_pixels, duration=0
+                        )
+                page_ctrl.run_task(_restore_table_scroll_inplace)
+
             if "_to_fill" in locals() and _to_fill:
                 if defer_fill_to_caller:
                     # Caller (currently only _reveal_sync) awaits the fill
@@ -5743,66 +7004,27 @@ class GsmParserView:
                         (gsm_sz_c, ek_sz_c, gsm_dg_c, ek_dg_c),
                     )
 
-            # Catch-up: a filter change (or search) can bring devices into
-            # view that the initial preload never touched — e.g. a user
-            # who only ever filters to one device type never needed the
-            # other ~300 devices preloaded in the first place. Top up just
-            # the delta (chart render + local photo cache) in the
-            # background, with its own visible status, instead of either
-            # assuming everything is already warm or re-running the full
-            # preload. Skipped when deferred (the reveal/manual-sync flows
-            # already do their own full warm) and while one is already
-            # running (avoid piling up redundant catch-ups on rapid
-            # filter clicks).
-            if (
-                not defer_fill_to_caller
-                and page_ctrl
-                and not self._catch_up_running
-            ):
-                _new_devs = [
-                    d for d in filtered
-                    if str(d.get("id") or "") not in self._warm_device_ids
-                ]
-                if _new_devs:
-                    page_ctrl.run_task(self._catch_up_new_devices, _new_devs)
+            # Deliberately NO catch-up here anymore. This used to
+            # auto-fire _catch_up_new_devices (chart render + photo warm)
+            # for every device a filter/search change revealed outside the
+            # initial preload — silently, on a background task, any time
+            # the visible set changed. On a broad filter change that can be
+            # hundreds of devices' worth of matplotlib renders competing
+            # for the same thread as everything else (card open, other
+            # charts, the Лог/Налаштування lazy tabs) — exactly the
+            # "something loading in the background" freeze reported after
+            # broadening a filter (see product feedback: fan spinning,
+            # device cards and Лог/Налаштування tabs hanging for minutes).
+            # Explicit product requirement: nothing loads outside the
+            # "Показати результати" click. Charts/photos for devices
+            # outside the original preload now build on demand instead —
+            # _build_adaptive_charts and the card-open path are already
+            # cache-aware and synchronous-when-warm, so the only cost is a
+            # normal one-time render the first time that specific device's
+            # card/chart is actually opened, not a batch of hundreds
+            # up front.
         except Exception as exc:
             logger.error("[GSM] _refresh_table FAILED: %s", exc, exc_info=True)
-
-    async def _catch_up_new_devices(self, new_devs: list[dict]) -> None:
-        """Warms chart+photo cache for devices a filter/search change just
-        revealed that the initial (or previous) preload never covered —
-        see _refresh_table's catch-up hook."""
-        if self._catch_up_running or not new_devs:
-            return
-        self._catch_up_running = True
-        try:
-            self._reveal_charts_done = 0
-            self._reveal_charts_total = 0
-            self._update_loading_status(
-                self.t("gsm.catching_up", "Довантаження… {n} нових пристроїв").format(
-                    n=len(new_devs)
-                )
-            )
-            if self._loading_bar_ref is not None:
-                self._loading_bar_ref.visible = True
-                with contextlib.suppress(Exception):
-                    self._loading_bar_ref.update()
-            if self._loading_status_ref is not None:
-                self._loading_status_ref.visible = True
-                with contextlib.suppress(Exception):
-                    self._loading_status_ref.update()
-            await self._preload_charts_for_current_page(new_devs)
-            await self._warm_photo_cache_from_db(new_devs)
-            self._warm_device_ids.update(
-                str(d.get("id") or "") for d in new_devs
-            )
-            _catlog.info("[GSM] _catch_up_new_devices completed: %s devices", len(new_devs))
-        except Exception:
-            logger.exception("[GSM] _catch_up_new_devices FAILED")
-            _catlog.exception("[GSM] _catch_up_new_devices FAILED")
-        finally:
-            self._catch_up_running = False
-            self._hide_loading_overlay()
 
     def _empty_row(self) -> ft.Control:
         return ft.Container(
@@ -5845,6 +7067,10 @@ class GsmParserView:
         brand = str(dev.get("brand") or "").strip().lower()
         if brand != "xiaomi":
             return []
+        with _DETAIL_LOCK:
+            cached_groups = _SIZE_GROUPS_CACHE.get(device_id)
+        if cached_groups is not None:
+            return cached_groups
         detail = self._get_or_fetch_device_detail(device_id, dev)
         variants = detail.get("variants") or []
         sized = [
@@ -5855,14 +7081,16 @@ class GsmParserView:
             and str(v.get("W") or "").strip()
         ]
         if not sized:
+            with _DETAIL_LOCK:
+                _SIZE_GROUPS_CACHE[device_id] = []
             return []
 
         def _sig(v: dict) -> tuple:
             return (
-                str(v.get("L") or "").strip(),
-                str(v.get("W") or "").strip(),
-                str(v.get("T") or "").strip(),
-                str(v.get("diagonal") or "").strip(),
+                _norm_size_num(v.get("L")),
+                _norm_size_num(v.get("W")),
+                _norm_size_num(v.get("T")),
+                _norm_size_num(v.get("diagonal")),
             )
 
         groups: dict[tuple, list[str]] = {}
@@ -5894,48 +7122,67 @@ class GsmParserView:
                 "size_str": _size_str(sig),
                 "diag_str": _diag_str(sig),
             })
+        with _DETAIL_LOCK:
+            _SIZE_GROUPS_CACHE[device_id] = result
         return result
 
-    def _build_compare_entries(self, dev: dict) -> list[dict]:
-        """Expand one selected device into one comparison "entry" per
-        DISTINCT physical size among its Xiaomi regional variants.
+    def _get_effective_xiaomi_size(self, device_id: str, dev: dict) -> dict | None:
+        """The size to use EVERYWHERE a Xiaomi device's size/diagonal is
+        shown or searched on: main table columns, Огляд tab (both GSM
+        Arena's and E-Katalog's own rows), compat search, comparison. A
+        manually-entered region size always outranks both GSM Arena's and
+        E-Katalog's own scraped figures — per spec, whatever WE typed in
+        the regional-variants table wins everywhere, unconditionally.
 
-        - No variants at all (or not Xiaomi): one entry, name/specs unchanged.
-        - Variants exist but all share one L×W×T+diagonal: still one entry,
-          name unchanged, but its size/diagonal come from the regional table
-          instead of GSM Arena (more precise/reliable for Xiaomi).
-        - Variants split into 2+ distinct sizes: one entry per size group,
-          name suffixed with the regions sharing that size, e.g.
-          "Xiaomi Redmi Note 15 Pro 4G (Europe, India)".
+        - No sized regional variants at all: no override (None) — nothing
+          manual exists yet, blanket GSM Arena/E-Katalog specs stand.
+        - All sized regions agree on ONE size: that size, unambiguously —
+          more precise/reliable than GSM Arena's single blanket figure,
+          and this needs no split at all (there's nothing to split, every
+          region already agrees).
+        - Regions carry 2+ DISTINCT sizes and this card is NOT split yet:
+          no override (None) — ambiguous until the user picks
+          "Розділити за регіоном" (split_gsm_device_by_region) to turn it
+          into two real single-size cards.
+        - Regions carry 2+ distinct sizes and this card IS split
+          (specs["region_split_group_id"] set): the size of just this
+          card's own claimed region subset (specs["region_split_regions"])."""
+        groups = self._get_xiaomi_size_groups(device_id, dev)
+        if not groups:
+            return None
+        if len(groups) == 1:
+            return groups[0]
+        gsm_specs = dev.get("gsm_specs") if isinstance(dev.get("gsm_specs"), dict) else {}
+        claimed = (gsm_specs or {}).get("region_split_regions")
+        if not (gsm_specs or {}).get("region_split_group_id") or not claimed:
+            return None
+        claimed_set = set(claimed)
+        for g in groups:
+            if set(g.get("regions") or []) & claimed_set:
+                return g
+        return None
+
+    def _build_compare_entries(self, dev: dict) -> list[dict]:
+        """One comparison entry per selected device — see
+        _get_effective_xiaomi_size's docstring for why this no longer fans
+        a single not-yet-split card out into multiple entries.
+
+        - Not Xiaomi, or not (yet) split: one entry, blanket GSM Arena/
+          E-Katalog specs unchanged — even if its regions carry different
+          sizes, that's exactly what split_gsm_device_by_region is for.
+        - Already split (region_split_group_id set): one entry, size/
+          diagonal come from this card's OWN claimed region subset.
         """
         device_id = str(dev.get("id") or "")
         base_name = str(dev.get("gsm_name") or dev.get("ek_name") or "—")
-        groups = self._get_xiaomi_size_groups(device_id, dev)
-
-        if not groups:
-            entry = dict(dev)
-            entry["_compare_name"] = base_name
-            entry["_variant_label"] = ""
-            return [entry]
-
-        if len(groups) == 1:
-            g = groups[0]
-            entry = dict(dev)
-            entry["_compare_name"] = base_name
-            entry["_variant_label"] = ""
+        entry = dict(dev)
+        entry["_compare_name"] = base_name
+        entry["_variant_label"] = ""
+        g = self._get_effective_xiaomi_size(device_id, dev)
+        if g:
             entry["_size_override"] = g["size_str"]
             entry["_diag_override"] = g["diag_str"]
-            return [entry]
-
-        entries = []
-        for g in groups:
-            entry = dict(dev)
-            entry["_compare_name"] = f"{base_name} ({g['label']})"
-            entry["_variant_label"] = g["label"]
-            entry["_size_override"] = g["size_str"]
-            entry["_diag_override"] = g["diag_str"]
-            entries.append(entry)
-        return entries
+        return [entry]
 
     def _comparison_modal(self, page_ctrl, selected_ids: set) -> None:
         """Open a side-by-side comparison modal for the selected devices.
@@ -5988,6 +7235,21 @@ class GsmParserView:
             with contextlib.suppress(Exception):
                 if modal_ref[0]:
                     page_ctrl.pop_dialog()
+            self._restore_table_scroll_soon(page_ctrl)
+            # Selection must not survive the modal — otherwise the compare
+            # checkboxes stay checked in the table and the user has to
+            # manually uncheck each one before starting a new comparison.
+            _COMPARE_SELECTED.clear()
+            cb = _COMPARE_BTN_CB
+            if cb:
+                with contextlib.suppress(Exception):
+                    cb()
+            for _d in filtered:
+                _did = str(_d.get("id") or "")
+                _brand = str(_d.get("brand") or "")
+                if _did and _brand:
+                    with contextlib.suppress(Exception):
+                        self._update_device_row_in_place(_did, _brand, _d)
 
         # Photo lists per device, kept in sync as each column loads its photos
         # asynchronously — the full-screen gallery flattens these into one
@@ -6158,6 +7420,100 @@ class GsmParserView:
             overlay_color=ft.Colors.with_opacity(0.1, ft.Colors.BLUE),
         )
 
+        _chars_content = ft.Row(
+            [
+                ft.IconButton(
+                    ft.Icons.CHEVRON_LEFT,
+                    icon_size=24,
+                    on_click=lambda _: _cmp_scroll(-(col_w + 4)),
+                    style=_arrow_style,
+                    icon_color=_ACCENT,
+                ),
+                ft.Container(
+                    expand=True,
+                    height=580,
+                    content=cmp_row,
+                    clip_behavior=ft.ClipBehavior.HARD_EDGE,
+                ),
+                ft.IconButton(
+                    ft.Icons.CHEVRON_RIGHT,
+                    icon_size=24,
+                    on_click=lambda _: _cmp_scroll(col_w + 4),
+                    style=_arrow_style,
+                    icon_color=_ACCENT,
+                ),
+            ],
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=0,
+        )
+
+        # "Діаграми" is built lazily (matplotlib cost only paid once the
+        # user actually asks for it) and cached (_CMP_CHART_RENDER_CACHE)
+        # so switching back to it after the first build is instant.
+        _charts_built = {"ctrl": None}
+        _body_ref = ft.Ref[ft.Container]()
+        _active_tab = {"v": "chars"}
+        _tab_chars_btn_ref = ft.Ref[ft.TextButton]()
+        _tab_charts_btn_ref = ft.Ref[ft.TextButton]()
+
+        def _tab_style(active: bool) -> ft.ButtonStyle:
+            return ft.ButtonStyle(
+                bgcolor=_ACCENT if active else "transparent",
+                color=ft.Colors.WHITE if active else _MUTED,
+                padding=ft.padding.symmetric(horizontal=12, vertical=6),
+                shape=ft.RoundedRectangleBorder(radius=8),
+            )
+
+        def _switch_tab(tab: str):
+            def _do(_e=None):
+                if _active_tab["v"] == tab:
+                    return
+                _active_tab["v"] = tab
+                if tab == "charts":
+                    if _charts_built["ctrl"] is None:
+                        _charts_built["ctrl"] = self._build_comparison_charts_view(compare_entries)
+                    _body_ref.current.content = ft.Container(
+                        content=_charts_built["ctrl"],
+                        height=920,
+                        padding=ft.padding.only(right=8),
+                    )
+                else:
+                    _body_ref.current.content = _chars_content
+                if _tab_chars_btn_ref.current:
+                    _tab_chars_btn_ref.current.style = _tab_style(tab == "chars")
+                    with contextlib.suppress(Exception):
+                        _tab_chars_btn_ref.current.update()
+                if _tab_charts_btn_ref.current:
+                    _tab_charts_btn_ref.current.style = _tab_style(tab == "charts")
+                    with contextlib.suppress(Exception):
+                        _tab_charts_btn_ref.current.update()
+                with contextlib.suppress(Exception):
+                    _body_ref.current.update()
+            return _do
+
+        tab_toggle = ft.Container(
+            padding=2,
+            bgcolor=ft.Colors.BLUE_GREY_50,
+            border_radius=10,
+            content=ft.Row(
+                [
+                    ft.TextButton(
+                        "Характеристики",
+                        ref=_tab_chars_btn_ref,
+                        style=_tab_style(True),
+                        on_click=_switch_tab("chars"),
+                    ),
+                    ft.TextButton(
+                        "Діаграми",
+                        ref=_tab_charts_btn_ref,
+                        style=_tab_style(False),
+                        on_click=_switch_tab("charts"),
+                    ),
+                ],
+                spacing=2,
+            ),
+        )
+
         modal = ft.AlertDialog(
             modal=True,
             title=ft.Row(
@@ -6176,6 +7532,7 @@ class GsmParserView:
                         weight=ft.FontWeight.W_700,
                     ),
                     ft.Container(expand=True),
+                    tab_toggle,
                     ft.IconButton(
                         ft.Icons.CLOSE,
                         icon_size=18,
@@ -6186,35 +7543,10 @@ class GsmParserView:
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 spacing=8,
             ),
-            content=ft.Row(
-                [
-                    ft.IconButton(
-                        ft.Icons.CHEVRON_LEFT,
-                        icon_size=24,
-                        on_click=lambda _: _cmp_scroll(-(col_w + 4)),
-                        style=_arrow_style,
-                        icon_color=_ACCENT,
-                    ),
-                    ft.Container(
-                        expand=True,
-                        height=580,
-                        content=cmp_row,
-                        clip_behavior=ft.ClipBehavior.HARD_EDGE,
-                    ),
-                    ft.IconButton(
-                        ft.Icons.CHEVRON_RIGHT,
-                        icon_size=24,
-                        on_click=lambda _: _cmp_scroll(col_w + 4),
-                        style=_arrow_style,
-                        icon_color=_ACCENT,
-                    ),
-                ],
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                spacing=0,
-            ),
+            content=ft.Container(ref=_body_ref, content=_chars_content),
             content_padding=ft.padding.symmetric(horizontal=8, vertical=8),
             actions=[],
-            inset_padding=ft.padding.symmetric(horizontal=16, vertical=32),
+            inset_padding=ft.padding.symmetric(horizontal=16, vertical=12),
         )
         modal_ref[0] = modal
         with contextlib.suppress(Exception):
@@ -6344,6 +7676,9 @@ class GsmParserView:
                     page_ctrl.run_task(_fetch_photos)
 
         # Spec row builder
+        _srow_label_w = 74
+        _srow_value_w = max(60, width - _srow_label_w - 4 - 16)
+
         def _srow(label: str, value) -> ft.Control | None:
             v = str(value or "").strip()
             if not v:
@@ -6354,19 +7689,20 @@ class GsmParserView:
                 padding=ft.padding.symmetric(horizontal=8, vertical=4),
                 content=ft.Row(
                     [
-                        ft.Text(label, size=9, color=_MUTED, width=74),
+                        ft.Text(label, size=9, color=_MUTED, width=_srow_label_w),
                         ft.Text(
                             v, size=9, weight=ft.FontWeight.W_600,
-                            expand=True, no_wrap=False, max_lines=3,
+                            width=_srow_value_w, no_wrap=False,
                         ),
                     ],
                     spacing=4,
                     # Row sits inside a vertically-scrolling Column nested in a
                     # horizontally-scrolling outer Row (the device columns) —
-                    # without an explicit width on this Container, that nested
-                    # scroll chain lets the value Text size to its natural
-                    # (unwrapped) content width instead of wrapping, which
-                    # shows up as a horizontal scrollbar on the whole dialog.
+                    # relying on expand=True alone here left the value Text
+                    # sized to its natural (unwrapped) content width instead
+                    # of actually wrapping, showing up as a horizontal
+                    # scrollbar on the whole dialog. A hard pixel width forces
+                    # the wrap.
                 ),
             )
 
@@ -7013,8 +8349,15 @@ class GsmParserView:
                 ),
             )
 
-        gsm_size = _fmt_dims(gs)
-        gsm_diag = str(gs.get("display_size") or "").strip()
+        # A manually-entered region size always outranks GSM Arena's/
+        # E-Katalog's own scraped figures in the table too — see
+        # _get_effective_xiaomi_size's docstring.
+        _eff_size = self._get_effective_xiaomi_size(device_id, merged)
+        _eff_size_str = (
+            str(_eff_size.get("size_str") or "").replace(" мм", "") if _eff_size else ""
+        )
+        gsm_size = _eff_size_str or _fmt_dims(gs)
+        gsm_diag = (_eff_size["diagonal"] if _eff_size else "") or str(gs.get("display_size") or "").strip()
         release = _release_label(gs)
 
         _brand_val = str(merged.get("brand") or "")
@@ -7091,8 +8434,8 @@ class GsmParserView:
         )
 
         # ---- EK section ----
-        ek_size = _fmt_dims(es)
-        ek_diag = str(es.get("display") or "").strip()
+        ek_size = _eff_size_str or _fmt_dims(es)
+        ek_diag = (_eff_size["diagonal"] if _eff_size else "") or str(es.get("display") or "").strip()
         # Full raw text (e.g. "12 листопада 2021" or "Травень 2025") — not
         # ISO, so it can't be safely truncated to a fixed char count without
         # losing the year; the cell below wraps it onto 2 lines instead.
@@ -7215,7 +8558,9 @@ class GsmParserView:
                 page_ctrl.pop_dialog()
 
                 async def _do():
-                    ok = await asyncio.to_thread(self.db.delete_gsm_device, device_id)
+                    ok = await asyncio.to_thread(
+                        self.db.delete_gsm_device, device_id, self.manager_id or ""
+                    )
                     if ok:
                         global _DEVICE_CACHE
                         with _CACHE_LOCK:
@@ -7251,7 +8596,9 @@ class GsmParserView:
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
                 content=ft.Text(
-                    f"«{name}» буде видалено з БД разом з усією історією цін та змін. Цю дію не можна скасувати.",
+                    f"«{name}» буде видалено з БД разом з усією історією цін та змін."
+                    " Автоматично на наступних парсингах не підтягнеться —"
+                    " повернути можна тільки вручну, через посилання.",
                     size=13,
                     color=ft.Colors.BLUE_GREY_700,
                     no_wrap=False,
@@ -7273,12 +8620,12 @@ class GsmParserView:
             page_ctrl.show_dialog(dlg_del)
 
         delete_btn = ft.Container(
-            visible=self.is_superadmin,
+            visible=self.can_manage_devices,
             content=ft.IconButton(
                 icon=ft.Icons.DELETE_OUTLINE,
                 icon_color=ft.Colors.RED_300,
                 icon_size=16,
-                tooltip=self.t("gsm.delete_device_sa", "Видалити пристрій (SA)"),
+                tooltip=self.t("gsm.delete_device_sa", "Видалити пристрій"),
                 on_click=_confirm_delete,
                 style=ft.ButtonStyle(padding=ft.padding.all(4)),
             ),
@@ -7607,6 +8954,7 @@ class GsmParserView:
 
                 await self._preload_charts_for_current_page()
                 await self._warm_photo_cache_from_db()
+                await self._warm_gallery_photo_cache_from_db()
             finally:
                 self._hide_loading_overlay()
 
@@ -7726,7 +9074,9 @@ class GsmParserView:
                 async def _do():
                     ok_count = 0
                     for did in ids:
-                        if await asyncio.to_thread(self.db.delete_gsm_device, did):
+                        if await asyncio.to_thread(
+                            self.db.delete_gsm_device, did, self.manager_id or ""
+                        ):
                             ok_count += 1
                     global _DEVICE_CACHE
                     deleted_ids = set(ids)
@@ -7791,7 +9141,7 @@ class GsmParserView:
         bulk_delete_btn = ft.FilledButton(
             f"Видалити ({_bulk_del_n_init})" if _bulk_del_n_init else "Видалити вибрані",
             icon=ft.Icons.DELETE_OUTLINE,
-            visible=self.is_superadmin and _bulk_del_n_init >= 1,
+            visible=self.can_manage_devices and _bulk_del_n_init >= 1,
             on_click=_confirm_bulk_delete,
             style=ft.ButtonStyle(
                 bgcolor=ft.Colors.RED_600,
@@ -7808,7 +9158,7 @@ class GsmParserView:
             compare_btn.text = self.t("gsm.compare_n", "Порівняти ({n})").format(n=n)
             with contextlib.suppress(Exception):
                 compare_btn.update()
-            if self.is_superadmin:
+            if self.can_manage_devices:
                 bulk_delete_btn.visible = n >= 1
                 bulk_delete_btn.text = f"Видалити ({n})" if n else "Видалити вибрані"
                 with contextlib.suppress(Exception):
@@ -7867,12 +9217,9 @@ class GsmParserView:
         if self.is_superadmin or self.can_run_parser:
             global _PARSER_STATUS_CB, _PARSER_BUTTONS_CB
 
-            global _PARSER_SCHEDULE_STATUS_CB, _PARSER_SCHEDULE_LAUNCH_CB
-
             _running_now = _parser_is_running()
             _paused_now = _parser_is_paused()
             _status_now = _parser_get_status()
-            _schedule_target_now = _parser_schedule_target()
 
             parser_status_text = ft.Text(
                 _status_now,
@@ -7882,14 +9229,6 @@ class GsmParserView:
                 visible=bool(_status_now),
             )
             self._parser_status_ref = parser_status_text
-
-            schedule_status_text = ft.Text(
-                _format_schedule_countdown(_schedule_target_now) if _schedule_target_now else "",
-                size=11,
-                color=ft.Colors.BLUE_700,
-                italic=True,
-                visible=bool(_schedule_target_now),
-            )
 
             _launch_menu_label_ref = ft.Ref[ft.Text]()
 
@@ -7949,11 +9288,6 @@ class GsmParserView:
                         ft.Icons.SYNC, ft.Colors.PURPLE_700,
                         self.t("gsm.menu.xiaomi_regions", "Регіони Xiaomi"),
                         lambda e: page_ctrl and page_ctrl.run_task(_run_xiaomi_sync, e),
-                    ),
-                    _menu_item(
-                        ft.Icons.SCHEDULE, ft.Colors.BLUE_700,
-                        self.t("gsm.schedule.menu_item", "Запланувати запуск…"),
-                        lambda e: _open_schedule_dialog(e),
                     ),
                 ],
             )
@@ -8017,17 +9351,10 @@ class GsmParserView:
                         if _panel is not None and _panel.visible:
                             _reveal_click(None)
 
-            def _ui_schedule_status_cb(msg: str) -> None:
-                schedule_status_text.value = msg
-                schedule_status_text.visible = bool(msg)
-                with contextlib.suppress(Exception):
-                    parser_status_row.update()
-
             _PARSER_STATUS_CB = _ui_status_cb
             _PARSER_BUTTONS_CB = _ui_buttons_cb
-            _PARSER_SCHEDULE_STATUS_CB = _ui_schedule_status_cb
 
-            parser_status_row = ft.Row([parser_status_text, schedule_status_text])
+            parser_status_row = ft.Row([parser_status_text])
 
             # If parser was already running when this view was built (e.g. after
             # account switch or tab navigation), re-attach the floating badge.
@@ -8079,28 +9406,22 @@ class GsmParserView:
                         pass
 
             async def _live_table_refresh():
+                # Deliberately does nothing anymore. This used to diff-sync
+                # + patch changed rows into the visible table every ~10s
+                # for as long as a parse was running (local click OR the
+                # daily schedule auto-firing while the app happened to be
+                # open) — real DB work + Flet row rebuilds competing with
+                # whatever the user was doing (selecting devices, opening
+                # cards, sorting), every 10 seconds, for the parse run's
+                # entire duration (can run well past an hour for the full
+                # catalog). Explicit product requirement: NOTHING loads
+                # once the table is drawn, full stop — a legitimately
+                # running background parse is not an exception. The table
+                # simply stays as it was revealed; picking up the parser's
+                # changes now requires an explicit re-reveal or manual
+                # "Синхронізація", same as any other data change.
                 while not _PARSER_DONE_FLAG["done"]:
                     await asyncio.sleep(10)
-                    if _PARSER_DONE_FLAG["done"]:
-                        break
-                    try:
-                        # Diff sync only — pulls what the running parser just
-                        # wrote, not the full 50k-row table every 10s.
-                        changed_rows = await asyncio.to_thread(
-                            self._sync_cache_from_db, False
-                        )
-                        # Only patch rows when this view is visible — refreshing
-                        # detached controls corrupts the active page's scroll
-                        # state in Flutter. Patches just the changed rows in
-                        # place (never a full _refresh_table()) so this doesn't
-                        # reset scroll position or collapse the user's currently
-                        # expanded brand groups every ~10s during a parse run.
-                        if _gsm_is_active_view():
-                            cb = _PARSER_REFRESH_TABLE_CB
-                            if cb:
-                                cb(changed_rows)
-                    except Exception:
-                        pass
 
             # Re-attach monitor tasks when entering Results tab with parser already running.
             # Guard _MONITOR_TASKS_ACTIVE to prevent duplicate task spawns.
@@ -8132,77 +9453,51 @@ class GsmParserView:
                     page_ctrl.run_task(_progress_monitor)
                     page_ctrl.run_task(_live_table_refresh)
                 try:
-                    _infra = {}
                     _svc = {}
                     with contextlib.suppress(Exception):
-                        _infra = self.db.get_infrastructure_settings()
-                    with contextlib.suppress(Exception):
                         _svc = self.db.get_parser_service_config()
-                    _vps_mode = str(_infra.get("mode") or "local") == "vps"
                     _vps_url = (
                         str(_svc.get("vps_service_url") or "").strip().rstrip("/")
                     )
                     _vps_key = str(_svc.get("vps_api_key") or "").strip()
 
-                    if _vps_mode and _vps_url:
-                        import httpx
-
-                        _parser_set_status("Надсилаємо запит на VPS…")
-                        headers = {"x-api-key": _vps_key} if _vps_key else {}
-                        async with httpx.AsyncClient() as _hc:
-                            _r = await _hc.post(
-                                f"{_vps_url}/trigger",
-                                json={"mode": mode},
-                                headers=headers,
-                                timeout=20,
-                            )
-                        _rj = _r.json() if _r.status_code == 200 else {}
-                        ok = _r.status_code == 200 and bool(_rj.get("ok"))
-                        result_msg = _rj.get("message", "") or f"HTTP {_r.status_code}"
-                        self._show_snack(
-                            (
-                                f"VPS: {result_msg}"
-                                if ok
-                                else f"VPS помилка: {result_msg}"
-                            ),
-                            ft.Colors.GREEN if ok else ft.Colors.RED,
+                    # Parsing runs EXCLUSIVELY on the VPS — never locally. The
+                    # desktop app is only ever the trigger source now; no
+                    # local fallback (a laptop-run multi-hour scrape defeats
+                    # the whole point of hosting the parser on a VPS, ties up
+                    # whoever clicked the button, and — before this fix — hit
+                    # a hard crash anyway since GSM_Parser/ was never bundled
+                    # into the installed build). If the VPS trigger service
+                    # isn't reachable, fail loudly instead of silently
+                    # running on whatever machine has the app open.
+                    if not _vps_url:
+                        raise RuntimeError(
+                            "VPS-сервіс парсера не налаштований (адреса сервісу "
+                            "порожня) — запуск можливий лише на віддаленому сервері."
                         )
-                    else:
-                        from gsm_parser_runner import run_gsm_parser
 
-                        _stop_ev = _PARSER_STOP_EVENT
-                        _pause_ev = _PARSER_PAUSE_EVENT
+                    import httpx
 
-                        def _cb(msg: str):
-                            _PARSER_PROGRESS_Q.put(msg)
-
-                        ok, result_msg = await asyncio.to_thread(
-                            run_gsm_parser,
-                            "__global__",
-                            "",
-                            "",
-                            mode,
-                            True,
-                            _cb,
-                            _stop_ev,
-                            _pause_ev,
+                    _parser_set_status("Надсилаємо запит на VPS…")
+                    headers = {"x-api-key": _vps_key} if _vps_key else {}
+                    async with httpx.AsyncClient() as _hc:
+                        _r = await _hc.post(
+                            f"{_vps_url}/trigger",
+                            json={"mode": mode},
+                            headers=headers,
+                            timeout=20,
                         )
-                        if ok:
-                            _snack_msg, _snack_color = (
-                                "Парсинг завершено ✓",
-                                ft.Colors.GREEN,
-                            )
-                        elif result_msg == "Зупинено":
-                            _snack_msg, _snack_color = (
-                                "Парсинг зупинено",
-                                ft.Colors.ORANGE_700,
-                            )
-                        else:
-                            _snack_msg, _snack_color = (
-                                f"Помилка: {result_msg}",
-                                ft.Colors.RED,
-                            )
-                        self._show_snack(_snack_msg, _snack_color)
+                    _rj = _r.json() if _r.status_code == 200 else {}
+                    ok = _r.status_code == 200 and bool(_rj.get("ok"))
+                    result_msg = _rj.get("message", "") or f"HTTP {_r.status_code}"
+                    self._show_snack(
+                        (
+                            f"Запущено на сервері: {result_msg}. Стежте за прогресом у вкладці «Лог»."
+                            if ok
+                            else f"VPS помилка: {result_msg}"
+                        ),
+                        ft.Colors.GREEN if ok else ft.Colors.RED,
+                    )
                 except Exception as exc:
                     self._show_snack(f"Помилка запуску: {exc}", ft.Colors.RED)
                 finally:
@@ -8228,9 +9523,6 @@ class GsmParserView:
                     if page_ctrl:
                         page_ctrl.run_task(self._background_load, page_ctrl)
 
-            global _PARSER_SCHEDULE_LAUNCH_CB
-            _PARSER_SCHEDULE_LAUNCH_CB = _launch_async
-
             def _pause_click(_):
                 global _PARSER_PAUSED
                 with _PARSER_LOCK:
@@ -8249,160 +9541,6 @@ class GsmParserView:
                 if _PARSER_PAUSE_EVENT:
                     _PARSER_PAUSE_EVENT.set()  # unblock pause so thread can exit
                 _parser_set_status("Зупинка…")
-
-            def _open_schedule_dialog(_e=None):
-                page = self._get_page_safe()
-                if not page:
-                    return
-
-                _mode_state = {"value": _PARSER_SCHEDULE_MODE or "full"}
-
-                def _schedule_help(_=None):
-                    from views.help_utils import show_modal_help
-                    show_modal_help(page, self.t("gsm.schedule.help_title", "Довідка — Запланований запуск"), [
-                        self.t("gsm.schedule.help.desc", "Дозволяє запустити парсер не одразу, а через заданий час — зручно, якщо ви запускаєте парсинг вручну вночі і хочете, щоб зміни зафіксувались уже завтрашнім днем."),
-                        (self.t("gsm.schedule.help.steps_title", "Як користуватись"), None),
-                        self.t("gsm.schedule.help.step1", "1. Оберіть режим запуску (повний / лише GSM / лише E-Katalog)."),
-                        self.t("gsm.schedule.help.step2", "2. Натисніть одну з кнопок швидкого вибору або вкажіть затримку від зараз у полях «Години» / «Хвилини» (наприклад, 1 год 30 хв — запуск через півтори години, а не о 1:30)."),
-                        self.t("gsm.schedule.help.step3", "3. Натисніть «Запланувати» — відлік з'явиться біля кнопки «Запустити»."),
-                        self.t("gsm.schedule.help.step4", "4. Застосунок має лишатись відкритим — запуск станеться автоматично, коли настане заданий час."),
-                        self.t("gsm.schedule.help.step5", "5. «Скасувати заплановий запуск» прибирає таймер без запуску парсера."),
-                    ])
-
-                def _on_mode_change(e):
-                    _mode_state["value"] = e.control.value
-
-                mode_dd = ft.Dropdown(
-                    label=self.t("gsm.schedule.mode_label", "Режим запуску"),
-                    value=_mode_state["value"],
-                    width=280,
-                    options=[
-                        ft.dropdown.Option("full", self.t("gsm.menu.full_parse", "Повний парсинг (ГСМ + ЄК)")),
-                        ft.dropdown.Option("gsm", self.t("gsm.menu.gsm_only", "Тільки GSM Arena")),
-                        ft.dropdown.Option("ekatalog", self.t("gsm.menu.ek_only", "Тільки E-Katalog")),
-                    ],
-                )
-                mode_dd.on_select = _on_mode_change
-                mode_dd.on_change = _on_mode_change
-
-                hours_tf = ft.TextField(
-                    label=self.t("gsm.schedule.hours_label", "Години"),
-                    value="0", width=90, dense=True,
-                    keyboard_type=ft.KeyboardType.NUMBER,
-                )
-                minutes_tf = ft.TextField(
-                    label=self.t("gsm.schedule.minutes_label", "Хвилини"),
-                    value="0", width=90, dense=True,
-                    keyboard_type=ft.KeyboardType.NUMBER,
-                )
-
-                _active_ts = _parser_schedule_target()
-                active_status_text = ft.Text(
-                    _format_schedule_countdown(_active_ts)
-                    if _active_ts
-                    else self.t("gsm.schedule.none_active", "Запуск не заплановано"),
-                    size=12,
-                    color=ft.Colors.BLUE_700 if _active_ts else ft.Colors.GREY_600,
-                    italic=True,
-                )
-
-                def _close_dlg(_=None):
-                    with contextlib.suppress(Exception):
-                        page.pop_dialog()
-
-                def _do_schedule(delay_seconds: float):
-                    ok = _parser_start_schedule(page_ctrl, delay_seconds, _mode_state["value"])
-                    _close_dlg()
-                    if ok:
-                        _target = _parser_schedule_target() or (time.time() + delay_seconds)
-                        _, _left = _schedule_countdown_parts(_target)
-                        self._show_snack(
-                            self.t("gsm.schedule.scheduled_snack", "Заплановано запуск через {left}").format(
-                                left=_left
-                            ),
-                            ft.Colors.BLUE_700,
-                        )
-
-                def _cancel_schedule_click(_=None):
-                    _parser_cancel_schedule()
-                    _close_dlg()
-                    self._show_snack(
-                        self.t("gsm.schedule.cancelled_snack", "Запланований запуск скасовано"),
-                        ft.Colors.GREY_700,
-                    )
-
-                def _quick_btn(label: str, seconds: int):
-                    return ft.OutlinedButton(
-                        label, on_click=lambda e, s=seconds: _do_schedule(s),
-                    )
-
-                def _confirm_custom(_=None):
-                    try:
-                        h = int(float(hours_tf.value or 0))
-                        m = int(float(minutes_tf.value or 0))
-                    except Exception:
-                        h, m = 0, 0
-                    total = h * 3600 + m * 60
-                    if total <= 0:
-                        self._show_snack(
-                            self.t("gsm.schedule.invalid_delay", "Вкажіть час більше нуля"),
-                            ft.Colors.RED,
-                        )
-                        return
-                    _do_schedule(total)
-
-                dlg = ft.AlertDialog(
-                    modal=True,
-                    title=ft.Row(
-                        [
-                            ft.Text(self.t("gsm.schedule.dialog_title", "Запланувати запуск парсера"), weight="bold", expand=True),
-                            ft.IconButton(ft.Icons.HELP_OUTLINE, icon_size=18, tooltip=self.t("common.help.tooltip", "Довідка"), on_click=_schedule_help),
-                        ],
-                    ),
-                    content=ft.Container(
-                        width=380,
-                        content=ft.Column(
-                            [
-                                active_status_text,
-                                ft.Divider(height=10),
-                                mode_dd,
-                                ft.Container(height=6),
-                                ft.Text(self.t("gsm.schedule.quick_label", "Швидкий вибір:"), size=12),
-                                ft.Row(
-                                    [
-                                        _quick_btn(self.t("gsm.schedule.quick_15m", "+15 хв"), 15 * 60),
-                                        _quick_btn(self.t("gsm.schedule.quick_30m", "+30 хв"), 30 * 60),
-                                        _quick_btn(self.t("gsm.schedule.quick_1h", "+1 год"), 60 * 60),
-                                        _quick_btn(self.t("gsm.schedule.quick_2h", "+2 год"), 2 * 60 * 60),
-                                        _quick_btn(self.t("gsm.schedule.quick_4h", "+4 год"), 4 * 60 * 60),
-                                    ],
-                                    wrap=True, spacing=6,
-                                ),
-                                ft.Container(height=6),
-                                ft.Text(self.t("gsm.schedule.custom_label", "Або вкажіть затримку від зараз:"), size=12),
-                                ft.Row([hours_tf, minutes_tf, ft.FilledButton(
-                                    self.t("gsm.schedule.confirm_btn", "Запланувати"),
-                                    on_click=_confirm_custom,
-                                )], spacing=8),
-                            ],
-                            spacing=8, tight=True,
-                        ),
-                    ),
-                    actions=[
-                        *(
-                            [ft.TextButton(
-                                self.t("gsm.schedule.cancel_active_btn", "Скасувати запланований запуск"),
-                                on_click=_cancel_schedule_click,
-                                style=ft.ButtonStyle(color=ft.Colors.RED_700),
-                            )]
-                            if _active_ts
-                            else []
-                        ),
-                        ft.TextButton(self.t("common.close", "Закрити"), on_click=_close_dlg),
-                    ],
-                )
-                with contextlib.suppress(Exception):
-                    page.open(dlg)
 
             right_toolbar_controls.append(launch_btn)
             right_toolbar_controls.append(pause_btn)
@@ -8447,6 +9585,7 @@ class GsmParserView:
                     result_line = (
                         f"Регіони Xiaomi: збіглось {stats['matched']}, "
                         f"оновлено {stats['updated']}, "
+                        f"ринки-плашки {stats.get('other_markets_updated', 0)}, "
                         f"не знайдено {stats['not_found']}"
                     )
                     _sync_status_text.value = result_line
@@ -8457,6 +9596,18 @@ class GsmParserView:
                                 encoding="utf-8"
                             )
                             self._log_text_ref.update()
+
+                    # sync_xiaomi_regions only writes to the DB — without
+                    # this, the running app's own in-memory device list
+                    # cache keeps showing whatever it had before the sync
+                    # ran, giving the false impression that nothing changed
+                    # until a full app restart. Same "update immediately,
+                    # no restart needed" contract as every other in-app
+                    # edit (manual GSM/EK link, split/merge, etc.).
+                    if stats.get("updated") or stats.get("other_markets_updated"):
+                        with contextlib.suppress(Exception):
+                            await asyncio.to_thread(self._sync_cache_from_db, True)
+                            self._refresh_table(rebuild_filters=True)
                 except Exception as exc:
                     _sync_status_text.value = f"Помилка синхронізації: {exc}"
                     self._show_snack(f"Помилка: {exc}", ft.Colors.RED)
@@ -8894,25 +10045,22 @@ class GsmParserView:
             # Arena" path) so they get parsed with the normal anti-bot
             # pacing instead of an immediate on-demand fetch from the UI. ----
             def _open_manual_ek_dialog(_):
-                ek_only_brands = sorted(
+                all_brands = sorted(
                     {
                         str(b.get("brand") or "").strip()
                         for b in (self.db.get_gsm_parser_brands() or [])
                         if str(b.get("brand") or "").strip()
-                        and not str(b.get("gsm_url") or "").strip()
                     }
                 )
-                if not ek_only_brands:
-                    self._show_snack(
-                        "Немає брендів, які парсяться лише через ЄК", ft.Colors.ORANGE
-                    )
+                if not all_brands:
+                    self._show_snack("Немає налаштованих брендів", ft.Colors.ORANGE)
                     return
 
                 brand_dd = ft.Dropdown(
                     label="Бренд",
-                    value=ek_only_brands[0],
+                    value=all_brands[0],
                     dense=True,
-                    options=[ft.DropdownOption(key=b, text=b) for b in ek_only_brands],
+                    options=[ft.DropdownOption(key=b, text=b) for b in all_brands],
                     width=200,
                 )
                 type_dd = ft.Dropdown(
@@ -8986,29 +10134,85 @@ class GsmParserView:
                 brand_dd.on_change = _refresh_links
                 brand_dd.on_select = _refresh_links
 
-                def _add_link(_):
+                async def _add_link_async(_):
                     url = (url_field.value or "").strip()
                     if not url.startswith("http"):
                         self._show_snack(
                             "Вкажіть коректне посилання (http/https)", ft.Colors.RED
                         )
                         return
-                    ok = self.db.add_gsm_manual_ek_link(
-                        brand_dd.value, type_dd.value, url, self.manager_id or ""
+                    ok = await asyncio.to_thread(
+                        self.db.add_gsm_manual_ek_link,
+                        brand_dd.value, type_dd.value, url, self.manager_id or "",
                     )
-                    if ok:
-                        url_field.value = ""
-                        with contextlib.suppress(Exception):
-                            url_field.update()
-                        _refresh_links()
-                        self._show_snack(
-                            "Додано. З'явиться після наступного парсингу цього бренду.",
-                            ft.Colors.GREEN,
-                        )
-                    else:
+                    if not ok:
                         self._show_snack(
                             "Помилка додавання (можливо, вже додано)", ft.Colors.RED
                         )
+                        return
+                    url_field.value = ""
+                    with contextlib.suppress(Exception):
+                        url_field.update()
+                    _refresh_links()
+
+                    # Fetch it immediately via the VPS instead of waiting for
+                    # the next scheduled/triggered full parse — parsing runs
+                    # exclusively on the VPS (see parser_service.py's
+                    # /fetch-manual-link), never locally.
+                    svc = await asyncio.to_thread(self.db.get_parser_service_config)
+                    vps_url = str((svc or {}).get("vps_service_url") or "").strip().rstrip("/")
+                    vps_key = str((svc or {}).get("vps_api_key") or "").strip()
+                    if not vps_url:
+                        self._show_snack(
+                            "Посилання збережено, але VPS-сервіс не налаштований —"
+                            " з'явиться після наступного запуску парсера.",
+                            ft.Colors.ORANGE,
+                        )
+                        return
+                    self._show_snack("Завантажуємо з сайту…", ft.Colors.BLUE)
+                    try:
+                        import httpx
+
+                        headers = {"x-api-key": vps_key} if vps_key else {}
+                        async with httpx.AsyncClient(timeout=40.0) as client:
+                            resp = await client.post(
+                                f"{vps_url}/fetch-manual-link",
+                                json={
+                                    "brand": brand_dd.value,
+                                    "device_type": type_dd.value,
+                                    "url": url,
+                                },
+                                headers=headers,
+                            )
+                            resp.raise_for_status()
+                            data = resp.json()
+                        if data.get("ok"):
+                            self._show_snack(
+                                f"Додано: {data.get('message')}", ft.Colors.GREEN
+                            )
+                            # _background_load only reloads from the on-disk
+                            # cache (stale — this device isn't in it yet) and
+                            # only pulls fresh from the DB past the daily
+                            # sync boundary. A forced sync (same call the
+                            # "Синхронізація" button makes) is what actually
+                            # pulls this newly-added device from the DB and
+                            # updates the module-level cache the table reads
+                            # from — confirmed live: without this, the device
+                            # landed in the DB correctly but the table never
+                            # showed it until a manual full sync.
+                            await asyncio.to_thread(self._sync_cache_from_db, True)
+                            self._refresh_table(rebuild_filters=True)
+                        else:
+                            self._show_snack(
+                                f"Не вдалося завантажити: {data.get('message')}",
+                                ft.Colors.RED,
+                            )
+                    except Exception as exc:
+                        self._show_snack(f"Помилка запиту до VPS: {exc}", ft.Colors.RED)
+
+                def _add_link(e):
+                    if page_ctrl:
+                        page_ctrl.run_task(_add_link_async, e)
 
                 _refresh_links()
 
@@ -9028,9 +10232,12 @@ class GsmParserView:
                         content=ft.Column(
                             [
                                 ft.Text(
-                                    "Тільки для брендів, які парсяться лише через "
-                                    "E-Katalog (без GSM Arena) — додайте товар, "
-                                    "якого немає в автоматичному списку.",
+                                    "Додайте товар з E-Katalog, якого ще немає на "
+                                    "GSM Arena (для будь-якого бренду) — він "
+                                    "з'явиться окремою карткою без даних GSM Arena, "
+                                    "а коли GSM Arena додасть цей пристрій, дані "
+                                    "об'єднаються в одну картку без втрати історії "
+                                    "цін і магазинів.",
                                     size=11,
                                     color=_MUTED,
                                 ),
@@ -9067,6 +10274,238 @@ class GsmParserView:
                     style=ft.ButtonStyle(
                         color=ft.Colors.TEAL_700,
                         side=ft.BorderSide(1, ft.Colors.TEAL_300),
+                        padding=ft.padding.symmetric(horizontal=10, vertical=5),
+                        text_style=ft.TextStyle(size=11),
+                    ),
+                )
+            )
+
+            # ---- Manual GSM Arena device entry (SA only) — mirror of the
+            # "Посилання ЄК" button above, for the opposite case: a device
+            # that's missing from GSM Arena entirely, with no card to attach
+            # it to (unlike gsm_manual_btn in the product card, which
+            # attaches to an EXISTING standalone E-Katalog device). Stored
+            # as its own standalone GSM Arena row; the normal auto-match
+            # picks it up once E-Katalog gets the same device. ----
+            def _open_manual_gsm_dialog(_):
+                all_brands = sorted(
+                    {
+                        str(b.get("brand") or "").strip()
+                        for b in (self.db.get_gsm_parser_brands() or [])
+                        if str(b.get("brand") or "").strip()
+                    }
+                )
+                if not all_brands:
+                    self._show_snack("Немає налаштованих брендів", ft.Colors.ORANGE)
+                    return
+
+                brand_dd = ft.Dropdown(
+                    label="Бренд",
+                    value=all_brands[0],
+                    dense=True,
+                    options=[ft.DropdownOption(key=b, text=b) for b in all_brands],
+                    width=200,
+                )
+                type_dd = ft.Dropdown(
+                    label="Тип",
+                    value="Smartphone",
+                    dense=True,
+                    options=[
+                        ft.DropdownOption(key="Smartphone", text="Смартфон"),
+                        ft.DropdownOption(key="Tablet", text="Планшет"),
+                        ft.DropdownOption(key="Watch", text="Годинник"),
+                    ],
+                    width=140,
+                )
+                url_field = ft.TextField(
+                    label="Посилання на пристрій (GSM Arena)",
+                    hint_text="https://www.gsmarena.com/...php",
+                    dense=True,
+                    expand=True,
+                )
+                links_col = ft.Column(
+                    spacing=4, tight=True, scroll=ft.ScrollMode.AUTO, height=180
+                )
+
+                def _refresh_links(_=None):
+                    links_col.controls.clear()
+                    rows = self.db.get_gsm_manual_gsm_links(brand_dd.value) or []
+                    if not rows:
+                        links_col.controls.append(
+                            ft.Text(
+                                "Немає доданих посилань для цього бренду",
+                                size=11,
+                                color=_MUTED,
+                            )
+                        )
+                    for r in rows:
+                        rid = str(r.get("id") or "")
+                        links_col.controls.append(
+                            ft.Row(
+                                [
+                                    ft.Text(
+                                        str(r.get("device_type") or ""),
+                                        size=10,
+                                        color=_MUTED,
+                                        width=70,
+                                    ),
+                                    ft.Text(
+                                        str(r.get("url") or ""),
+                                        size=11,
+                                        expand=True,
+                                        selectable=True,
+                                        max_lines=1,
+                                    ),
+                                    ft.IconButton(
+                                        ft.Icons.DELETE_OUTLINE,
+                                        icon_size=16,
+                                        icon_color=ft.Colors.RED_400,
+                                        tooltip="Видалити",
+                                        on_click=lambda e, _id=rid: _delete_link(_id),
+                                    ),
+                                ],
+                                spacing=6,
+                            )
+                        )
+                    with contextlib.suppress(Exception):
+                        links_col.update()
+
+                def _delete_link(link_id):
+                    self.db.delete_gsm_manual_gsm_link(link_id)
+                    _refresh_links()
+
+                brand_dd.on_change = _refresh_links
+                brand_dd.on_select = _refresh_links
+
+                async def _add_link_async(_):
+                    url = (url_field.value or "").strip()
+                    if not url.startswith("http"):
+                        self._show_snack(
+                            "Вкажіть коректне посилання (http/https)", ft.Colors.RED
+                        )
+                        return
+                    ok = await asyncio.to_thread(
+                        self.db.add_gsm_manual_gsm_link,
+                        brand_dd.value, type_dd.value, url, self.manager_id or "",
+                    )
+                    if not ok:
+                        self._show_snack(
+                            "Помилка додавання (можливо, вже додано)", ft.Colors.RED
+                        )
+                        return
+                    url_field.value = ""
+                    with contextlib.suppress(Exception):
+                        url_field.update()
+                    _refresh_links()
+
+                    # Fetch it immediately via the VPS instead of waiting for
+                    # the next scheduled/triggered full parse — parsing runs
+                    # exclusively on the VPS (see parser_service.py's
+                    # /fetch-manual-gsm-device), never locally.
+                    svc = await asyncio.to_thread(self.db.get_parser_service_config)
+                    vps_url = str((svc or {}).get("vps_service_url") or "").strip().rstrip("/")
+                    vps_key = str((svc or {}).get("vps_api_key") or "").strip()
+                    if not vps_url:
+                        self._show_snack(
+                            "Посилання збережено, але VPS-сервіс не налаштований —"
+                            " з'явиться після наступного запуску парсера.",
+                            ft.Colors.ORANGE,
+                        )
+                        return
+                    self._show_snack("Завантажуємо з GSM Arena… (до хвилини)", ft.Colors.BLUE)
+                    try:
+                        import httpx
+
+                        headers = {"x-api-key": vps_key} if vps_key else {}
+                        async with httpx.AsyncClient(timeout=90.0) as client:
+                            resp = await client.post(
+                                f"{vps_url}/fetch-manual-gsm-device",
+                                json={
+                                    "brand": brand_dd.value,
+                                    "device_type": type_dd.value,
+                                    "url": url,
+                                },
+                                headers=headers,
+                            )
+                            resp.raise_for_status()
+                            data = resp.json()
+                        if data.get("ok"):
+                            self._show_snack(
+                                f"Додано: {data.get('message')}", ft.Colors.GREEN
+                            )
+                            await asyncio.to_thread(self._sync_cache_from_db, True)
+                            self._refresh_table(rebuild_filters=True)
+                        else:
+                            self._show_snack(
+                                f"Не вдалося завантажити: {data.get('message')}",
+                                ft.Colors.RED,
+                            )
+                    except Exception as exc:
+                        self._show_snack(f"Помилка запиту до VPS: {exc}", ft.Colors.RED)
+
+                def _add_link(e):
+                    if page_ctrl:
+                        page_ctrl.run_task(_add_link_async, e)
+
+                _refresh_links()
+
+                dlg = ft.AlertDialog(
+                    modal=True,
+                    title=ft.Row(
+                        [
+                            ft.Icon(ft.Icons.ADD_LINK, color=ft.Colors.INDIGO_700, size=22),
+                            ft.Text(
+                                "Ручні посилання GSM Arena", size=15, weight=ft.FontWeight.W_700
+                            ),
+                        ],
+                        spacing=8,
+                    ),
+                    content=ft.Container(
+                        width=520,
+                        content=ft.Column(
+                            [
+                                ft.Text(
+                                    "Додайте пристрій з GSM Arena, якого ще немає на "
+                                    "E-Katalog (для будь-якого бренду) — він з'явиться "
+                                    "окремою карткою без даних E-Katalog, а коли "
+                                    "E-Katalog додасть цей товар, дані об'єднаються в "
+                                    "одну картку без втрати історії цін і магазинів.",
+                                    size=11,
+                                    color=_MUTED,
+                                ),
+                                ft.Row([brand_dd, type_dd], spacing=8),
+                                ft.Row([url_field], spacing=8),
+                                ft.FilledButton(
+                                    "Додати", icon=ft.Icons.ADD, on_click=_add_link
+                                ),
+                                ft.Divider(height=1),
+                                ft.Text(
+                                    "Додані посилання:", size=11, weight=ft.FontWeight.W_600
+                                ),
+                                links_col,
+                            ],
+                            spacing=8,
+                            tight=True,
+                        ),
+                    ),
+                    actions=[
+                        ft.TextButton(
+                            "Закрити", on_click=lambda _: page_ctrl.pop_dialog()
+                        ),
+                    ],
+                    actions_alignment=ft.MainAxisAlignment.END,
+                )
+                if page_ctrl:
+                    page_ctrl.show_dialog(dlg)
+
+            right_toolbar_controls.append(
+                ft.OutlinedButton(
+                    "Посилання GSM Arena",
+                    icon=ft.Icons.ADD_LINK,
+                    on_click=_open_manual_gsm_dialog,
+                    style=ft.ButtonStyle(
+                        color=ft.Colors.INDIGO_700,
+                        side=ft.BorderSide(1, ft.Colors.INDIGO_300),
                         padding=ft.padding.symmetric(horizontal=10, vertical=5),
                         text_style=ft.TextStyle(size=11),
                     ),
@@ -9630,9 +11069,15 @@ class GsmParserView:
                         ft.Divider(height=1, color=ft.Colors.BLUE_GREY_200),
                         ft.Column(
                             [table_body],
+                            ref=self._table_v_scroll_ref,
+                            on_scroll=self._on_table_v_scroll,
                             spacing=0,
                             tight=True,
-                            scroll=ft.ScrollMode.HIDDEN,
+                            # ALWAYS (not HIDDEN) — a visible, draggable
+                            # scrollbar thumb so long device lists don't
+                            # require many mouse-wheel motions to move
+                            # around.
+                            scroll=ft.ScrollMode.ALWAYS,
                             expand=True,
                         ),
                     ],
@@ -9712,7 +11157,57 @@ class GsmParserView:
             # Xiaomi sync status shown below toolbar (separate from log row)
             _col_controls.append(ft.Row([_sync_status_text]))
         _col_controls.extend([filter_panel, reveal_panel, table_container, pager_row])
+
+        # This function builds a BRAND-NEW scrollable Column every time it
+        # runs (closing a device/compare modal, split/merge, a background
+        # sync's full rebuild, etc. all end up calling it again) — a fresh
+        # Flet/Flutter scrollable always starts at offset 0 regardless of
+        # where the old one was, so without this the user gets bounced back
+        # to the top of a long device list on every one of those actions.
+        # Restore whatever _on_table_v_scroll last recorded, once this new
+        # Column is actually mounted (scroll_to needs the control on the
+        # page — a short delay covers the one page.update() round trip).
+        if page_ctrl and self._table_scroll_pixels > 0:
+            async def _restore_table_scroll():
+                await asyncio.sleep(0.05)
+                with contextlib.suppress(Exception):
+                    if self._table_v_scroll_ref.current:
+                        await self._table_v_scroll_ref.current.scroll_to(
+                            offset=self._table_scroll_pixels, duration=0
+                        )
+            page_ctrl.run_task(_restore_table_scroll)
+
         return ft.Column(_col_controls, spacing=6, expand=True)
+
+    def _on_table_v_scroll(self, e) -> None:
+        with contextlib.suppress(Exception):
+            pixels = getattr(e, "pixels", None)
+            if pixels is not None:
+                self._table_scroll_pixels = float(pixels)
+
+    def _restore_table_scroll_soon(self, page) -> None:
+        """Call right after page.pop_dialog() (device card / compare modal /
+        anything else overlaying the table) — dismissing a Flet dialog
+        overlay can itself reset an ancestor scrollable's offset even when
+        nothing about the table's own controls changed, same symptom as
+        _build_results_content/_refresh_table's own restore calls but with
+        no rebuild involved to hang this off of, so every dialog-close site
+        that matters calls this directly instead."""
+        if self._table_scroll_pixels <= 0:
+            return
+        page_ctrl = page or self._get_page_safe()
+        if not page_ctrl:
+            return
+
+        async def _do():
+            with contextlib.suppress(Exception):
+                if self._table_v_scroll_ref.current:
+                    await self._table_v_scroll_ref.current.scroll_to(
+                        offset=self._table_scroll_pixels, duration=0
+                    )
+
+        with contextlib.suppress(Exception):
+            page_ctrl.run_task(_do)
 
     def _do_search(self, value: str):
         self._search = value.strip()
@@ -9731,27 +11226,38 @@ class GsmParserView:
                 self.build()
 
     def _build_filter_panel(self) -> ft.Control:
+        global _FILTER_OPTIONS, _LIGHT_FILTER_OPTIONS_LOADED
         devices, _, loading = _get_cache()
         if devices is None:
-            # devices is None now just means "Показати результати" hasn't
-            # been clicked yet (nothing auto-loads anymore) — filter
-            # OPTIONS (brand/type/year lists) genuinely can't be computed
-            # without the data, but a spinner + "завантажується" here
-            # would be misleading (nothing is actively happening).
-            return ft.Container(
-                padding=ft.padding.symmetric(horizontal=16, vertical=12),
-                content=ft.Row(
-                    [
-                        ft.Icon(ft.Icons.INFO_OUTLINE, size=16, color=_MUTED),
-                        ft.Text(
-                            "Спочатку натисніть «Показати результати»",
-                            size=12, color=_MUTED,
-                        ),
-                    ],
-                    spacing=10,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                ),
-            )
+            # Cold start, nothing cached yet — filter options used to be
+            # unavailable until "Показати результати" loaded the whole
+            # catalog into memory just to compute them. Brand/device_type
+            # are indexed columns, so a plain DISTINCT query straight
+            # against the DB is cheap — fetch it once (not on every
+            # rebuild) and show the real filter chips immediately, without
+            # forcing a full load first.
+            if not _LIGHT_FILTER_OPTIONS_LOADED:
+                _LIGHT_FILTER_OPTIONS_LOADED = True
+                with contextlib.suppress(Exception):
+                    light_opts = self.db.get_gsm_parser_filter_options()
+                    if any(light_opts.values()):
+                        _FILTER_OPTIONS = light_opts
+            if not any(_FILTER_OPTIONS.values()):
+                # Truly nothing in the DB yet — genuinely nothing to filter by.
+                return ft.Container(
+                    padding=ft.padding.symmetric(horizontal=16, vertical=12),
+                    content=ft.Row(
+                        [
+                            ft.Icon(ft.Icons.INFO_OUTLINE, size=16, color=_MUTED),
+                            ft.Text(
+                                "Ще немає даних для фільтрації — натисніть «Показати результати»",
+                                size=12, color=_MUTED,
+                            ),
+                        ],
+                        spacing=10,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                )
         # Use pre-computed option sets (updated once per cache load, not per click)
         opts = _FILTER_OPTIONS
         all_brands = opts["brands"]
@@ -10673,6 +12179,32 @@ class GsmParserView:
             settings_container = _lazy_tab_placeholder()
             _built_tabs = {"log": False, "settings": False}
 
+            def _update_lazy_container(container: ft.Container, key: str) -> None:
+                """Retries .update() a few times before giving up — this
+                thread's content-swap update() races against the tab-click
+                handler's OWN _main_content_holder.update() (which is what
+                actually mounts this container into the live page tree,
+                called synchronously just before _build_tab_lazy starts
+                this thread). Losing that race hits Flet's well-known
+                "Control must be added to the page first" error — silently
+                swallowing it (the old behavior) left the container's
+                `.content` correctly set in Python but never pushed to the
+                client, so the tab just stayed blank forever with no way to
+                tell why. Logs if every retry fails instead of staying
+                silent."""
+                last_exc: Exception | None = None
+                for attempt in range(5):
+                    try:
+                        container.update()
+                        return
+                    except Exception as exc:
+                        last_exc = exc
+                        time.sleep(0.1 * (attempt + 1))
+                logger.error(
+                    "[GSM] lazy tab '%s': container.update() failed after retries: %s",
+                    key, last_exc,
+                )
+
             def _build_tab_lazy(key: str):
                 if _built_tabs.get(key):
                     return
@@ -10683,8 +12215,7 @@ class GsmParserView:
                         if key == "log":
                             ctrl = self._build_log_tab()
                             log_container.content = ctrl
-                            with contextlib.suppress(Exception):
-                                log_container.update()
+                            _update_lazy_container(log_container, key)
                         elif key == "settings":
                             # Full settings (schedule/VPS/Telegram/backup) for
                             # superadmins; a manager granted only "Запуск
@@ -10695,10 +12226,10 @@ class GsmParserView:
                                 else self._build_brands_only_tab(page_ctrl_ref)
                             )
                             settings_container.content = ctrl
-                            with contextlib.suppress(Exception):
-                                settings_container.update()
+                            _update_lazy_container(settings_container, key)
                     except Exception:
                         logger.exception("[GSM] lazy tab '%s' build failed", key)
+                        _built_tabs[key] = False
 
                 threading.Thread(target=_work, daemon=True).start()
 

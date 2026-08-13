@@ -1238,7 +1238,10 @@ class MediaPlanView:
             self._visible_months_count = n
             self._save_month_view_settings()
             self._schedule_rebuild()
-            self._snack(self.t("media.months_saved", f"Збережено: {n} міс."), "#10B981")
+            self._snack(
+                self.t("media.months_saved", "Збережено: {n} міс.").format(n=n),
+                "#10B981",
+            )
 
         months_row = ft.Row(
             [
@@ -2220,7 +2223,10 @@ class MediaPlanView:
             self._visible_months_count = n
             self._save_month_view_settings()
             self._schedule_rebuild()
-            self._snack(self.t("media.months_saved", f"Збережено: {n} міс."), "#10B981")
+            self._snack(
+                self.t("media.months_saved", "Збережено: {n} міс.").format(n=n),
+                "#10B981",
+            )
 
         months_row = ft.Row(
             [
@@ -2748,7 +2754,15 @@ class MediaPlanView:
                 or []
             )
             self._save_entries_cache(db_pulse)
-        # else: self._entries populated from cache by _load_entries_cache()
+        else:
+            # Cache hit — self._entries already populated by
+            # _load_entries_cache(). _entries_cache_pulse used to only get
+            # set on a miss (_save_entries_cache), so it stayed 0 through
+            # every cache-hit load — resume()'s guard below then always
+            # treated that as "no cached pulse to compare", defaulted
+            # _data_changed to True, and repainted this tab on every single
+            # tab-switch-back even when nothing had changed.
+            self._entries_cache_pulse = cached_pulse
         self._set_loading_text(f"Записи: {len(self._entries or [])}")
 
         # Re-apply any pending (un-flushed) outbox items over loaded data.
@@ -2874,14 +2888,8 @@ class MediaPlanView:
                 for n in nodes
                 if isinstance(n, dict) and str(n.get("id") or "").strip()
             }
-            # print(f"[_load] _node_names loaded: {len(self._node_names)} nodes")
-            # print(f"[_load] _products loaded: {len(self._products)} products")
-            # print(
-            #     f"[_load] _category_level_pos_by_title keys: {list(self._category_level_pos_by_title.keys())}"
-            # )
-            # print(f"[_load] _title_default_pos: {self._title_default_pos}")
-        except Exception as e:
-            print(f"[_load] ERROR loading nodes: {e}")
+        except Exception:
+            _catlog.exception("[media-plan] _load: failed loading nodes")
             self._node_names = {}
         self._load_month_view_settings()
         self._load_post_days_settings()
@@ -4311,7 +4319,7 @@ class MediaPlanView:
             dp = ft.DatePicker(
                 value=datetime.combine(date.today(), datetime.min.time()),
                 first_date=date(2020, 1, 1),
-                last_date=date(2100, 12, 31),
+                last_date=date(2035, 12, 31),
                 entry_mode=ft.DatePickerEntryMode.CALENDAR_ONLY,
                 date_picker_mode=ft.DatePickerMode.DAY,
                 locale=ft.Locale("uk", "UA"),
@@ -5654,7 +5662,7 @@ class MediaPlanView:
                 dp = ft.DatePicker(
                     value=default_dt,
                     first_date=date(2020, 1, 1),
-                    last_date=date(2100, 12, 31),
+                    last_date=date(2035, 12, 31),
                     entry_mode=ft.DatePickerEntryMode.CALENDAR_ONLY,
                     date_picker_mode=ft.DatePickerMode.DAY,
                     locale=ft.Locale("uk", "UA"),
@@ -6117,7 +6125,13 @@ class MediaPlanView:
                 visible=False
             )
         if reload or not self._initial_loaded:
-            self._load()
+            # `reload=True` must force a real refetch — _load()'s own
+            # early-return guard (`if self._initial_loaded and not force:
+            # return`) otherwise made every reload after the very first one
+            # a silent no-op: pulse-detected changes, manual refresh, and
+            # resume() all called _rebuild(reload=True) expecting a refetch
+            # that never actually happened.
+            self._load(force=reload)
             self._load_table_layout_state()
             self._load_visible_columns_state()
 

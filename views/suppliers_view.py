@@ -159,13 +159,31 @@ class SuppliersView:
         if self.is_privileged:
             return True
         supplier_id = (supplier.get("id") or "").strip()
-        if supplier_id and self.db.has_entity_owner(
-            self.company_id, current_id, "supplier", supplier_id
-        ):
+        # Was a per-card `has_entity_owner` DB round trip (N queries for N
+        # suppliers on every render); load_suppliers() now fetches this same
+        # manager's whole owned-supplier-id set once and caches it here.
+        if supplier_id and supplier_id in self._owned_supplier_ids_cache():
             return True
         if not owner_id:
             return True
         return owner_id == current_id
+
+    def _owned_supplier_ids_cache(self) -> set:
+        cached = getattr(self, "_owned_supplier_ids", None)
+        if cached is not None:
+            return cached
+        current_id = (self.manager_id or "").strip()
+        try:
+            ids = set(
+                self.db.get_entity_owner_entity_ids(
+                    self.company_id, current_id, "supplier"
+                )
+                or []
+            )
+        except Exception:
+            ids = set()
+        self._owned_supplier_ids = ids
+        return ids
 
     def _resolve_manager_name(self, company_id, manager_id):
         try:
@@ -209,6 +227,32 @@ class SuppliersView:
             logger.exception("Resolve supplier manager name failed")
             return ""
 
+    def _effective_payment_fields_cached(self, company_id: str, region_id: str) -> list:
+        """Memoized per (company_id, manager_id, region_id) for the duration
+        of one render pass — this was called twice per supplier card
+        (_get_enabled_payment_method_names + _get_effective_payment_image_entries),
+        and get_effective_payment_fields_for_manager itself is 4 uncached DB
+        round trips, so a list of N suppliers used to cost up to ~8×N queries
+        for data that's identical across (almost) the whole list."""
+        cache = getattr(self, "_eff_payment_fields_cache", None)
+        if cache is None:
+            cache = {}
+            self._eff_payment_fields_cache = cache
+        key = (company_id, self.manager_id, region_id)
+        if key in cache:
+            return cache[key]
+        try:
+            fields = (
+                self.db.get_effective_payment_fields_for_manager(
+                    company_id, self.manager_id, region_id=region_id
+                )
+                or []
+            )
+        except Exception:
+            fields = []
+        cache[key] = fields
+        return fields
+
     def _get_enabled_payment_method_names(self, supplier: dict) -> list[str]:
         """
         Returns list of enabled payment method names for a supplier.
@@ -221,14 +265,7 @@ class SuppliersView:
             return []
 
         # Get effective payment fields template for manager
-        effective_fields = (
-            self.db.get_effective_payment_fields_for_manager(
-                company_id,
-                self.manager_id,
-                region_id=region_id,
-            )
-            or []
-        )
+        effective_fields = self._effective_payment_fields_cached(company_id, region_id)
 
         # Build map of field_id -> supplier's payment_field config
         by_field_id = {}
@@ -268,14 +305,7 @@ class SuppliersView:
         if not company_id:
             return []
 
-        effective_fields = (
-            self.db.get_effective_payment_fields_for_manager(
-                company_id,
-                self.manager_id,
-                region_id=region_id,
-            )
-            or []
-        )
+        effective_fields = self._effective_payment_fields_cached(company_id, region_id)
 
         by_field_id = {}
         pf = supplier.get("payment_fields")
@@ -690,6 +720,45 @@ class SuppliersView:
             self._header_loading_indicator.visible = False
         if self.content_area.page and hasattr(self.content_area, "update"):
             self.content_area.update()
+        self._suppliers_ui_ready = True
+        with contextlib.suppress(Exception):
+            self._suppliers_pulse_ts = self._suppliers_scope_pulse_ts()
+
+    def _suppliers_scope_pulse_ts(self) -> int:
+        try:
+            out = self.db.get_companies_sync_pulses(
+                [self.company_id], ["suppliers", "catalog"]
+            ) or {}
+            by_company = out.get(self.company_id) if isinstance(out, dict) else {}
+            if not isinstance(by_company, dict):
+                return 0
+            return max((int(v or 0) for v in by_company.values()), default=0)
+        except Exception:
+            return 0
+
+    async def resume(self) -> None:
+        """Called when returning to this cached tab. This view previously
+        had NO reload mechanism at all once built once — a supplier change
+        made on another device/session never showed up here short of an app
+        restart. Cheap pulse check + a real (force_refresh) reload only when
+        something genuinely changed."""
+        if not getattr(self, "_suppliers_ui_ready", False):
+            return
+
+        async def _bg_suppliers_pulse_check():
+            try:
+                new_pulse = await asyncio.to_thread(self._suppliers_scope_pulse_ts)
+                cached_pulse = int(getattr(self, "_suppliers_pulse_ts", 0) or 0)
+                if new_pulse > cached_pulse:
+                    self._suppliers_pulse_ts = new_pulse
+                    self.load_suppliers(force_refresh=True)
+            except Exception:
+                pass
+
+        _pg = self._page()
+        if _pg and hasattr(_pg, "run_task"):
+            with contextlib.suppress(Exception):
+                _pg.run_task(_bg_suppliers_pulse_check)
 
     def _compress_image(self, input_path):
         if not Image:
@@ -720,13 +789,23 @@ class SuppliersView:
         except Exception:
             pass
 
-    def load_suppliers(self):
+    def load_suppliers(self, force_refresh: bool = False):
+        if not hasattr(self, "suppliers_list"):
+            return
         self.suppliers_list.controls.clear()
         current_region_id = self._effective_region_id()
+        # Recompute once per load — ownership can change between loads
+        # (reassignment), but every card in THIS render shares one fetch
+        # instead of one `has_entity_owner` round trip per card.
+        self._owned_supplier_ids = None
+        self._eff_payment_fields_cache = {}
 
         load_manager_id = self.manager_id
         raw_suppliers = self.db.get_suppliers(
-            self.company_id, current_region_id, manager_id=load_manager_id
+            self.company_id,
+            current_region_id,
+            manager_id=load_manager_id,
+            force_refresh=force_refresh,
         )
         suppliers = raw_suppliers if isinstance(raw_suppliers, list) else []
         self._set_loading_text(f"Постачальники: {len(suppliers)}")

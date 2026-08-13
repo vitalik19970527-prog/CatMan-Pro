@@ -649,6 +649,8 @@ class CategoriesBrandsView:
 
     def load_categories(self):
         logger.info("[categories-debug] load_categories start")
+        if not hasattr(self, "categories_list"):
+            return
         self.categories_list.controls.clear()
         region_id = self._resolve_region_id()
         self._visible_scope_node_ids = set()
@@ -684,6 +686,42 @@ class CategoriesBrandsView:
                     )
                     if str(x).strip()
                 }
+                # get_manager_scope_node_ids() returns only the EXACT nodes
+                # this manager owns — no ancestor expansion. A manager who
+                # only ever got ownership of a deep leaf (e.g. a product's
+                # own catalog_node_id, auto-granted by add_product) then has
+                # no owned row for the intermediate brand/series nodes on
+                # the path down to it, so this tile-filter (exact id
+                # membership) hid the whole branch even though a product
+                # under it is clearly visible elsewhere — confirmed live
+                # ("KVZV" not showing under "Glitter Android UA" despite a
+                # product at Glitter Android UA -> KVZV -> KVZV Kayla).
+                # Walk every owned node up to its category root and add
+                # every ancestor so the full path is always browsable —
+                # this only affects what's visible/expandable in this tree,
+                # it grants no new ownership/edit rights on those ancestors.
+                if self._visible_scope_node_ids:
+                    with contextlib.suppress(Exception):
+                        _all_nodes = self.db.get_company_catalog_nodes(
+                            self.company_id
+                        )
+                        _by_id = {
+                            str(n.get("id") or "").strip(): n
+                            for n in (_all_nodes or [])
+                            if isinstance(n, dict) and str(n.get("id") or "").strip()
+                        }
+                        _ancestors: set[str] = set()
+                        for _start in list(self._visible_scope_node_ids):
+                            _cur = _by_id.get(_start)
+                            _hops = 0
+                            while isinstance(_cur, dict) and _hops < 40:
+                                _parent = str(_cur.get("parent_id") or "").strip()
+                                if not _parent or _parent in _ancestors:
+                                    break
+                                _ancestors.add(_parent)
+                                _cur = _by_id.get(_parent)
+                                _hops += 1
+                        self._visible_scope_node_ids |= _ancestors
         categories = categories_raw if isinstance(categories_raw, list) else []
         self._set_loading_text(f"Категорії: {len(categories)}")
         self.current_categories = categories
@@ -1943,10 +1981,11 @@ class CategoriesBrandsView:
                         ttl_seconds=180,
                     )
 
-            try:
-                lock_heartbeat_task_ref["task"] = asyncio.create_task(_heartbeat_loop())
-            except Exception:
-                logger.exception("Failed to start category lock heartbeat")
+            # Heartbeat loop no longer started — 1 менеджер = 1 категорія
+            # means two people editing the same category is architecturally
+            # impossible now, so there's nothing left to protect against.
+            # The lock (acquired above) still exists but simply expires on
+            # its own TTL (180s) instead of being kept alive forever.
 
         def _release_lock_once():
             if (not is_edit) or lock_released_ref["done"]:
@@ -1983,11 +2022,12 @@ class CategoriesBrandsView:
             is_edit,
             target_company_id,
             _release_lock_once,
+            edit_lock_token,
         )
         if dlg is not None:
             self._show_dialog_safe(dlg)
 
-    def _build_category_dialog(self, category, is_edit, target_company_id, _release_lock_once):
+    def _build_category_dialog(self, category, is_edit, target_company_id, _release_lock_once, edit_lock_token=""):
         can_rename_category = bool(self.can_manage_categories)
         name_f = ft.TextField(
             label=self.t("categories.field.category_name", "Назва категорії"),

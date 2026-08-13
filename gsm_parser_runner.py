@@ -95,6 +95,31 @@ def _normalize_model_name(name: str, rules: dict) -> str:
     return txt
 
 
+# E-Katalog product titles bake in memory/storage (e.g. "128 ГБ / 4 ГБ") and
+# occasionally physical size in mm — GSM Arena's titles never do. Without
+# stripping these before computing model_key, two RAM/storage variants of the
+# very same phone (or a variant discovered on a later scrape) end up with
+# DIFFERENT model_keys and land as separate rows — the exact "duplicate
+# device" complaint (e.g. "Xiaomi Redmi 17 128 ГБ / 4 ГБ" got its own key
+# instead of matching plain "Xiaomi Redmi 17"). Year and 4G/5G are
+# deliberately NOT touched here — those really do distinguish different
+# devices, unlike storage/RAM capacity or physical dimensions.
+_SIZE_TOKEN_RE = re.compile(
+    r"\s*\d+(?:[.,]\d+)?\s*(?:ГБайт|ГБ|Гб|GB|Gb|ТБ|Тб|TB|Tb|мм|mm)\.?\s*"
+    r"(?:[/+]\s*\d+(?:[.,]\d+)?\s*(?:ГБайт|ГБ|Гб|GB|Gb|ТБ|Тб|TB|Tb|мм|mm)\.?\s*)*",
+    re.IGNORECASE,
+)
+
+
+def _strip_size_tokens(name: str) -> str:
+    """Strip memory/storage and mm-size tokens from a product title — use
+    ONLY when computing model_key, never for the display model_name (users
+    still want to see "128 ГБ / 4 ГБ" on the card, we just can't let it
+    fragment identity matching)."""
+    txt = _SIZE_TOKEN_RE.sub(" ", str(name or ""))
+    return re.sub(r"\s+", " ", txt).strip()
+
+
 def _name_similarity(a: str, b: str, rules: dict) -> float:
     na = _normalize_model_name(a, rules)
     nb = _normalize_model_name(b, rules)
@@ -333,6 +358,10 @@ def fetch_and_apply_manual_ek_url(
         },
         "gsm_ref_model_key": str(row.get("model_key") or ""),
         "gsm_ref_device_id": gsm_id,
+        # Consumed by _upsert_device's next scheduled-run UPDATE of this
+        # exact row — makes it count as "new" (sidebar + Telegram) exactly
+        # once, per spec for manually-pasted links.
+        "_pending_new_announce": True,
     }
     ek_model_name = str(parsed.get("W") or model_name).strip()
     ek_payload = {
@@ -341,17 +370,261 @@ def fetch_and_apply_manual_ek_url(
         "device_type": dev_type_label,
         "model_name": ek_model_name,
         "model_key": str(row.get("model_key") or "").strip()
-        or _normalize_model_name(ek_model_name, {}),
+        or _normalize_model_name(_strip_size_tokens(ek_model_name), {}),
         "source_url": url,
         "image_url": str(row.get("image_url") or ""),
         "specs": ek_specs,
     }
 
+    with contextlib.suppress(Exception):
+        db.clear_gsm_excluded(SOURCE_EK, str(ek_payload.get("model_key") or ""))
     ok, dev_id, ch, ev_status, _extra_status = _upsert_device(db, ek_payload)
     if not ok:
         return False, "Помилка запису в БД", ""
     _record_daily_history(db, gsm_id, SOURCE_EK, ek_specs)
     return True, ek_model_name, dev_id
+
+
+def fetch_and_add_manual_ek_device(
+    db: DataManager,
+    brand: str,
+    device_type: str,
+    url: str,
+    max_age_months: Optional[int] = None,
+    on_sale_status_prefixes: Optional[list] = None,
+) -> tuple[bool, str, str, int, str]:
+    """Immediately fetch a manually-pinned E-Katalog URL for a device that
+    has NO existing GSM Arena row to attach to (unlike
+    fetch_and_apply_manual_ek_url above) and store it as its own standalone
+    EK device — same shape/upsert path the scheduled parser's manual-links
+    pass uses (see the "Auto-scanning the rest of the listing..." comment in
+    run_gsm_parser), just triggered on demand instead of waiting for the
+    next scheduled run. If a later GSM Arena parse discovers a matching
+    device, _link_new_gsm_device_to_standalone_ek merges into this same row.
+
+    Returns (ok, message_or_model_name, device_id, changes_count, event_status)."""
+    url = str(url or "").strip()
+    if not url:
+        return False, "Порожнє посилання", "", 0, ""
+
+    legacy_ek = _legacy_ek()
+    try:
+        parsed = legacy_ek.parse_ekatalog_item(url, "", device_type, skip_net_check=True)
+    except Exception as exc:
+        return False, f"Помилка завантаження сторінки: {exc}", "", 0, ""
+    if not parsed or "fail_net" in parsed:
+        return False, "Не вдалося завантажити сторінку ЄК (мережа/недоступно)", "", 0, ""
+
+    ek_model_name = str(parsed.get("W") or "").strip()
+    if not ek_model_name:
+        return False, "Не вдалося розпізнати назву товару на сторінці", "", 0, ""
+
+    ek_date_raw = str(parsed.get("Y") or "")
+    ek_year, ek_month = _parse_ek_date_added(ek_date_raw)
+    ek_specs = {
+        "date_added": ek_date_raw,
+        "date_added_year": ek_year,
+        "date_added_month": ek_month,
+        "dimensions": str(parsed.get("Z") or ""),
+        "length": str(parsed.get("AA") or ""),
+        "width": str(parsed.get("AB") or ""),
+        "thickness": str(parsed.get("AC") or ""),
+        "weight": str(parsed.get("AD") or ""),
+        "display": str(parsed.get("AE") or ""),
+        "os": str(parsed.get("AF") or ""),
+        "cpu": str(parsed.get("AG") or ""),
+        "memory": str(parsed.get("AH") or ""),
+        "battery": str(parsed.get("AI") or ""),
+        "status": str(parsed.get("AJ") or ""),
+        "price_low": str(parsed.get("AK") or ""),
+        "price_min": str(parsed.get("AL") or ""),
+        "price_max": str(parsed.get("AM") or ""),
+        "ek_url": url,
+        "shops_count": str(parsed.get("AK") or ""),
+        "variations": {
+            "AP": str(parsed.get("AP") or ""),
+            "AQ": str(parsed.get("AQ") or ""),
+            "AR": str(parsed.get("AR") or ""),
+            "AS": str(parsed.get("AS") or ""),
+            "AT": str(parsed.get("AT") or ""),
+        },
+        # See fetch_and_apply_manual_ek_url's matching comment.
+        "_pending_new_announce": True,
+    }
+    ek_payload = {
+        "source": SOURCE_EK,
+        "brand": brand,
+        "device_type": device_type,
+        "model_name": ek_model_name,
+        "model_key": _normalize_model_name(_strip_size_tokens(ek_model_name), {}),
+        "source_url": url,
+        "image_url": str(parsed.get("PHOTO_MAIN") or ""),
+        "specs": ek_specs,
+    }
+
+    with contextlib.suppress(Exception):
+        db.clear_gsm_excluded(SOURCE_EK, str(ek_payload.get("model_key") or ""))
+    ok, dev_id, ch, ev_status, _extra_status = _upsert_device(
+        db, ek_payload, max_age_months, on_sale_status_prefixes
+    )
+    if not ok:
+        return False, "Помилка запису в БД", "", 0, ""
+    _record_daily_history(db, dev_id, SOURCE_EK, ek_specs)
+    if ev_status in {"new", "updated"}:
+        with contextlib.suppress(Exception):
+            _save_ek_primary_photos(legacy_ek, db, dev_id, parsed)
+    return True, ek_model_name, dev_id, int(ch), str(ev_status or "")
+
+
+def fetch_and_add_manual_gsm_device(
+    db: DataManager,
+    brand: str,
+    device_type: str,
+    url: str,
+) -> tuple[bool, str, str]:
+    """Immediately fetch a manually-pinned GSM Arena URL for a device that
+    has NO existing row on either side yet (unlike fetch_and_attach_manual_
+    gsm_url, which attaches to an ALREADY-EXISTING standalone E-Katalog
+    device) — the mirror-image of fetch_and_add_manual_ek_device above, for
+    when the device is missing from GSM Arena entirely and there's no EK
+    card to attach it to. Stored as its own standalone GSM Arena device; if
+    a later E-Katalog scrape (or another manual "Посилання ЄК" pin)
+    discovers a matching device, the normal auto-match/merge picks it up
+    the same way it would for any other GSM Arena row.
+
+    Returns (ok, message_or_model_name, device_id)."""
+    url = str(url or "").strip()
+    if not url:
+        return False, "Порожнє посилання", ""
+
+    legacy_gsm = _legacy_gsm()
+    try:
+        # Single one-off manual fetch, not a bulk crawl — skip the anti-bot
+        # pacing delay (~32-56s) that only exists to space out a crawler's
+        # many sequential requests.
+        info = legacy_gsm.parse_device_details(url, brand, skip_pacing=True)
+    except Exception as exc:
+        return False, f"Помилка завантаження сторінки: {exc}", ""
+    if info == "STOP":
+        return False, "GSM Arena тимчасово заблокувала запити — спробуйте пізніше", ""
+    if not info or not isinstance(info, list):
+        return False, "Не вдалося завантажити сторінку GSM Arena (мережа/недоступно)", ""
+
+    model_name = str(info[1] if len(info) > 1 else "").strip()
+    if not model_name:
+        return False, "Не вдалося розпізнати назву пристрою на сторінці", ""
+
+    rules = {}
+    with contextlib.suppress(Exception):
+        cfg = db.get_gsm_parser_global_config() or {}
+        rules = cfg.get("comparison") if isinstance(cfg.get("comparison"), dict) else {}
+
+    payload = _map_gsm_info_to_payload(info, rules)
+    payload["brand"] = str(brand or payload.get("brand") or "").strip()
+    payload["device_type"] = str(device_type or payload.get("device_type") or "").strip()
+    # See fetch_and_apply_manual_ek_url's matching comment.
+    payload.setdefault("specs", {})["_pending_new_announce"] = True
+    with contextlib.suppress(Exception):
+        db.clear_gsm_excluded(SOURCE_GSM, str(payload.get("model_key") or ""))
+    ok, gsm_dev_id, _ch, _status, _extra = _upsert_device(db, payload)
+    if not ok:
+        return False, "Помилка запису в БД", ""
+
+    main_photo = info[23] if len(info) > 23 else None
+    gallery_photos = info[24] if len(info) > 24 else []
+    if main_photo or gallery_photos:
+        with contextlib.suppress(Exception):
+            db.save_gsm_device_photos(gsm_dev_id, main_photo, gallery_photos)
+
+    return True, model_name, gsm_dev_id
+
+
+def fetch_and_attach_manual_gsm_url(
+    db: DataManager, ek_device_id: str, url: str
+) -> tuple[bool, str, str]:
+    """Immediately fetch a manually-pinned GSM Arena URL for an existing
+    STANDALONE E-Katalog device (no GSM Arena match yet) and link the two —
+    the mirror-image of fetch_and_apply_manual_ek_url above, for when GSM
+    Arena hasn't been auto-matched (or doesn't have the device in our DB at
+    all yet) instead of the other way around. Same trust-the-URL contract:
+    no name/type matching, this pin bypasses that step entirely.
+
+    Reuses the exact insert path a normal scheduled crawl uses for a
+    brand-new GSM Arena device (parse_device_details + _upsert_device), so
+    if the automated crawler later revisits this same device it just
+    updates this same row instead of creating a duplicate.
+
+    Returns (ok, message_or_model_name, gsm_device_id)."""
+    url = str(url or "").strip()
+    if not url:
+        return False, "Порожнє посилання", ""
+
+    row = db.get_gsm_device_by_id(ek_device_id)
+    if not row or str(row.get("source") or "") != SOURCE_EK:
+        return False, "Пристрій E-Katalog не знайдено", ""
+
+    brand = str(row.get("brand") or "").strip()
+
+    legacy_gsm = _legacy_gsm()
+    try:
+        # Single one-off manual fetch, not a bulk crawl — skip the anti-bot
+        # pacing delay (~32-56s) that only exists to space out a crawler's
+        # many sequential requests.
+        info = legacy_gsm.parse_device_details(url, brand, skip_pacing=True)
+    except Exception as exc:
+        return False, f"Помилка завантаження сторінки: {exc}", ""
+    if info == "STOP":
+        return False, "GSM Arena тимчасово заблокувала запити — спробуйте пізніше", ""
+    if not info or not isinstance(info, list):
+        return False, "Не вдалося завантажити сторінку GSM Arena (мережа/недоступно)", ""
+
+    model_name = str(info[1] if len(info) > 1 else "").strip()
+    if not model_name:
+        return False, "Не вдалося розпізнати назву пристрою на сторінці", ""
+
+    rules = {}
+    with contextlib.suppress(Exception):
+        cfg = db.get_gsm_parser_global_config() or {}
+        rules = cfg.get("comparison") if isinstance(cfg.get("comparison"), dict) else {}
+
+    payload = _map_gsm_info_to_payload(info, rules)
+    # See fetch_and_apply_manual_ek_url's matching comment.
+    payload.setdefault("specs", {})["_pending_new_announce"] = True
+    with contextlib.suppress(Exception):
+        db.clear_gsm_excluded(SOURCE_GSM, str(payload.get("model_key") or ""))
+    ok, gsm_dev_id, _ch, _status, _extra = _upsert_device(db, payload)
+    if not ok:
+        return False, "Помилка запису в БД", ""
+
+    main_photo = info[23] if len(info) > 23 else None
+    gallery_photos = info[24] if len(info) > 24 else []
+    if main_photo or gallery_photos:
+        with contextlib.suppress(Exception):
+            db.save_gsm_device_photos(gsm_dev_id, main_photo, gallery_photos)
+
+    # Link the standalone EK row to this GSM row exactly the way an
+    # automatic match would (see _link_new_gsm_device_to_standalone_ek) —
+    # get_gsm_merged_results and the results table both key the join off
+    # this same field, so this is the whole merge, not a separate step.
+    ek_specs = row.get("specs") if isinstance(row.get("specs"), dict) else {}
+    ek_specs = dict(ek_specs)
+    ek_specs["gsm_ref_device_id"] = gsm_dev_id
+    ek_specs["gsm_ref_model_key"] = str(payload.get("model_key") or "")
+    try:
+        with db._general_pg().cursor() as cur:
+            cur.execute(
+                "UPDATE public.gsm_parser_devices SET specs=%s::jsonb, updated_at=%s WHERE id=%s",
+                (json.dumps(ek_specs, ensure_ascii=False), datetime.now(), ek_device_id),
+            )
+        db._general_pg().commit()
+    except Exception as exc:
+        return (
+            False,
+            f"GSM-пристрій збережено, але не вдалося прив'язати до товару ЄК: {exc}",
+            gsm_dev_id,
+        )
+
+    return True, model_name, gsm_dev_id
 
 
 def _download_ek_bytes(legacy_ek, url: str) -> Optional[bytes]:
@@ -522,6 +795,12 @@ def _upsert_device(
                     if not _existing_gsm_ref or _existing_gsm_ref == _incoming_gsm_ref:
                         existing = url_match
             if not existing:
+                # A manually deleted device (delete_gsm_device -> add_gsm_excluded)
+                # must never silently reappear on the next scheduled parse —
+                # the only way back in is a manual link add, which clears
+                # this via clear_gsm_excluded before ever reaching here.
+                if db.is_gsm_device_excluded(source, model_key):
+                    return True, "", 0, "excluded", None
                 device_id = f"dev_{uuid.uuid4().hex}"
                 insert_specs = dict(payload.get("specs") or {})
                 extra_status = None
@@ -705,6 +984,20 @@ def _upsert_device(
             # read it, forcing a needless (and sometimes wrong) re-match.
             merged_specs = {**existing_specs, **incoming_specs}
 
+            # A device created via a manual link paste (fetch_and_add_manual_
+            # gsm_device / fetch_and_add_manual_ek_device) is never announced
+            # at add-time — per spec it must still count as "new" (sidebar +
+            # Telegram) exactly once, on the FIRST scheduled parse run that
+            # touches it afterward. That run is always an UPDATE (the row
+            # already exists), so it would otherwise fall through to
+            # "updated"/"seen" and never surface as new anywhere. Consume the
+            # flag write-once — it survives until whichever source (GSM
+            # Arena or E-Katalog) re-scrapes this exact row next, then never
+            # fires again.
+            pending_announce = bool(existing_specs.get("_pending_new_announce"))
+            if pending_announce:
+                merged_specs.pop("_pending_new_announce", None)
+
             cur.execute(
                 """
                 UPDATE public.gsm_parser_devices
@@ -735,7 +1028,14 @@ def _upsert_device(
                 ),
             )
 
+            if pending_announce:
+                _log_change(
+                    cur, device_id, source, "__manual_announce__", "",
+                    str(payload.get("model_name") or ""),
+                )
             db._general_pg().commit()
+            if pending_announce:
+                return True, device_id, max(changes, 1), "new", None
             if shops_appeared:
                 return True, device_id, changes, "shops_appeared", None
             if changes > 0:
@@ -1437,10 +1737,17 @@ def _ek_name_matches(
         return False
     # 2b. network-generation markers (4G/5G/LTE/Wi-Fi) — checked on the
     # ORIGINAL strings since clean_name_final already stripped them from
-    # orig_words/site_words above. Must match exactly, not just "both present":
-    # a search for the plain Wi-Fi variant must never match a listing that
-    # only exists as the 5G variant (or vice versa) — see _ek_network_tokens.
-    if _ek_network_tokens(model_name) != _ek_network_tokens(site_name):
+    # orig_words/site_words above. Asymmetric like the numbered-generation
+    # check below (5): the SITE side must not introduce a token the search
+    # term doesn't have — e.g. a search for the plain Wi-Fi variant must
+    # never match a listing that only exists as the 5G variant. But the
+    # reverse (search states "4G", site states no network token at all) is
+    # NOT a mismatch: E-Katalog listings routinely describe a phone by
+    # storage/RAM instead of network generation and never mention "4G" at
+    # all even though it's the exact same device GSM Arena calls "... 4G" —
+    # confirmed live, this previously created a permanent duplicate row
+    # ("Redmi 17 4G" next to a GSM-less "Redmi 17 128GB/4GB").
+    if _ek_network_tokens(site_name) - _ek_network_tokens(model_name):
         return False
     # 3. single-letter markers from old code
     if ("s" in orig_words) != ("s" in site_words):
@@ -2227,9 +2534,11 @@ def run_gsm_parser(
 
                     if _pstat and _pstat["has_main"]:
                         # ── Lightweight path: device already in DB with main photo ──
-                        # Only fetch price + dates (1 request). Gallery topped up if needed.
-                        pdata = legacy_gsm.parse_device_price_dates(link)
-                        if pdata == "STOP":
+                        # Full spec re-check (1 request, no photo download) so a name
+                        # change or refined announce/release date on an already-known
+                        # device is caught too, not just price. Gallery topped up if needed.
+                        info = legacy_gsm.parse_device_details(link, brand, fetch_photos=False)
+                        if info == "STOP":
                             stats["errors"] += 1
                             _consecutive_blocks += 1
                             if _consecutive_blocks >= 2:
@@ -2261,16 +2570,21 @@ def run_gsm_parser(
                             break
 
                         model_name = _pstat["model_name"]
-                        if pdata:
+                        if not info or not isinstance(info, list):
+                            info = None
+                        if info:
                             dev_id = _pstat["device_id"]
-                            changed = db.update_gsm_device_price_and_dates(
+                            payload = _map_gsm_info_to_payload(info, rules)
+                            model_name = payload["model_name"] or model_name
+                            changed = db.update_gsm_device_full_refresh(
                                 dev_id,
-                                pdata["price_raw"],
-                                pdata["price_uah"],
-                                pdata["announced"],
-                                pdata["released"],
+                                payload["model_name"],
+                                payload["model_key"],
+                                payload["specs"],
                                 device_order=link_idx,
                             )
+                            if "model_name" in changed:
+                                _gsm_photo_status[link_norm]["model_name"] = payload["model_name"]
                             stats["gsm_written"] += 1
                             stats["changed"] += int(bool(changed))
                             # Top up gallery if GSM Arena now has more photos than we stored
@@ -2615,7 +2929,7 @@ def run_gsm_parser(
                                 "brand": bname,
                                 "device_type": dtype,
                                 "model_name": ek_model_name,
-                                "model_key": _normalize_model_name(ek_model_name, rules),
+                                "model_key": _normalize_model_name(_strip_size_tokens(ek_model_name), rules),
                                 "source_url": link,
                                 "image_url": str(tmp.get("PHOTO_MAIN") or ""),
                                 "specs": ek_specs,
@@ -2924,7 +3238,7 @@ def run_gsm_parser(
                             # from that text here would miss the existing row and create
                             # a duplicate "new" device every run.
                             "model_key": str(row.get("model_key") or "").strip()
-                            or _normalize_model_name(ek_model_name, rules),
+                            or _normalize_model_name(_strip_size_tokens(ek_model_name), rules),
                             "source_url": item_url,
                             "image_url": str(row.get("image_url") or ""),
                             "specs": ek_specs,
@@ -2983,108 +3297,36 @@ def run_gsm_parser(
 
                         _smart_sleep(random.uniform(2.0, 5.0))
 
-                    # EK devices with no GSM Arena match yet: a brand can be
-                    # tracked on GSM Arena overall while still missing a
-                    # specific model that IS on E-Katalog (GSM Arena simply
-                    # hasn't listed it, or listed it under a name the
-                    # matcher above didn't accept). Previously every listing
-                    # candidate that didn't match one of THIS brand/type's
-                    # GSM devices was silently dropped every run — never
-                    # stored, never shown. Store it as a standalone EK row
-                    # instead (same shape as the EK-primary-brand path
-                    # above, just for leftover candidates within an
-                    # otherwise GSM-tracked brand) so it at least shows up
-                    # with EK data and an empty GSM Arena side. If the
-                    # device later appears on GSM Arena, the GSM Arena
-                    # insert path (_link_new_gsm_device_to_standalone_ek)
-                    # links it into this same row instead of leaving a
-                    # separate duplicate.
-                    leftover_candidates = [
-                        c
-                        for c in candidate_links
-                        if str(c.get("url") or "").strip().lower().rstrip("/")
-                        not in matched_ek_urls
-                        and str(c.get("url") or "").strip()
-                    ]
-                    for ek_idx, cand in enumerate(leftover_candidates, 1):
+                    # Auto-scanning the rest of the listing for "leftover"
+                    # candidates (unmatched to any known GSM device) and
+                    # bulk-adding them as new standalone EK rows was tried
+                    # and reverted: E-Katalog lists every storage/RAM SKU and
+                    # every watch case size as its own separate listing item,
+                    # so it kept mis-flagging already-tracked models
+                    # (different capacity/size only) as brand-new duplicates
+                    # run after run, while still missing the one genuinely
+                    # new device it was meant to catch in the first place.
+                    # Replaced with an explicit, admin-controlled mechanism:
+                    # a superadmin manually pins the ONE specific E-Katalog
+                    # URL they know GSM Arena is missing (see "Посилання ЄК"
+                    # in the device toolbar — now available for any brand,
+                    # not just EK-only ones). Manually-pinned links only, no
+                    # bulk listing scan.
+                    manual_links = db.get_gsm_manual_ek_links(bname, dtype) or []
+                    for ek_idx, _ml in enumerate(manual_links, 1):
                         _check_control()
-                        link = str(cand.get("url") or "")
-                        cand_title = str(cand.get("title") or link).strip()
-                        try:
-                            tmp = legacy_ek.parse_ekatalog_item(
-                                link, "", dtype, skip_net_check=True
-                            )
-                        except Exception as exc:
-                            _log(
-                                f"[2/2] ЄК ► [{bname}] {cand_title}"
-                                f" (без GSM, {ek_idx}/{len(leftover_candidates)})"
-                                f" — помилка: {exc}"
-                            )
-                            _smart_sleep(random.uniform(2.0, 5.0))
+                        link = str(_ml.get("url") or "").strip()
+                        if not link or link.lower().rstrip("/") in matched_ek_urls:
                             continue
-                        if not tmp or "fail_net" in tmp:
-                            _smart_sleep(random.uniform(2.0, 5.0))
-                            continue
-
-                        ek_model_name = str(tmp.get("W") or cand_title).strip()
-                        if not ek_model_name:
-                            _smart_sleep(random.uniform(2.0, 5.0))
-                            continue
-
-                        _ek_date_raw = str(tmp.get("Y") or "")
-                        _ek_year, _ek_month = _parse_ek_date_added(_ek_date_raw)
-                        ek_specs = {
-                            "date_added": _ek_date_raw,
-                            "date_added_year": _ek_year,
-                            "date_added_month": _ek_month,
-                            "dimensions": str(tmp.get("Z") or ""),
-                            "length": str(tmp.get("AA") or ""),
-                            "width": str(tmp.get("AB") or ""),
-                            "thickness": str(tmp.get("AC") or ""),
-                            "weight": str(tmp.get("AD") or ""),
-                            "display": str(tmp.get("AE") or ""),
-                            "os": str(tmp.get("AF") or ""),
-                            "cpu": str(tmp.get("AG") or ""),
-                            "memory": str(tmp.get("AH") or ""),
-                            "battery": str(tmp.get("AI") or ""),
-                            "status": str(tmp.get("AJ") or ""),
-                            "price_low": str(tmp.get("AK") or ""),
-                            "price_min": str(tmp.get("AL") or ""),
-                            "price_max": str(tmp.get("AM") or ""),
-                            "ek_url": link,
-                            "shops_count": str(tmp.get("AK") or ""),
-                            "variations": {
-                                "AP": str(tmp.get("AP") or ""),
-                                "AQ": str(tmp.get("AQ") or ""),
-                                "AR": str(tmp.get("AR") or ""),
-                                "AS": str(tmp.get("AS") or ""),
-                                "AT": str(tmp.get("AT") or ""),
-                            },
-                        }
-                        ek_payload = {
-                            "source": SOURCE_EK,
-                            "brand": bname,
-                            "device_type": dtype,
-                            "model_name": ek_model_name,
-                            "model_key": _normalize_model_name(ek_model_name, rules),
-                            "source_url": link,
-                            "image_url": str(tmp.get("PHOTO_MAIN") or ""),
-                            "specs": ek_specs,
-                        }
-
-                        ok, dev_id, ch, ev_status, ev_extra_status = _upsert_device(
-                            db, ek_payload, shops_appeared_max_age_months,
-                            ek_on_sale_status_prefixes,
+                        (
+                            ok, msg_or_name, dev_id, ch, ev_status
+                        ) = fetch_and_add_manual_ek_device(
+                            db, bname, dtype, link,
+                            shops_appeared_max_age_months, ek_on_sale_status_prefixes,
                         )
                         if ok:
                             stats["ek_written"] += 1
-                            stats["changed"] += int(ch)
-                            _record_daily_history(db, dev_id, SOURCE_EK, ek_specs)
-                            if ev_status in {"new", "updated"}:
-                                with contextlib.suppress(Exception):
-                                    _save_ek_primary_photos(
-                                        legacy_ek, db, dev_id, tmp
-                                    )
+                            stats["changed"] += ch
                             ek_st_label = {
                                 "new": "НОВИЙ (без GSM)",
                                 "updated": "оновлено (без GSM)",
@@ -3092,25 +3334,39 @@ def run_gsm_parser(
                                 "seen": "без змін",
                             }.get(ev_status, ev_status)
                             _log(
-                                f"[2/2] ЄК ► [{bname}] {ek_model_name}"
-                                f" (без GSM, {ek_idx}/{len(leftover_candidates)})"
+                                f"[2/2] ЄК ► [{bname}] {msg_or_name}"
+                                f" (ручне посилання, {ek_idx}/{len(manual_links)})"
                                 f" — {ek_st_label} | всього ЄК: {stats['ek_written']}"
                             )
                             if ev_status in {"new", "updated", "shops_appeared"}:
+                                # Re-read the just-written row so the Telegram
+                                # card gets full specs/photo (image_url, dims,
+                                # price, status) — fetch_and_add_manual_ek_device
+                                # only returns the bare essentials, matching
+                                # fetch_and_apply_manual_ek_url's contract.
+                                _saved_row = db.get_gsm_device_by_id(dev_id) or {}
                                 events.append(
                                     {
                                         "source": SOURCE_EK,
                                         "status": ev_status,
-                                        "changes": int(ch),
+                                        "changes": ch,
                                         "device_id": dev_id,
-                                        "payload": ek_payload,
+                                        "payload": {
+                                            "source": SOURCE_EK,
+                                            "brand": bname,
+                                            "device_type": dtype,
+                                            "model_name": msg_or_name,
+                                            "source_url": link,
+                                            "image_url": str(_saved_row.get("image_url") or ""),
+                                            "specs": _saved_row.get("specs") or {},
+                                        },
                                     }
                                 )
                         else:
                             stats["errors"] += 1
                             _log(
-                                f"[2/2] ЄК ► [{bname}] {ek_model_name}"
-                                f" (без GSM) — помилка запису в БД"
+                                f"[2/2] ЄК ► [{bname}] Ручне посилання"
+                                f" ({ek_idx}/{len(manual_links)}) — {msg_or_name}"
                             )
 
                         _smart_sleep(random.uniform(2.0, 5.0))

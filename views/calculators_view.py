@@ -10,6 +10,7 @@ import contextlib
 import json
 import math
 import re
+import sys
 import threading
 import time
 import urllib.request
@@ -33,32 +34,159 @@ _SOFT = "#F1F5F9"
 _DARK = "#1E293B"
 _ALT = "#F8FAFC"
 
+# Set once (True) by calculator_web_app.py's main() — the standalone
+# GitHub Pages web build. There, every dialog's top-right "X" is
+# meaningless (there's nothing behind it to return to; on web it just left
+# a blank screen) and gets replaced with a refresh action instead — see
+# _close_or_refresh_btn. The desktop app (dashboard.py) and the Windows
+# calculator_app.py installer never call set_web_standalone_mode, so this
+# stays False for them and the X keeps closing the dialog as before.
+_WEB_STANDALONE_MODE = False
+
+
+def set_web_standalone_mode(value: bool = True) -> None:
+    global _WEB_STANDALONE_MODE
+    _WEB_STANDALONE_MODE = bool(value)
+
+
+def _close_or_refresh_btn(page, _close, icon_size: int = 16) -> ft.IconButton:
+    """Top-right dialog button: closes the dialog (desktop/embedded), or —
+    in the standalone web build — hard-reloads the page instead, since
+    there's no underlying screen to reveal by closing. The reload bypasses
+    the browser cache (cache-busting query param) so a freshly published
+    build is always picked up, and never re-shows the password gate: see
+    calculator_web_app.py's _startup, which checks a persisted
+    shared_preferences flag before deciding whether to show it."""
+    if not _WEB_STANDALONE_MODE:
+        return ft.IconButton(ft.Icons.CLOSE, on_click=_close, icon_size=icon_size)
+
+    async def _hard_reload(_e=None):
+        base = str(page.url or "").split("?", 1)[0].split("#", 1)[0]
+        target = f"{base}?_r={int(time.time())}"
+        with contextlib.suppress(Exception):
+            await page.launch_url(target, web_popup_window_name=ft.UrlTarget.SELF)
+
+    return ft.IconButton(
+        ft.Icons.REFRESH,
+        tooltip="Оновити сторінку",
+        on_click=_hard_reload,
+        icon_size=icon_size,
+    )
+
+
 _CALC_TYPES = [
     ("basic", "Звичайний"),
     ("cost", "Собівартість"),
+    ("cost_clo", "С/В з митом"),
     ("profit", "Рентабельність"),
     ("turnover", "Оборот / Забезп."),
 ]
 _CALC_LABELS = dict(_CALC_TYPES)
+
+# Same keys as open_calculators_modal's own icon-grid labels below (reused
+# here for the save-name default and the "Збережені" list/filter, so every
+# place a calc type's short name shows up translates from one single key
+# per type instead of drifting apart into near-duplicates).
+_CALC_LABEL_I18N_KEYS: dict[str, tuple[str, str]] = {
+    "basic": ("calc.type.basic", "Звичайний"),
+    "cost": ("calc.type.cost", "Собівартість"),
+    "cost_clo": ("calc.type.cost_clo", "С/В з митом"),
+    "profit": ("calc.type.profit", "Рентабельність"),
+    "turnover": ("calc.type.turnover", "Оборот / Забезп."),
+}
+
+
+def _calc_type_label(t, calc_type: str) -> str:
+    ikey, ua = _CALC_LABEL_I18N_KEYS.get(
+        calc_type, (f"calc.{calc_type}.title", _CALC_LABELS.get(calc_type, calc_type))
+    )
+    return t(ikey, ua)
+
+def _run_in_background(fn) -> None:
+    """threading.Thread(...).start() everywhere except the browser (this
+    module is also used by calculator_web_app.py's Flet/Pyodide build,
+    which runs Python single-threaded — real OS thread creation isn't
+    available there and raises "can't start new thread"). Falls back to
+    just calling fn() synchronously in that case: slower for that one
+    call (blocks until it returns instead of running in the background),
+    but the app keeps working instead of crashing outright."""
+    try:
+        threading.Thread(target=fn, daemon=True).start()
+    except Exception:
+        fn()
+
 
 # ── FX cache ───────────────────────────────────────────────────────────────
 _FX_CACHE: dict = {"ts": 0.0, "rates": {}}
 _FX_REFRESH_IN_FLIGHT = False
 _FX_LAST_ERRORS: list[str] = []
 
+# Pyodide (the in-browser Python runtime calculator_web_app.py runs under)
+# has no raw sockets, so urllib.request.urlopen raises "URLError: unknown
+# url type: https" for every real request — confirmed live in the web
+# build. sys.platform == "emscripten" is the standard way to detect it.
+_IS_PYODIDE = sys.platform == "emscripten"
 
-def _fetch_uah_rates() -> dict:
+_NBU_URL = "https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?json"
+_ER_API_URL = "https://open.er-api.com/v6/latest/UAH"
+_FAWAZAHMED0_URL = (
+    "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/"
+    "v1/currencies/uah.json"
+)
+
+
+def _parse_nbu(data) -> dict:
+    if not isinstance(data, list):
+        return {}
+    out: dict = {"UAH": 1.0}
+    for row in data:
+        cc = str(row.get("cc") or "").upper().strip()
+        rate = row.get("rate")
+        unit = float(row.get("unit") or 1) or 1
+        if cc and rate:
+            out[cc] = float(rate) / unit
+    return out
+
+
+def _parse_uah_rates_map(raw, key: str) -> dict:
+    """Shared parser for open.er-api.com and fawazahmed0 — both return
+    {key: {"USD": 0.024, ...}} (UAH per unit foreign), inverted here to the
+    same "units of CCY per 1 UAH" shape _parse_nbu already produces."""
+    rts = (raw or {}).get(key) if isinstance(raw, dict) else {}
+    out: dict = {"UAH": 1.0}
+    for cc, v in (rts or {}).items():
+        cc_u = str(cc).upper().strip()
+        fv = float(v) if v else 0
+        if cc_u and cc_u != "UAH" and fv > 0:
+            out[cc_u] = 1.0 / fv
+    return out
+
+
+_FX_SOURCES = (
+    (_NBU_URL, _parse_nbu),
+    (_ER_API_URL, lambda raw: _parse_uah_rates_map(raw, "rates")),
+    (_FAWAZAHMED0_URL, lambda raw: _parse_uah_rates_map(raw, "uah")),
+)
+
+
+def _fetch_uah_rates(page=None) -> dict:
     """Cache-only read — NEVER performs blocking network I/O on the calling
-    thread. If the cache is missing/stale, a background daemon thread is
-    kicked off to refresh it (see `_refresh_uah_rates_background`) and the
-    best data available right now is returned immediately.
+    thread. If the cache is missing/stale, a background refresh is kicked
+    off (a daemon thread on desktop, an async page task in the browser —
+    see `_refresh_uah_rates_background`/`_refresh_uah_rates_async_pyodide`)
+    and the best data available right now is returned immediately.
 
     Why: this used to fetch NBU/er-api rates INLINE (up to ~12s worst case:
     two sequential 6s-timeout requests) whenever the cache expired. Both
     callers (`_open_cost`, `_open_profit`) run synchronously in the click
     handler that opens the calculator dialog, so that inline fetch froze the
     whole app for however long the HTTP calls took — every time a user
-    opened "Собівартість"/"Рентабельність" with a cold cache."""
+    opened "Собівартість"/"Рентабельність" with a cold cache.
+
+    page is optional (existing desktop call sites that don't pass it keep
+    working) but required to actually refresh on the web build — Pyodide
+    has no threads, so without a page to schedule the async fetch on, a
+    stale/empty web cache just stays stale."""
     global _FX_CACHE, _FX_REFRESH_IN_FLIGHT
     now = time.time()
     ts = float(_FX_CACHE.get("ts") or 0)
@@ -66,7 +194,13 @@ def _fetch_uah_rates() -> dict:
     is_fresh = ts > 0 and (now - ts) < (900 if rates else 120)
     if not is_fresh and not _FX_REFRESH_IN_FLIGHT:
         _FX_REFRESH_IN_FLIGHT = True
-        threading.Thread(target=_refresh_uah_rates_background, daemon=True).start()
+        if _IS_PYODIDE and page is not None:
+            with contextlib.suppress(Exception):
+                page.run_task(_refresh_uah_rates_async_pyodide)
+        elif not _IS_PYODIDE:
+            _run_in_background(_refresh_uah_rates_background)
+        else:
+            _FX_REFRESH_IN_FLIGHT = False
     return rates
 
 
@@ -81,68 +215,99 @@ def _refresh_uah_rates_background() -> None:
 
 
 def _fetch_uah_rates_blocking() -> dict:
-    """Actual network fetch. Blocking — only ever call from a background
-    thread (see `_refresh_uah_rates_background`), never from the UI thread."""
+    """Actual network fetch via urllib — desktop only (real sockets
+    required). Blocking — only ever call from a background thread (see
+    `_refresh_uah_rates_background`), never from the UI thread."""
 
     def _get(url: str):
         with urllib.request.urlopen(url, timeout=6) as r:
             return json.loads(r.read().decode())
 
-    def _nbu() -> dict:
-        data = _get("https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?json")
-        if not isinstance(data, list):
-            return {}
-        out: dict = {"UAH": 1.0}
-        for row in data:
-            cc = str(row.get("cc") or "").upper().strip()
-            rate = row.get("rate")
-            unit = float(row.get("unit") or 1) or 1
-            if cc and rate:
-                out[cc] = float(rate) / unit
-        return out
+    return _try_fx_sources_sync(_get)
 
-    def _er_api() -> dict:
-        raw = _get("https://open.er-api.com/v6/latest/UAH")
-        rts = (raw or {}).get("rates") if isinstance(raw, dict) else {}
-        out: dict = {"UAH": 1.0}
-        for cc, v in (rts or {}).items():
-            cc_u = str(cc).upper().strip()
-            fv = float(v) if v else 0
-            if cc_u and cc_u != "UAH" and fv > 0:
-                out[cc_u] = 1.0 / fv
-        return out
 
-    def _fawazahmed0() -> dict:
-        # Free, keyless, CDN-hosted currency API — third independent fallback
-        # in case both NBU and open.er-api.com are unreachable (corporate
-        # firewall, ISP block, etc).
-        raw = _get(
-            "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/"
-            "v1/currencies/uah.json"
-        )
-        rts = (raw or {}).get("uah") if isinstance(raw, dict) else {}
-        out: dict = {"UAH": 1.0}
-        for cc, v in (rts or {}).items():
-            cc_u = str(cc).upper().strip()
-            fv = float(v) if v else 0
-            if cc_u and cc_u != "UAH" and fv > 0:
-                out[cc_u] = 1.0 / fv
-        return out
+async def _refresh_uah_rates_async_pyodide() -> None:
+    global _FX_CACHE, _FX_REFRESH_IN_FLIGHT
+    try:
+        fresh = await _fetch_uah_rates_async_pyodide()
+        if fresh:
+            _FX_CACHE = {"ts": time.time(), "rates": fresh}
+    finally:
+        _FX_REFRESH_IN_FLIGHT = False
 
+
+async def _fetch_uah_rates_async_pyodide() -> dict:
+    """Browser equivalent of `_fetch_uah_rates_blocking` — uses
+    pyodide.http.pyfetch (wraps the browser's own fetch API) instead of
+    urllib, since urllib can't open real sockets in the Pyodide sandbox.
+    Import is local so the desktop build never needs the pyodide package."""
+    from pyodide.http import pyfetch
+
+    async def _get(url: str):
+        resp = await pyfetch(url, method="GET")
+        return await resp.json()
+
+    return await _try_fx_sources_async(_get)
+
+
+def _fx_source_error(exc_or_none, name: str, result: dict) -> str | None:
+    if exc_or_none is not None:
+        exc = exc_or_none
+        return f"{name}: {type(exc).__name__}: {exc}"
+    if not result:
+        return f"{name}: порожня відповідь"
+    return None
+
+
+def _try_fx_sources_sync(get_fn) -> dict:
+    """Try each FX source in order (see `_FX_SOURCES`) using a plain sync
+    callable(url) -> parsed JSON. Desktop/urllib path — see
+    `_try_fx_sources_async` for the Pyodide/pyfetch equivalent (kept as a
+    separate function since an async def always returns a coroutine, even
+    when its body happens not to await anything on a given call — it can't
+    double as a sync callable)."""
     global _FX_LAST_ERRORS
     errors: list[str] = []
     result: dict = {}
-    for fn in (_nbu, _er_api, _fawazahmed0):
+    for url, parser in _FX_SOURCES:
+        name = url.split("/")[2]
         try:
-            result = fn() or {}
-            if result.get("USD") and result.get("UAH"):
-                _FX_LAST_ERRORS = []
-                return result
+            result = parser(get_fn(url)) or {}
         except Exception as exc:
-            errors.append(f"{fn.__name__}: {type(exc).__name__}: {exc}")
-        else:
-            if not result:
-                errors.append(f"{fn.__name__}: порожня відповідь")
+            errors.append(_fx_source_error(exc, name, result))
+            continue
+        if result.get("USD") and result.get("UAH"):
+            _FX_LAST_ERRORS = []
+            return result
+        err = _fx_source_error(None, name, result)
+        if err:
+            errors.append(err)
+
+    _FX_LAST_ERRORS = errors
+    if errors:
+        logger.warning("[calc] fx rate fetch failed for all sources: %s", "; ".join(errors))
+    return result
+
+
+async def _try_fx_sources_async(get_fn) -> dict:
+    """Async twin of `_try_fx_sources_sync` for the Pyodide/pyfetch path —
+    get_fn is an async callable(url) -> parsed JSON."""
+    global _FX_LAST_ERRORS
+    errors: list[str] = []
+    result: dict = {}
+    for url, parser in _FX_SOURCES:
+        name = url.split("/")[2]
+        try:
+            result = parser(await get_fn(url)) or {}
+        except Exception as exc:
+            errors.append(_fx_source_error(exc, name, result))
+            continue
+        if result.get("USD") and result.get("UAH"):
+            _FX_LAST_ERRORS = []
+            return result
+        err = _fx_source_error(None, name, result)
+        if err:
+            errors.append(err)
 
     _FX_LAST_ERRORS = errors
     if errors:
@@ -247,15 +412,25 @@ def _delete_calc_entry(db, manager_id: str, entry_id: str) -> None:
     )
 
 
+def _rename_calc_entry(db, manager_id: str, entry_id: str, new_name: str) -> None:
+    saved = _load_saved(db, manager_id)
+    for s in saved:
+        if str(s.get("id") or "") == entry_id:
+            s["name"] = new_name
+            break
+    _persist_saved(db, manager_id, saved)
+
+
 def _show_save_dialog(page, db, manager_id: str, calc_type: str, data: dict):
     _t = i18n.bind(str(manager_id or ""))
+    _ACTIVE_MANAGER_ID[0] = str(manager_id or "")
     name_f = ft.TextField(
         label=_t("calc.save_dlg.name_label", "Назва розрахунку"), width=300, border_radius=8, autofocus=True
     )
     sdlg = ft.AlertDialog(modal=True)
 
     def _do(_e=None):
-        nm = str(name_f.value or "").strip() or _CALC_LABELS.get(calc_type, calc_type)
+        nm = str(name_f.value or "").strip() or _calc_type_label(_t, calc_type)
         _save_calc_entry(db, manager_id, calc_type, nm, data)
         with contextlib.suppress(Exception):
             page.pop_dialog()
@@ -268,7 +443,8 @@ def _show_save_dialog(page, db, manager_id: str, calc_type: str, data: dict):
         ])
 
     sdlg.title = ft.Row([
-        ft.Text(_t("calc.save_dlg.title", "Зберегти розрахунок"), weight="bold", expand=True),
+        ft.Text(_t("calc.save_dlg.title", "Зберегти розрахунок"), weight="bold", expand=True,
+                no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
         ft.IconButton(icon=ft.Icons.HELP_OUTLINE, icon_size=16, tooltip=_t("common.help.tooltip", "Довідка"), on_click=_save_dlg_help),
     ], vertical_alignment=ft.CrossAxisAlignment.CENTER, tight=True)
     sdlg.content = ft.Container(width=320, padding=16, content=name_f)
@@ -278,14 +454,23 @@ def _show_save_dialog(page, db, manager_id: str, calc_type: str, data: dict):
     ]
     sdlg.actions_alignment = ft.MainAxisAlignment.END
     name_f.on_submit = _do
-    page.open(sdlg)
+    page.show_dialog(sdlg)
 
 
 # ── Shared widgets ─────────────────────────────────────────────────────────
+# Set to the manager_id of whichever calculator panel is currently being
+# built (each _open_*/_build_*_panel sets this right after binding its own
+# _t), so these two generic helpers can translate their small bits of
+# boilerplate text without threading a `t` callable through every one of
+# their ~40 call sites across the file.
+_ACTIVE_MANAGER_ID: list[str] = [""]
+
+
 def _field(
     label: str, width=180, value="", number=True, optional=False
 ) -> ft.TextField:
-    lbl = label + (" (необ.)" if optional else "")
+    _t = i18n.bind(_ACTIVE_MANAGER_ID[0])
+    lbl = label + (" " + _t("calc.field.optional_suffix", "(необ.)") if optional else "")
     return ft.TextField(
         label=lbl,
         value=str(value) if value else "",
@@ -301,7 +486,8 @@ def _field(
 def _dd(
     label: str, opts: list[tuple[str, str]], value: str = "", width=180
 ) -> ft.Dropdown:
-    options = [ft.dropdown.Option(key="", text="— оберіть —")] + [
+    _t = i18n.bind(_ACTIVE_MANAGER_ID[0])
+    options = [ft.dropdown.Option(key="", text=_t("calc.field.choose_placeholder", "— оберіть —"))] + [
         ft.dropdown.Option(key=k, text=v) for k, v in opts
     ]
     return ft.Dropdown(
@@ -354,6 +540,19 @@ class _FloatDialog:
     works on the main page. Drag it by the title bar.
     """
 
+    # Class-level (not per-instance) — calculator_app.py/calculator_web_app.py's
+    # _install_fullscreen_dialogs() flips this to True once at process
+    # startup, before any dialog exists. _resize_holder() (below, in
+    # _run_multi_panel_calculator) reads it to decide whether to cap
+    # row_holder's width to the available window width (CatMan Pro's
+    # draggable dialog — no outer scroll wrapper, still needs the cap +
+    # panels_row's own internal scroll to reach overflow) or let it size
+    # naturally (the fullscreen apps' own _open override wraps everything
+    # in its own outer horizontal+vertical scroll, making an inner cap
+    # redundant — and worse, WRONG, since it's computed once and goes
+    # stale after the window/zoom later changes).
+    _is_fullscreen_build: bool = False
+
     def __init__(self):
         self.title = None
         self.content = None
@@ -363,6 +562,13 @@ class _FloatDialog:
         # Set to the exact outer pixel width of dlg.content so the title bar
         # can be stretched to the same width and expand=True on the title text works.
         self.panel_width: int | None = None
+        # Only meaningful for the portable app's fullscreen _open override
+        # (see calculator_app.py._install_fullscreen_dialogs) — the picker
+        # is a small fixed-size grid of buttons, not a form meant to fill
+        # the window, so it should sit centered in the available space
+        # instead of pinned to the top-left corner like the calculator
+        # forms (which deliberately DO fill available width/height).
+        self.center_content: bool = False
 
     def _open(self, page) -> None:
         _x = 24.0
@@ -404,7 +610,37 @@ class _FloatDialog:
 
         body: list = [title_bar]
         if self.content is not None:
-            body.append(self.content)
+            if getattr(self, "center_content", False):
+                # Small, never-overflowing content (the picker) — left as-is,
+                # no height cap/scroll needed.
+                body.append(self.content)
+            else:
+                # Cap content height to fit within the CatMan Pro window and
+                # let it scroll internally instead of silently growing past
+                # the visible area — this modal floats via page.overlay at a
+                # fixed (left, top) position with NO height constraint of
+                # its own, so a tall calculator form (many delivery methods,
+                # price tiers, etc.) could extend below the bottom of the
+                # window with no way to reach the rest of it. CatMan Pro's
+                # own Ctrl+/- shortcut resizes the whole APP WINDOW, not
+                # this floating panel, so it doesn't help here either.
+                avail_h = 800.0
+                with contextlib.suppress(Exception):
+                    avail_h = float(
+                        getattr(page, "height", None)
+                        or getattr(page.window, "height", None)
+                        or 800.0
+                    )
+                content_max_h = max(300.0, avail_h - _y - 130.0)
+                body.append(
+                    ft.Container(
+                        content=ft.Column(
+                            [self.content],
+                            scroll=ft.ScrollMode.AUTO,
+                        ),
+                        height=content_max_h,
+                    )
+                )
         if self.actions:
             body.append(
                 ft.Container(
@@ -501,6 +737,8 @@ def _rate_texts(
 # ── 1. Звичайний ──────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 def _open_basic(page, db, manager_id: str, back_fn=None):
+    _t = i18n.bind(str(manager_id or ""))
+    _ACTIVE_MANAGER_ID[0] = str(manager_id or "")
     dlg = _FloatDialog()
     expr_text = ft.Text(
         "", size=11, color=_MUTED, text_align=ft.TextAlign.RIGHT, selectable=True
@@ -517,7 +755,7 @@ def _open_basic(page, db, manager_id: str, back_fn=None):
         width=8, height=8,
         bgcolor="#94A3B8",
         border_radius=4,
-        tooltip="Клацніть кнопку калькулятора щоб активувати клавіатуру",
+        tooltip=_t("calc.basic.kb_hint", "Клацніть кнопку калькулятора щоб активувати клавіатуру"),
     )
 
     def _set_kb_active(val: bool):
@@ -561,7 +799,12 @@ def _open_basic(page, db, manager_id: str, back_fn=None):
 
     def _close(_=None):
         with contextlib.suppress(Exception):
-            page.on_keyboard_event = None
+            # Restore the exe's Ctrl+Plus/Minus zoom handler (if any — only
+            # set there, never on CatMan Pro's page) instead of just wiping
+            # the slot to None, so zoom keeps working for whatever
+            # calculator gets opened next.
+            _zoom_check = getattr(page, "_catman_zoom_check", None)
+            page.on_keyboard_event = _zoom_check
         with contextlib.suppress(Exception):
             _fdlg_close(page, dlg)
 
@@ -574,7 +817,7 @@ def _open_basic(page, db, manager_id: str, back_fn=None):
 
     def _refresh():
         if state["error"]:
-            val_text.value = "Помилка"
+            val_text.value = _t("calc.basic.error", "Помилка")
             expr_text.value = state["expr"]
         elif state["eq"]:
             r = state["result"]
@@ -678,6 +921,11 @@ def _open_basic(page, db, manager_id: str, back_fn=None):
     }
 
     def _on_key(e: ft.KeyboardEvent):
+        # Only set on the exe's page (see calculator_app.py's main()) —
+        # None/no-op everywhere else, including CatMan Pro.
+        _zoom_check = getattr(page, "_catman_zoom_check", None)
+        if _zoom_check and _zoom_check(e):
+            return
         if not _kb_active[0]:
             return
         token = _KEY_MAP.get(e.key)
@@ -742,19 +990,28 @@ def _open_basic(page, db, manager_id: str, back_fn=None):
             page, db, manager_id, "basic", {"expr": state["expr"], "result": raw}
         )
 
+    def _on_lang_select(code: str) -> None:
+        # No prefill support on Basic (it's a scratch calculator, not
+        # comparison panels) — reopening just clears the display, same as
+        # closing and reopening it manually would.
+        i18n.save_manager_language(db, str(manager_id or ""), code)
+        _close()
+        _open_basic(page, db, manager_id, back_fn=back_fn)
+
     dlg.title = ft.Row(
         [
-            ft.Text("Звичайний", weight="bold", size=12, expand=True,
+            ft.Text(_t("calc.basic.title", "Звичайний"), weight="bold", size=12, expand=True,
                     no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
             _kb_dot,
-            ft.IconButton(ft.Icons.BOOKMARK_ADD_OUTLINED, tooltip="Зберегти",
+            i18n.build_language_switcher(db, _on_lang_select, manager_id=str(manager_id or "")),
+            ft.IconButton(ft.Icons.BOOKMARK_ADD_OUTLINED, tooltip=_t("common.save", "Зберегти"),
                           on_click=_do_save, icon_size=18),
             *(
-                [ft.IconButton(ft.Icons.ARROW_BACK, tooltip="Назад",
+                [ft.IconButton(ft.Icons.ARROW_BACK, tooltip=_t("common.back", "Назад"),
                                on_click=_go_back, icon_size=16)]
                 if back_fn else []
             ),
-            ft.IconButton(ft.Icons.CLOSE, on_click=_close, icon_size=16),
+            _close_or_refresh_btn(page, _close, icon_size=16),
         ]
     )
     _PW = _GRID_W + 32  # 268
@@ -788,10 +1045,10 @@ _C_BG    = "#F8FAFC"
 _C_BG2   = "#EFF6FF"
 _C_CARD  = "#FFFFFF"
 
-_LEFT_W   = 290   # left panel container width
-_INP_W    = 274   # inputs column width
-_RIGHT_W  = 330   # right panel container width
-_RES_W    = 314   # results column width
+_LEFT_W   = 246   # left panel container width (-15%, so 3 comparison panels fit the window width)
+_INP_W    = 233   # inputs column width (-15%)
+_RIGHT_W  = 280   # right panel container width (-15%)
+_RES_W    = 267   # results column width (-15%)
 _PANEL_H  = 520   # panel height
 
 
@@ -809,23 +1066,91 @@ def _cost_row(label: str, value: str, color: str = _DARK,
     )
 
 
+# Soft, semi-transparent grey (not the solid _BORDER) — specifically for the
+# row/column rule lines inside the inline %-breakdown rows in _cost_card;
+# left slightly wider (1.4 vs the plain 1px dividers elsewhere) since a
+# fully-opaque grey at that width read as "dark" against the card's white
+# background.
+_LINE_SOFT = ft.Colors.with_opacity(0.30, "#000000")
+
+
 def _cost_card(
     method_name: str,
-    rows: list,           # list of (label, value, color, bold)
+    rows: list,  # list of (label, value, color, bold, pct) — pct is the row's
+                 # % share of the card's final total, or None for rows that
+                 # shouldn't show one (the final total itself, "Ціна при
+                 # рент.", price-tier margin rows).
     *,
     highlight: bool = False,
 ) -> ft.Container:
-    row_widgets = [
-        ft.Row(
-            [
-                ft.Text(lbl, size=11, color=_MUTED, expand=True),
-                ft.Text(val, size=11, color=clr,
-                        weight=ft.FontWeight.W_700 if bld else None),
-            ],
-            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+    # All sizes/widths in this function are -15% vs. their original values,
+    # matching the same reduction applied to _LEFT_W/_RIGHT_W — so 3
+    # comparison panels fit side-by-side in the window instead of
+    # overflowing into horizontal scroll.
+    row_widgets = []
+    for lbl, val, clr, bld, pct in rows:
+        if pct is None:
+            if val.endswith("%"):
+                # Price-tier margin rows (B2B/Vip/Dealer/...) — their value
+                # IS a percentage. Badged too, like the cost-share %s, but
+                # plain light-grey/black — not the semantic green/amber/red
+                # (_C_OK/_C_WARN/_C_ERR) it used to be, since that green
+                # kept reading as the same green as the bold "Собівартість
+                # з митом:" total right above it.
+                value_text = ft.Container(
+                    ft.Text(val, size=9, color=_DARK, weight=ft.FontWeight.W_700),
+                    bgcolor=_SOFT,
+                    border_radius=5,
+                    padding=ft.padding.symmetric(horizontal=6, vertical=2),
+                    alignment=ft.Alignment(0, 0),
+                )
+            else:
+                value_text = ft.Text(val, size=9, color=clr, weight=ft.FontWeight.W_700 if bld else None)
+            row_widgets.append(
+                ft.Row(
+                    [ft.Text(lbl, size=9, color=_MUTED, expand=True), value_text],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                )
+            )
+            continue
+        # Rows that carry a %-share use the per-row `clr` — each
+        # semantically distinct row (a plain cost component vs. the duty
+        # amount vs. the pre-duty subtotal) gets its OWN fixed color so
+        # they read as different things at a glance (see call sites for
+        # which color means what). `bld` marks "highlight" rows (duty,
+        # subtotal) — bigger/bold/colored — vs. plain leaf cost rows,
+        # which stay small neutral dark. The % is a solid-background badge
+        # (not just colored text) so it never reads as "another number"
+        # sitting next to the price.
+        value_text = ft.Text(
+            val, size=11 if bld else 10,
+            color=clr if bld else _DARK,
+            weight=ft.FontWeight.W_700 if bld else ft.FontWeight.W_500,
         )
-        for lbl, val, clr, bld in rows
-    ]
+        pct_badge = ft.Container(
+            ft.Text(f"{pct:.1f}%", size=9, color=ft.Colors.WHITE, weight=ft.FontWeight.W_700),
+            bgcolor=_MUTED,
+            border_radius=5,
+            padding=ft.padding.symmetric(horizontal=6, vertical=2),
+            width=46,
+            alignment=ft.Alignment(0, 0),
+        )
+        row_widgets.append(
+            ft.Container(
+                content=ft.Row(
+                    [
+                        ft.Text(lbl, size=9, color=_MUTED, expand=True),
+                        ft.Container(value_text, width=77, alignment=ft.Alignment(1, 0)),
+                        pct_badge,
+                    ],
+                    spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                padding=ft.padding.only(bottom=6, top=3),
+                border=ft.border.only(bottom=ft.BorderSide(1.2, _LINE_SOFT)),
+            )
+        )
+
     return ft.Container(
         bgcolor=_C_BG2 if highlight else _C_CARD,
         border=ft.border.all(2 if highlight else 1, _C_BLUE if highlight else _BORDER),
@@ -843,16 +1168,277 @@ def _cost_card(
     )
 
 
-def _open_cost(
+_MAX_COMPARE_PANELS = 5
+
+
+def _run_multi_panel_calculator(
     page,
     db,
     manager_id: str,
-    company_id: str,
-    region_id: str,
-    regions_list: list[str],
-    prefill: dict | None = None,
+    calc_type: str,
+    title: str,
+    prefill,
+    panel_factory,
+    single_panel_width: int,
     back_fn=None,
+    help_fn=None,
+    reopen_fn=None,
 ):
+    """Shared host for calculators that support side-by-side comparison
+    panels (everything except Звичайний). Renders 1..5 panel_factory()
+    instances in a horizontally-scrollable row so you can tweak just the
+    1-2 fields that differ between scenarios and compare results at a
+    glance — "+" duplicates the LAST panel's current INPUT VALUES (never
+    its computed result; press "Розрахувати" again in the new panel) into
+    a fresh one; "Зберегти" stores every visible panel's data as one
+    {"panels": [...]} entry so reopening it recreates the whole comparison
+    set at once, in the same order.
+
+    panel_factory(prefill: dict, on_remove: Callable|None) -> (container,
+    get_data): builds ONE independent panel (its own widgets/local state —
+    calling panel_factory again produces a fully separate instance) and
+    returns its root control plus a zero-arg callable returning that
+    panel's current input values as a plain dict (never including computed
+    results — those are recomputed fresh in whichever panel the user
+    presses "Розрахувати" in). on_remove is a no-arg callback the panel may
+    wire to its own small "×" (only meaningful/shown when there's more
+    than one panel — the host calls this per-panel, see _add_panel below).
+
+    prefill accepts either the new multi-panel shape ({"panels": [dict,
+    ...]}) or a bare single-calculator dict (every save made before this
+    feature existed) — both normalize to a list of per-panel prefills
+    here, so old saved calculations keep opening exactly as before."""
+    global _PANEL_H
+    _t = i18n.bind(str(manager_id or ""))
+    _ACTIVE_MANAGER_ID[0] = str(manager_id or "")
+    # Kick off the FX-rate background refresh (see _fetch_uah_rates) the
+    # instant the calculator opens, not on the first "Розрахувати" click —
+    # so the cache is already warm by the time the user finishes typing.
+    _fetch_uah_rates(page)
+
+    # Same idea as the width fix below: _PANEL_H used to be a fixed 520px
+    # regardless of window size, leaving a large dead strip under the
+    # dialog on any reasonably tall window (e.g. rows of delivery methods
+    # get their own internal scroll well before they need to). Every
+    # _build_*_panel function reads this same module-level constant at
+    # build time, so setting it once here — before any panel is actually
+    # built below — makes every panel in THIS dialog use the current
+    # window's real height instead.
+    with contextlib.suppress(Exception):
+        win_h = 0
+        with contextlib.suppress(Exception):
+            win_h = int(getattr(page, "height", None) or 0)
+        if not win_h:
+            win_h = int(page.window.height or 0)
+        if win_h:
+            # ~200px reserved for the dialog's own title bar + top/bottom
+            # padding + the app's own header chrome above the dialog.
+            _PANEL_H = max(400, win_h - 200)
+
+    if (
+        isinstance(prefill, dict)
+        and isinstance(prefill.get("panels"), list)
+        and prefill["panels"]
+    ):
+        prefill_list = [p for p in prefill["panels"] if isinstance(p, dict)] or [{}]
+    else:
+        prefill_list = [prefill if isinstance(prefill, dict) else {}]
+    prefill_list = prefill_list[:_MAX_COMPARE_PANELS]
+
+    panels: list[dict] = []
+    panels_row = ft.Row(
+        [], spacing=14, scroll=ft.ScrollMode.AUTO,
+        vertical_alignment=ft.CrossAxisAlignment.START, tight=True,
+    )
+    row_holder = ft.Container(content=panels_row, clip_behavior=ft.ClipBehavior.HARD_EDGE)
+    add_btn_ref: list = [None]
+    # Created here (not further down, next to _close/_go_back/dlg.title as
+    # before) — _resize_holder needs to set dlg.panel_width, and it already
+    # runs once per panel during the prefill loop below, before those other
+    # dlg-using closures are ever actually CALLED (only defined).
+    dlg = _FloatDialog()
+
+    def _available_width() -> int:
+        # page.width mirrors the ACTUAL rendered viewport (matches how
+        # dashboard.py's own _zoom_page_dims picks a width — page.width
+        # first, page.window.width only as a fallback). page.window.width
+        # is the raw OS window descriptor, which does not reliably reflect
+        # a MAXIMIZED window's true size on this Flet version — using it as
+        # primary is what left the dialog sized for a small/default window
+        # even when the app was actually maximized full-screen.
+        candidates = []
+        with contextlib.suppress(Exception):
+            candidates.append(int(getattr(page, "width", None) or 0))
+        with contextlib.suppress(Exception):
+            candidates.append(int(page.window.width or 0))
+        candidates = [c for c in candidates if c > 0]
+        return max(candidates) if candidates else 1280
+
+    def _resize_holder():
+        natural_w = len(panels) * single_panel_width + max(0, len(panels) - 1) * 14
+        if _FloatDialog._is_fullscreen_build:
+            # The fullscreen apps (standalone exe / web) wrap everything in
+            # their own outer horizontal+vertical scroll now (see their
+            # _open override) — row_holder can just take its natural full
+            # width; an inner cap here would be redundant AND wrong, since
+            # it'd be computed once from the CURRENT window size and go
+            # stale the moment the window resizes or the page is zoomed
+            # afterward, right back to the "3rd panel needs an inner
+            # scrollbar to reach" problem this was meant to solve.
+            w = natural_w
+        else:
+            # CatMan Pro's floating/draggable dialog has no outer scroll
+            # wrapper — always fill the actual window width (minus a small
+            # margin) rather than shrinking the dialog to exactly N whole
+            # panels; trying to size the dialog to "precisely fit 2, not 3"
+            # left a large dead gap between the (narrower) dialog and the
+            # actual window edge whenever the true available width didn't
+            # divide evenly by single panel width, with the next panel
+            # visually peeking through instead of being cleanly clipped.
+            # Anything that doesn't fit is reached via panels_row's own
+            # horizontal scroll (ScrollMode.AUTO) instead. ~64px accounts
+            # for the dialog's left offset (_FloatDialog._open) plus a
+            # right-side margin so it never touches the window edge.
+            w = min(natural_w, max(single_panel_width, _available_width() - 64))
+        row_holder.width = w
+        # Keep the WHOLE floating dialog (title bar included) locked to the
+        # same width as its content — otherwise the title bar (which
+        # stretches via expand=True with nothing of its own to constrain
+        # it) can render wider than row_holder, leaving a visible gap on
+        # the right with the next panel peeking through instead of being
+        # cleanly clipped/scrolled away.
+        dlg.panel_width = w
+        with contextlib.suppress(Exception):
+            # Only touch an already-open panel's own .width when it's the
+            # real floating/draggable variant (positioned via left/top —
+            # see _FloatDialog._open). The fullscreen apps reuse this same
+            # class but never set left/top, since that panel is meant to
+            # fill the whole window — forcing a fixed width on it there
+            # would shrink it instead of leaving it fullscreen.
+            if dlg._panel is not None and getattr(dlg._panel, "left", None) is not None:
+                dlg._panel.width = w
+                dlg._panel.update()
+
+    def _update_add_btn():
+        if add_btn_ref[0] is not None:
+            add_btn_ref[0].disabled = len(panels) >= _MAX_COMPARE_PANELS
+            with contextlib.suppress(Exception):
+                add_btn_ref[0].update()
+
+    def _remove_panel(entry: dict):
+        if len(panels) <= 1:
+            return
+        with contextlib.suppress(ValueError):
+            panels.remove(entry)
+        panels_row.controls = [p["container"] for p in panels]
+        _resize_holder()
+        _update_add_btn()
+        with contextlib.suppress(Exception):
+            page.update()
+
+    def _add_panel(pf: dict):
+        if len(panels) >= _MAX_COMPARE_PANELS:
+            return
+        entry: dict = {}
+
+        def _on_remove(_e=None, _entry=entry):
+            _remove_panel(_entry)
+
+        container, get_data = panel_factory(pf, _on_remove)
+        entry["container"] = container
+        entry["get_data"] = get_data
+        panels.append(entry)
+        panels_row.controls = [p["container"] for p in panels]
+        _resize_holder()
+        _update_add_btn()
+
+    for pf in prefill_list:
+        _add_panel(pf)
+
+    def _on_add(_=None):
+        if not panels or len(panels) >= _MAX_COMPARE_PANELS:
+            return
+        _add_panel(panels[-1]["get_data"]())
+        with contextlib.suppress(Exception):
+            page.update()
+
+    def _close(_=None):
+        with contextlib.suppress(Exception):
+            _fdlg_close(page, dlg)
+
+    async def _go_back(_=None):
+        _close()
+        if back_fn:
+            await asyncio.sleep(0.05)
+            with contextlib.suppress(Exception):
+                back_fn()
+
+    def _do_save(_=None):
+        data = {"panels": [p["get_data"]() for p in panels]}
+        _show_save_dialog(page, db, manager_id, calc_type, data)
+
+    def _on_lang_select(code: str) -> None:
+        # Switching language mid-entry shouldn't force closing the modal —
+        # save the current panels' input values, close, and have the
+        # calculator's own wrapper (_open_cost/_open_cost_clo/_open_profit/
+        # _open_turnover_coverage) reopen itself: that rebuilds title/help
+        # text with a freshly-bound _t in the new language, which a plain
+        # recursive call into THIS function couldn't do (title/help_fn here
+        # are already-resolved strings/closures frozen in the old language).
+        i18n.save_manager_language(db, str(manager_id or ""), code)
+        data = {"panels": [p["get_data"]() for p in panels]}
+        _close()
+        if reopen_fn:
+            with contextlib.suppress(Exception):
+                reopen_fn(data)
+
+    add_btn_ref[0] = ft.IconButton(
+        ft.Icons.ADD_BOX_OUTLINED,
+        tooltip=_t("calc.compare.add_tooltip", "Додати панель для порівняння (до {n})").format(n=_MAX_COMPARE_PANELS),
+        on_click=_on_add,
+        icon_size=18,
+    )
+    _update_add_btn()
+
+    dlg.title = ft.Row(
+        [
+            ft.Text(title, weight="bold", size=13, expand=True,
+                    no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
+            i18n.build_language_switcher(db, _on_lang_select, manager_id=str(manager_id or "")),
+            *(
+                [ft.IconButton(ft.Icons.HELP_OUTLINE, tooltip=_t("common.help.tooltip", "Довідка"),
+                               on_click=help_fn, icon_size=18)]
+                if help_fn else []
+            ),
+            add_btn_ref[0],
+            ft.IconButton(ft.Icons.BOOKMARK_ADD_OUTLINED, tooltip=_t("common.save", "Зберегти"),
+                          on_click=_do_save, icon_size=18),
+            *(
+                [ft.IconButton(ft.Icons.ARROW_BACK, tooltip=_t("common.back", "Назад"),
+                               on_click=_go_back, icon_size=16)]
+                if back_fn else []
+            ),
+            _close_or_refresh_btn(page, _close, icon_size=16),
+        ]
+    )
+    dlg.content = ft.Container(
+        padding=ft.padding.symmetric(horizontal=16, vertical=8),
+        content=row_holder,
+    )
+    _fdlg_open(page, dlg)
+
+
+def _build_cost_panel(
+    page, db, manager_id: str, company_id: str, region_id: str,
+    regions_list: list[str], prefill: dict | None, on_remove,
+):
+    """One independent Собівартість panel — inputs, its own result column,
+    its own _calculate/_get_data closures. Called once per comparison
+    panel by _open_cost's factory; each call has fully separate local
+    state (method_widgets, tier_widgets, etc.), so N panels never share
+    anything but the region/company/regions_list they were opened with."""
+    _t = i18n.bind(str(manager_id or ""))
+    _ACTIVE_MANAGER_ID[0] = str(manager_id or "")
     pf = prefill or {}
 
     cur_region = [str(pf.get("region_id") or region_id or "")]
@@ -873,6 +1459,17 @@ def _open_cost(
                 methods = db.get_company_delivery_methods(company_id, rid) or []
             except Exception:
                 pass
+        # Region-configured methods used to come back with editable_name
+        # unset/False — real preset name, tariff editable, but no way to
+        # rename it or add a brand new one (dynamic, below, requires EVERY
+        # method to be editable_name). Stamping it True here still seeds
+        # each method's name/tariff from the real region config (mname
+        # reads m["name"] either way — see the render loop) but now lets
+        # the manager edit the name too, and enables "+ Додати спосіб
+        # доставки" — matching the standalone/web calculators' flexibility
+        # instead of being locked to whatever the region has configured.
+        for m in methods:
+            m["editable_name"] = True
         try:
             price_tiers = (
                 db.get_manager_region_price_tiers_overrides(manager_id, rid) or []
@@ -888,6 +1485,11 @@ def _open_cost(
     dm_overrides_state = [
         db.get_manager_delivery_overrides(manager_id, region_id=cur_uuid[0]) or {}
     ]
+    # No real per-company price tiers configured for this region (always
+    # true in the standalone/portable app, which has no regions at all) —
+    # render a growable manual list ("+" adds as many levels as needed)
+    # instead of a "not configured" message + a single fixed manual field.
+    tiers_dynamic = not bool(tiers0)
 
     def _all_ccys(methods, tiers) -> list[str]:
         s: set[str] = {"USD", "UAH", "EUR", "PLN", "CNY"}
@@ -905,39 +1507,82 @@ def _open_cost(
     # ── Input widgets ──────────────────────────────────────────────────────────
     _CCY_W = 114   # currency dropdown width
     _PR_W  = _INP_W - _CCY_W - 4  # price field width = 274-114-4 = 156
-    price_f    = _field("Ціна закупівлі *",  width=_PR_W,  value=pf.get("purchase_price", ""))
-    pkg_f      = _field("Ціна упаковки",     width=_PR_W,  value=pf.get("pkg_price", ""), optional=True)
-    weight_f   = _field("Вага, кг *",        width=_INP_W, value=pf.get("weight", ""))
-    rent_f     = _field("Рентабельність, %", width=_INP_W, value=pf.get("rent_pct", ""), optional=True)
-    buy_ccy_dd  = _dd("Валюта",  ccy_opts0, value=pf_buy_ccy,  width=_CCY_W)
-    pkg_ccy_dd  = _dd("Валюта",  ccy_opts0, value=pf_pkg_ccy,  width=_CCY_W)
-    cost_ccy_dd = _dd("Валюта С/В", ccy_opts0, value=pf_cost_ccy, width=_INP_W)
+    price_f    = _field(_t("calc.cost.purchase_price", "Ціна закупівлі *"),  width=_PR_W,  value=pf.get("purchase_price", ""))
+    pkg_f      = _field(_t("calc.cost.pkg_price", "Ціна упаковки"),     width=_PR_W,  value=pf.get("pkg_price", ""), optional=True)
+    weight_f   = _field(_t("calc.cost.weight", "Вага, кг *"),        width=_INP_W, value=pf.get("weight", ""))
+    rent_f     = _field(_t("calc.field.rent_pct", "Рентабельність, %"), width=_INP_W, value=pf.get("rent_pct", ""), optional=True)
+    buy_ccy_dd  = _dd(_t("calc.field.currency", "Валюта"),  ccy_opts0, value=pf_buy_ccy,  width=_CCY_W)
+    pkg_ccy_dd  = _dd(_t("calc.field.currency", "Валюта"),  ccy_opts0, value=pf_pkg_ccy,  width=_CCY_W)
+    cost_ccy_dd = _dd(_t("calc.cost.cost_currency", "Валюта С/В"), ccy_opts0, value=pf_cost_ccy, width=_INP_W)
+
+    _TIER_CCYS = ("USD", "UAH", "EUR", "PLN", "CNY")
+    custom_tier_name_f = _field(
+        _t("calc.tier.custom_name", "Назва рівня"), width=_INP_W,
+        value=pf.get("custom_tier_name", ""), number=False, optional=True,
+    )
+    custom_tier_price_f = _field(
+        _t("calc.tier.custom_price", "Ціна рівня"), width=_PR_W,
+        value=pf.get("custom_tier_price", ""), optional=True,
+    )
+    custom_tier_ccy_dd = _dd(
+        _t("calc.field.currency", "Валюта"), [(c, c) for c in _TIER_CCYS],
+        value=str(pf.get("custom_tier_ccy") or "USD"), width=_CCY_W,
+    )
 
     # ── Dynamic sections ───────────────────────────────────────────────────────
     methods_col = ft.Column([], spacing=6, tight=True)
     tiers_col   = ft.Column([], spacing=4, tight=True)
     method_widgets: dict[str, dict] = {}
     tier_widgets:   dict[str, dict] = {}
+    manual_tiers_col = ft.Column([], spacing=4, tight=True)
+    manual_tier_widgets: dict[str, dict] = {}
+    _manual_tiers_next_id = [1]
+    if tiers_dynamic:
+        _mt_seed = pf.get("manual_tiers")
+        if not _mt_seed and pf.get("custom_tier_name"):
+            # Backward compat: a saved calc from before this dynamic list
+            # existed only had one singular custom_tier_name/price/ccy.
+            _mt_seed = [{
+                "name": pf.get("custom_tier_name"), "price": pf.get("custom_tier_price"),
+                "ccy": pf.get("custom_tier_ccy"),
+            }]
+        manual_tiers_state: list[dict] = [
+            {"id": t.get("id") or f"manual_tier_{i + 1}", "name": t.get("name", ""),
+             "price": t.get("price", ""), "ccy": t.get("ccy") or "USD"}
+            for i, t in enumerate(_mt_seed or [])
+        ]
+        _manual_tiers_next_id[0] = len(manual_tiers_state) + 1
+    else:
+        manual_tiers_state = []
 
     def _rebuild_methods(methods: list[dict], pf_methods: dict, dm_overrides: dict | None = None):
         method_widgets.clear()
         rows = []
+        # Every method carries editable_name=True now (region-configured
+        # ones are stamped True in _load_for_region, seeded with the
+        # region's real name/tariff; standalone/web ones start blank) — so
+        # this always renders a growable list (rename in place, "+" for as
+        # many as needed) rather than a fixed, uneditable preset.
+        dynamic = bool(methods) and all(bool(x.get("editable_name")) for x in methods)
         if not methods:
-            rows.append(ft.Text("Типи доставки не налаштовані для цього регіону",
+            rows.append(ft.Text(_t("calc.cost.no_delivery_methods", "Типи доставки не налаштовані для цього регіону"),
                                 size=11, color=_MUTED, italic=True))
-        for m in methods:
+        for idx, m in enumerate(methods):
             mid   = str(m.get("id") or "")
-            mname = str(m.get("name") or mid)
+            # editable_name (standalone portable app only, no real company
+            # delivery methods configured) — the manager types their own
+            # delivery name instead of picking from a fixed preset list.
+            editable_name = bool(m.get("editable_name"))
+            mname = str(m.get("name") or "").strip() if editable_name else str(m.get("name") or mid)
             eff   = m.get("effective_price_per_kg") or m.get("base_price_per_kg") or 0
             mccy  = str(m.get("effective_price_currency") or m.get("price_currency") or "USD").upper()
             pf_m  = (pf_methods or {}).get(mid) or {}
-            ov_entry = (dm_overrides or {}).get(mid)
-            if isinstance(ov_entry, dict) and "enabled" in ov_entry:
-                cb_val = bool(ov_entry["enabled"])
-            elif "checked" in pf_m:
-                cb_val = bool(pf_m["checked"])
-            else:
-                cb_val = bool(m.get("user_enabled", True))
+            # Deliberately ignores dm_overrides / m["user_enabled"] (the
+            # manager's general "which delivery methods do I use" setting,
+            # shared with Orders) — the calculator is a scratch/what-if tool,
+            # so it always starts with nothing pre-checked unless restoring
+            # a previously SAVED calculation, never a general app setting.
+            cb_val = bool(pf_m.get("checked", False))
 
             def _on_cb(ev, method_id=mid):
                 cur_ov = dm_overrides_state[0]
@@ -946,12 +1591,8 @@ def _open_cost(
                 cur_ov[method_id]["enabled"] = bool(ev.control.value)
                 db.save_manager_delivery_overrides(manager_id, cur_ov, region_id=cur_uuid[0])
 
-            cb = ft.Checkbox(
-                label=mname, value=cb_val, on_change=_on_cb,
-                label_style=ft.TextStyle(size=12),
-            )
             tariff_f = ft.TextField(
-                label="тариф/кг",
+                label=_t("calc.cost.tariff_per_kg", "тариф/кг"),
                 value=str(pf_m.get("tariff") or eff or ""),
                 width=82, border_radius=6,
                 keyboard_type=ft.KeyboardType.NUMBER, dense=True,
@@ -959,22 +1600,87 @@ def _open_cost(
                 label_style=ft.TextStyle(size=10),
                 text_style=ft.TextStyle(size=12),
             )
-            method_widgets[mid] = {"name": mname, "ccy": mccy, "cb": cb, "tariff_f": tariff_f}
-            rows.append(ft.Row(
+            # Two rows per method (name up top, checkbox+tariff+currency
+            # below) instead of cramming everything into one row — at the
+            # narrower -15% widths, one row didn't leave enough room for
+            # longer delivery names before they got clipped.
+            if editable_name:
+                cb = ft.Checkbox(value=cb_val, on_change=_on_cb)
+                name_f = ft.TextField(
+                    value=str(pf_m.get("name") or mname or ""),
+                    hint_text=_t("calc.cost.delivery_name_hint", "Назва доставки"),
+                    dense=True, border_radius=6, expand=True,
+                    content_padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                    text_style=ft.TextStyle(size=12),
+                )
+                method_widgets[mid] = {"name": mname or _t("calc.cost.delivery_generic_name", "Доставка {n}").format(n=idx + 1),
+                                       "name_f": name_f, "ccy": mccy, "cb": cb, "tariff_f": tariff_f}
+                top_row = ft.Row([name_f], spacing=0, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+            else:
+                cb = ft.Checkbox(value=cb_val, on_change=_on_cb)
+                method_widgets[mid] = {"name": mname, "name_f": None, "ccy": mccy, "cb": cb, "tariff_f": tariff_f}
+                top_row = ft.Row(
+                    [ft.Text(mname, size=11, color=_DARK, expand=True)],
+                    spacing=0, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                )
+            bottom_controls = [
+                cb, tariff_f,
+                ft.Text(mccy, size=9, color=_MUTED, width=28),
+            ]
+            if dynamic and len(methods) > 1:
+                bottom_controls.append(ft.IconButton(
+                    ft.Icons.CLOSE, icon_size=14, icon_color=_MUTED,
+                    tooltip=_t("common.delete", "Видалити"),
+                    on_click=lambda _, method_id=mid: _remove_method_slot(method_id),
+                ))
+            rows.append(ft.Column(
                 [
-                    ft.Container(content=cb, expand=True),
-                    tariff_f,
-                    ft.Text(mccy, size=9, color=_MUTED, width=28),
+                    top_row,
+                    ft.Row(bottom_controls, spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ],
-                spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=2, tight=True,
+            ))
+        if dynamic:
+            rows.append(ft.TextButton(
+                "+ " + _t("calc.cost.add_delivery_method", "Додати спосіб доставки"),
+                icon=ft.Icons.ADD, on_click=_add_method_slot,
+                style=ft.ButtonStyle(padding=0),
             ))
         methods_col.controls = rows
+
+    def _snapshot_methods_pf() -> dict:
+        return {
+            mid: {
+                "checked": w["cb"].value, "tariff": w["tariff_f"].value,
+                **({"name": w["name_f"].value} if w.get("name_f") else {}),
+            }
+            for mid, w in method_widgets.items()
+        }
+
+    def _add_method_slot(_=None):
+        snap = _snapshot_methods_pf()
+        n = len(methods0) + 1
+        methods0.append({
+            "id": f"custom_method_{n}", "name": "", "effective_price_per_kg": 0,
+            "effective_price_currency": "USD", "editable_name": True,
+        })
+        _rebuild_methods(methods0, snap, dm_overrides_state[0])
+        with contextlib.suppress(Exception):
+            page.update()
+
+    def _remove_method_slot(mid: str):
+        snap = _snapshot_methods_pf()
+        snap.pop(mid, None)
+        methods0[:] = [m for m in methods0 if str(m.get("id") or "") != mid]
+        _rebuild_methods(methods0, snap, dm_overrides_state[0])
+        with contextlib.suppress(Exception):
+            page.update()
 
     def _rebuild_tiers(tiers: list[dict], pf_tiers: dict):
         tier_widgets.clear()
         rows = []
         if not tiers:
-            rows.append(ft.Text("Ціни продажу не налаштовані для цього регіону",
+            rows.append(ft.Text(_t("calc.cost.no_price_tiers", "Ціни продажу не налаштовані для цього регіону"),
                                 size=11, color=_MUTED, italic=True))
         for t in tiers:
             tid  = str(t.get("id") or "")
@@ -995,6 +1701,98 @@ def _open_cost(
             ))
         tiers_col.controls = rows
 
+    def _sync_manual_tiers_from_widgets():
+        for t in manual_tiers_state:
+            w = manual_tier_widgets.get(t["id"])
+            if w:
+                t["name"] = w["name_f"].value
+                t["price"] = w["price_f"].value
+                t["ccy"] = w["ccy_dd"].value
+
+    def _rebuild_manual_tiers():
+        manual_tier_widgets.clear()
+        rows = []
+        for t in manual_tiers_state:
+            tid = t["id"]
+            name_f = ft.TextField(
+                value=str(t.get("name") or ""),
+                hint_text=_t("calc.tier.custom_name", "Назва рівня"),
+                dense=True, border_radius=6, expand=True,
+                content_padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                text_style=ft.TextStyle(size=12),
+            )
+            price_f = ft.TextField(
+                value=str(t.get("price") or ""), width=90, border_radius=6, dense=True,
+                keyboard_type=ft.KeyboardType.NUMBER,
+                content_padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                text_style=ft.TextStyle(size=12),
+            )
+            ccy_dd = _dd("", [(c, c) for c in _TIER_CCYS], value=str(t.get("ccy") or "USD"), width=_CCY_W)
+            manual_tier_widgets[tid] = {"name_f": name_f, "price_f": price_f, "ccy_dd": ccy_dd}
+            rows.append(ft.Container(
+                padding=ft.padding.only(bottom=4),
+                border=ft.border.only(bottom=ft.BorderSide(1, _BORDER)),
+                content=ft.Column(
+                    [
+                        ft.Row(
+                            [
+                                name_f,
+                                ft.IconButton(
+                                    ft.Icons.CLOSE, icon_size=14, icon_color=_MUTED,
+                                    tooltip=_t("common.delete", "Видалити"),
+                                    on_click=lambda _, tid=tid: _remove_manual_tier(tid),
+                                ),
+                            ],
+                            spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                        ft.Row([price_f, ccy_dd], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    ],
+                    spacing=4, tight=True,
+                ),
+            ))
+        rows.append(ft.TextButton(
+            "+ " + _t("calc.tier.add_level", "Додати рівень ціни"),
+            icon=ft.Icons.ADD, on_click=_add_manual_tier,
+            style=ft.ButtonStyle(padding=0),
+        ))
+        manual_tiers_col.controls = rows
+
+    def _add_manual_tier(_=None):
+        _sync_manual_tiers_from_widgets()
+        n = _manual_tiers_next_id[0]
+        _manual_tiers_next_id[0] += 1
+        manual_tiers_state.append({"id": f"manual_tier_{n}", "name": "", "price": "", "ccy": "USD"})
+        _rebuild_manual_tiers()
+        with contextlib.suppress(Exception):
+            page.update()
+
+    def _remove_manual_tier(tid: str):
+        _sync_manual_tiers_from_widgets()
+        manual_tiers_state[:] = [t for t in manual_tiers_state if t["id"] != tid]
+        _rebuild_manual_tiers()
+        with contextlib.suppress(Exception):
+            page.update()
+
+    if tiers_dynamic:
+        _rebuild_manual_tiers()
+
+    # Restoring a saved calculation: the standalone/editable-name delivery
+    # list always starts from a single blank slot (see
+    # _StandaloneDB._default_delivery_methods), but the saved calc may have
+    # 2+ user-added ones — without re-creating a slot for each saved id
+    # here, _rebuild_methods below only had "method_1" to iterate over and
+    # silently dropped every other saved delivery method on reopen (looked
+    # like they'd been deleted, even though _get_data had saved them fine).
+    _pf_methods_seed = pf.get("methods") or {}
+    if methods0 and all(bool(m.get("editable_name")) for m in methods0):
+        _existing_method_ids = {str(m.get("id") or "") for m in methods0}
+        for _extra_id in _pf_methods_seed:
+            if _extra_id not in _existing_method_ids:
+                methods0.append({
+                    "id": _extra_id, "name": "", "effective_price_per_kg": 0,
+                    "effective_price_currency": "USD", "editable_name": True,
+                })
+
     _rebuild_methods(methods0, pf.get("methods") or {}, dm_overrides_state[0])
     _rebuild_tiers(tiers0, pf.get("tiers") or {})
 
@@ -1011,7 +1809,7 @@ def _open_cost(
                 dm_overrides_state[0] = db.get_manager_delivery_overrides(manager_id, region_id=cur_uuid[0]) or {}
                 new_m, new_t = _load_for_region(rid_name)
                 new_ccys = _all_ccys(new_m, new_t)
-                new_opts = [ft.dropdown.Option(key="", text="— оберіть —")] + [
+                new_opts = [ft.dropdown.Option(key="", text=_t("calc.field.choose_placeholder", "— оберіть —"))] + [
                     ft.dropdown.Option(key=c, text=c) for c in new_ccys
                 ]
                 for dd in (buy_ccy_dd, pkg_ccy_dd, cost_ccy_dd):
@@ -1029,7 +1827,7 @@ def _open_cost(
                         bgcolor="#FEE2E2", border=ft.border.all(1, "#DC2626"),
                         border_radius=8, padding=ft.padding.all(12),
                         content=ft.Text(
-                            f"⚠ Помилка перемикання регіону: {rid_name}",
+                            _t("calc.err.region_switch", "⚠ Помилка перемикання регіону: {region}").format(region=rid_name),
                             color=_ERR_FG, size=12,
                         ),
                     )
@@ -1037,27 +1835,36 @@ def _open_cost(
             with contextlib.suppress(Exception):
                 page.update()
 
-        region_dd = _dd("Регіон", [(r, r) for r in regions_list],
+        region_dd = _dd(_t("calc.field.region", "Регіон"), [(r, r) for r in regions_list],
                         value=cur_region[0], width=_INP_W)
         region_dd.on_select = _on_region_change
-        region_section = [_section("Регіон"), region_dd]
+        region_section = [_section(_t("calc.field.region", "Регіон")), region_dd]
 
     # ── Inputs column ──────────────────────────────────────────────────────────
     inputs_col = ft.Column(
         [
             *region_section,
-            _section("Закупівля"),
+            _section(_t("calc.cost.section.purchase", "Закупівля")),
             ft.Row([price_f, buy_ccy_dd], spacing=4),
             ft.Row([pkg_f,   pkg_ccy_dd], spacing=4),
             weight_f,
-            _section("Валюта собівартості"),
+            _section(_t("calc.cost.section.cost_currency", "Валюта собівартості")),
             cost_ccy_dd,
-            _section("Типи доставки  (✓ — обрати, тариф — редагується)"),
+            _section(_t("calc.cost.section.delivery_methods", "Типи доставки  (✓ — обрати, тариф — редагується)")),
             ft.Container(content=methods_col),
-            _section("Рентабельність (необов'яз.)"),
+            _section(_t("calc.field.rent_pct_optional", "Рентабельність (необов'яз.)")),
             rent_f,
-            _section("Ціни продажу (необов'яз.)"),
-            ft.Container(content=tiers_col),
+            _section(_t("calc.cost.section.price_tiers", "Ціни продажу (необов'яз.)")),
+            *(
+                [ft.Container(content=manual_tiers_col)]
+                if tiers_dynamic else
+                [
+                    ft.Container(content=tiers_col),
+                    _section(_t("calc.tier.custom_section", "Додатковий рівень ціни (вручну)")),
+                    custom_tier_name_f,
+                    ft.Row([custom_tier_price_f, custom_tier_ccy_dd], spacing=4),
+                ]
+            ),
         ],
         spacing=4,
         scroll=ft.ScrollMode.AUTO,
@@ -1072,23 +1879,9 @@ def _open_cost(
         width=_RES_W,
     )
 
-    # ── Dialog ────────────────────────────────────────────────────────────────
-    dlg = _FloatDialog()
-
-    def _close(_=None):
-        with contextlib.suppress(Exception):
-            _fdlg_close(page, dlg)
-
-    async def _go_back(_=None):
-        _close()
-        if back_fn:
-            await asyncio.sleep(0.05)
-            with contextlib.suppress(Exception):
-                back_fn()
-
     # ── Calculate ─────────────────────────────────────────────────────────────
     def _calculate(_=None):
-        rates = _fetch_uah_rates()
+        rates = _fetch_uah_rates(page)
         purchase_price = _safe_float(price_f.value)
         pkg_price      = _safe_float(pkg_f.value) or 0.0
         weight         = _safe_float(weight_f.value)
@@ -1109,21 +1902,24 @@ def _open_cost(
                 page.update()
 
         if purchase_price is None:
-            _err("Введіть ціну закупівлі")
+            _err(_t("calc.err.enter_purchase_price", "Введіть ціну закупівлі"))
             return
         if weight is None:
-            _err("Введіть вагу")
+            _err(_t("calc.err.enter_weight", "Введіть вагу"))
             return
 
         selected = [(mid, w) for mid, w in method_widgets.items() if w["cb"].value]
         if not selected:
-            _err("Оберіть хоча б один тип доставки")
+            _err(_t("calc.err.choose_delivery_method", "Оберіть хоча б один тип доставки"))
             return
 
         buy_in_cv = _convert(purchase_price, buy_ccy, cost_ccy, rates)
         if buy_in_cv is None:
-            detail = f" ({'; '.join(_FX_LAST_ERRORS)})" if _FX_LAST_ERRORS else " (курси ще не завантажені — спробуйте ще раз за кілька секунд)"
-            _err(f"Немає курсу {buy_ccy} → {cost_ccy}{detail}")
+            detail = (
+                f" ({'; '.join(_FX_LAST_ERRORS)})" if _FX_LAST_ERRORS
+                else " " + _t("calc.err.rates_not_loaded", "(курси ще не завантажені — спробуйте ще раз за кілька секунд)")
+            )
+            _err(_t("calc.err.no_rate", "Немає курсу {a} → {b}").format(a=buy_ccy, b=cost_ccy) + detail)
             return
         pkg_in_cv  = (_convert(pkg_price, pkg_ccy, cost_ccy, rates) or 0.0) if pkg_price else 0.0
         base_cost  = buy_in_cv + pkg_in_cv
@@ -1134,6 +1930,17 @@ def _open_cost(
             v = _safe_float(tw["field"].value)
             if v is not None and v > 0:
                 tier_vals.append((tw["name"], tw["ccy"], v))
+        if tiers_dynamic:
+            for w in manual_tier_widgets.values():
+                nm = str(w["name_f"].value or "").strip()
+                pr = _safe_float(w["price_f"].value)
+                if nm and pr is not None and pr > 0:
+                    tier_vals.append((nm, str(w["ccy_dd"].value or "USD").upper(), pr))
+        else:
+            custom_tier_name = str(custom_tier_name_f.value or "").strip()
+            custom_tier_price = _safe_float(custom_tier_price_f.value)
+            if custom_tier_name and custom_tier_price is not None and custom_tier_price > 0:
+                tier_vals.append((custom_tier_name, str(custom_tier_ccy_dd.value or "USD").upper(), custom_tier_price))
 
         extra_ccys: set[str] = {buy_ccy, pkg_ccy}
         cards = []
@@ -1141,25 +1948,32 @@ def _open_cost(
         for mid, mw in selected:
             tariff      = _safe_float(mw["tariff_f"].value) or 0.0
             mccy        = mw["ccy"]
+            mw_name     = (str(mw["name_f"].value or "").strip() if mw.get("name_f") else "") or mw["name"]
             delivery_cv = _convert(weight * tariff, mccy, cost_ccy, rates) or (weight * tariff)
             extra_ccys.add(mccy)
             cv = base_cost + delivery_cv
 
-            card_rows: list[tuple[str, str, str, bool]] = [
-                ("Ціна закупівлі:", _fmt_money(buy_in_cv, cost_ccy), _DARK, False),
+            # Each row's pct (5th tuple element) is its share of the final
+            # С/В (cv, the card's own 100% baseline) — None on rows that
+            # shouldn't show one (the total itself, "Ціна при рент.", tier
+            # margin rows). See _cost_card's docstring.
+            pct_of = (lambda amt: amt / cv * 100) if cv > 0 else (lambda amt: None)
+
+            card_rows: list[tuple[str, str, str, bool, float | None]] = [
+                (_t("calc.result.purchase_price", "Ціна закупівлі:"), _fmt_money(buy_in_cv, cost_ccy), _DARK, False, pct_of(buy_in_cv)),
             ]
             if pkg_in_cv:
-                card_rows.append(("Упаковка:", _fmt_money(pkg_in_cv, cost_ccy), _MUTED, False))
+                card_rows.append((_t("calc.result.packaging", "Упаковка:"), _fmt_money(pkg_in_cv, cost_ccy), _MUTED, False, pct_of(pkg_in_cv)))
             card_rows.append(
-                (f"Доставка ({weight} кг × {tariff} {mccy}/кг):",
-                 _fmt_money(delivery_cv, cost_ccy), _MUTED, False)
+                (_t("calc.result.delivery_line", "Доставка ({weight} кг × {tariff} {ccy}/кг):").format(weight=weight, tariff=tariff, ccy=mccy),
+                 _fmt_money(delivery_cv, cost_ccy), _MUTED, False, pct_of(delivery_cv))
             )
-            card_rows.append(("Собівартість:", _fmt_money(cv, cost_ccy), _C_OK, True))
+            card_rows.append((_t("calc.result.cost", "Собівартість:"), _fmt_money(cv, cost_ccy), _C_OK, True, None))
 
             if has_rent:
                 sale = cv / (1.0 - rent_pct / 100.0)
                 card_rows.append(
-                    (f"Ціна при рент. {rent_pct:.0f}%:", _fmt_money(sale, cost_ccy), _C_BLUE, True)
+                    (_t("calc.result.price_at_rent", "Ціна при рент. {pct:.0f}%:").format(pct=rent_pct), _fmt_money(sale, cost_ccy), _C_BLUE, True, None)
                 )
 
             for tnm, tccy, tprice in tier_vals:
@@ -1172,10 +1986,10 @@ def _open_cost(
                 )
                 card_rows.append(
                     (f"{tnm} ({price_label}):",
-                     f"{r_pct:.1f}%", clr, False)
+                     f"{r_pct:.1f}%", clr, False, None)
                 )
 
-            cards.append(_cost_card(mw["name"], card_rows, highlight=len(selected) == 1))
+            cards.append(_cost_card(mw_name, card_rows, highlight=True))
 
         # Rates line
         rate_parts = _rate_texts(buy_ccy, cost_ccy, extra_ccys, rates)
@@ -1188,8 +2002,12 @@ def _open_cost(
                 padding=ft.padding.symmetric(horizontal=12, vertical=8),
                 content=ft.Column(
                     [
-                        ft.Text("Результати розрахунку", size=12,
+                        ft.Text(_t("calc.results_title", "Результати розрахунку"), size=12,
                                 weight=ft.FontWeight.W_700, color=_DARK),
+                        ft.Text(
+                            _t("calc.cost.formula", "С/В = Ціна закупівлі + Упаковка + (Вага × Тариф доставки)"),
+                            size=9, color=_MUTED, italic=True,
+                        ),
                         *(
                             [ft.Text(rate_str, size=9, color=_MUTED)]
                             if rate_str else []
@@ -1203,8 +2021,8 @@ def _open_cost(
         with contextlib.suppress(Exception):
             page.update()
 
-    def _do_save(_=None):
-        data = {
+    def _get_data() -> dict:
+        return {
             "region_id":    cur_region[0],
             "purchase_price": price_f.value,
             "purchase_ccy": buy_ccy_dd.value,
@@ -1214,82 +2032,878 @@ def _open_cost(
             "weight":       weight_f.value,
             "rent_pct":     rent_f.value,
             "methods": {
-                mid: {"checked": w["cb"].value, "tariff": w["tariff_f"].value}
+                mid: {
+                    "checked": w["cb"].value, "tariff": w["tariff_f"].value,
+                    **({"name": w["name_f"].value} if w.get("name_f") else {}),
+                }
                 for mid, w in method_widgets.items()
             },
             "tiers": {tid: tw["field"].value for tid, tw in tier_widgets.items()},
-        }
-        _show_save_dialog(page, db, manager_id, "cost", data)
-
-    # ── Dialog title ──────────────────────────────────────────────────────────
-    dlg.title = ft.Row(
-        [
-            ft.Text("Собівартість", weight="bold", size=13, expand=True),
-            ft.IconButton(ft.Icons.BOOKMARK_ADD_OUTLINED, tooltip="Зберегти",
-                          on_click=_do_save, icon_size=18),
-            *(
-                [ft.IconButton(ft.Icons.ARROW_BACK, tooltip="Назад",
-                               on_click=_go_back, icon_size=16)]
-                if back_fn else []
+            **(
+                {
+                    "manual_tiers": [
+                        {"id": tid, "name": w["name_f"].value, "price": w["price_f"].value, "ccy": w["ccy_dd"].value}
+                        for tid, w in manual_tier_widgets.items()
+                    ],
+                }
+                if tiers_dynamic else
+                {
+                    "custom_tier_name": custom_tier_name_f.value,
+                    "custom_tier_price": custom_tier_price_f.value,
+                    "custom_tier_ccy": custom_tier_ccy_dd.value,
+                }
             ),
-            ft.IconButton(ft.Icons.CLOSE, on_click=_close, icon_size=16),
-        ]
-    )
+        }
 
-    _dlg_w = _LEFT_W + 21 + _RIGHT_W + 32  # 290+21+420+32 = 763
-    dlg.panel_width = _dlg_w
-    dlg.content = ft.Container(
-        padding=ft.padding.symmetric(horizontal=16, vertical=8),
-        content=ft.Row(
-            [
-                # Left: inputs + pinned button
-                ft.Column(
-                    [
-                        ft.Container(
-                            width=_LEFT_W,
-                            height=_PANEL_H - 48,
-                            content=inputs_col,
+    panel_body = ft.Row(
+        [
+            ft.Column(
+                [
+                    ft.Container(
+                        width=_LEFT_W,
+                        content=inputs_col,
+                    ),
+                    ft.FilledButton(
+                        "  " + _t("calc.action.calculate", "Розрахувати"),
+                        icon=ft.Icons.CALCULATE,
+                        on_click=_calculate,
+                        width=_LEFT_W,
+                        style=ft.ButtonStyle(
+                            shape=ft.RoundedRectangleBorder(radius=8),
                         ),
-                        ft.FilledButton(
-                            "  Розрахувати",
-                            icon=ft.Icons.CALCULATE,
-                            on_click=_calculate,
-                            width=_LEFT_W,
-                            style=ft.ButtonStyle(
-                                shape=ft.RoundedRectangleBorder(radius=8),
-                            ),
+                    ),
+                ],
+                spacing=6,
+                tight=True,
+            ),
+            ft.VerticalDivider(width=1, color=_BORDER),
+            ft.Container(
+                width=_RIGHT_W,
+                content=result_col,
+            ),
+        ],
+        spacing=10,
+        vertical_alignment=ft.CrossAxisAlignment.START,
+    )
+    container = ft.Container(
+        border=ft.border.all(1, _BORDER),
+        border_radius=10,
+        padding=8,
+        content=ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Container(expand=True),
+                        ft.IconButton(
+                            ft.Icons.CLOSE, icon_size=14, tooltip=_t("calc.compare.remove_panel", "Прибрати панель"),
+                            on_click=on_remove,
                         ),
                     ],
-                    spacing=6,
                     tight=True,
                 ),
-                ft.VerticalDivider(width=1, color=_BORDER),
-                ft.Container(
-                    width=_RIGHT_W,
-                    height=_PANEL_H,
-                    content=result_col,
-                ),
+                panel_body,
             ],
-            spacing=10,
-            vertical_alignment=ft.CrossAxisAlignment.START,
+            spacing=0, tight=True,
         ),
     )
-    _fdlg_open(page, dlg)
+    return container, _get_data
+
+
+def _open_cost(
+    page, db, manager_id: str, company_id: str, region_id: str,
+    regions_list: list[str], prefill: dict | None = None, back_fn=None,
+):
+    _t = i18n.bind(str(manager_id or ""))
+    _ACTIVE_MANAGER_ID[0] = str(manager_id or "")
+
+    def _factory(pf: dict, on_remove):
+        return _build_cost_panel(
+            page, db, manager_id, company_id, region_id, regions_list, pf, on_remove
+        )
+
+    def _reopen(data: dict):
+        _open_cost(page, db, manager_id, company_id, region_id, regions_list, prefill=data, back_fn=back_fn)
+
+    _run_multi_panel_calculator(
+        page, db, manager_id, "cost", _t("calc.cost.title", "Собівартість"), prefill, _factory,
+        single_panel_width=_LEFT_W + 21 + _RIGHT_W + 32,
+        back_fn=back_fn,
+        reopen_fn=_reopen,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── 2b. Собівартість з митом ──────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+def _build_cost_clo_panel(
+    page, db, manager_id: str, company_id: str, region_id: str,
+    regions_list: list[str], prefill: dict | None, on_remove,
+):
+    """One independent Собівартість+мито panel (see _build_cost_panel for
+    the multi-panel comparison mechanics — this mirrors it exactly plus
+    two extra manually-entered fields — Ставка мита (%) and Коефіцієнт
+    коригування фрахту — for routes where duty accrues only on the
+    outside-EU leg of a combined route (e.g. part of the trip is outside
+    the EU, part is already within it). Мито = ставка% × (С/В без мита ÷
+    коефіцієнт); the коефіцієнт (e.g. 1,2 for an 80/20 outside-EU/EU split)
+    already encodes "keep only the outside-EU share" — see the on-screen
+    help for the worked example this was specified against (9.7% rate,
+    invoice 2 + logistics 1, 80% outside EU → мито = 9.7% × (3 ÷ 1.2) =
+    0.2425). Deliberately generic (no hardcoded country names) so the tool
+    applies to any route split, not just one specific origin/destination.
+
+    Internal identifiers (function name, "cost_clo" dispatch/calc_type key,
+    "clo_rate"/"clo_coef" data-dict keys) were kept as-is when the on-screen
+    labels were renamed from CLO to мито/коригування фрахту — cosmetic
+    rename only, no need to migrate already-saved calculations."""
+    _t = i18n.bind(str(manager_id or ""))
+    _ACTIVE_MANAGER_ID[0] = str(manager_id or "")
+    pf = prefill or {}
+
+    cur_region = [str(pf.get("region_id") or region_id or "")]
+
+    def _load_for_region(rid_name: str):
+        methods: list[dict] = []
+        price_tiers: list[dict] = []
+        rid = _resolve_region_id(db, company_id, rid_name)
+        try:
+            methods = (
+                db.get_effective_delivery_methods_for_manager(
+                    company_id, manager_id, rid, include_user_disabled=True
+                )
+                or []
+            )
+        except Exception:
+            try:
+                methods = db.get_company_delivery_methods(company_id, rid) or []
+            except Exception:
+                pass
+        # Region-configured methods used to come back with editable_name
+        # unset/False — real preset name, tariff editable, but no way to
+        # rename it or add a brand new one (dynamic, below, requires EVERY
+        # method to be editable_name). Stamping it True here still seeds
+        # each method's name/tariff from the real region config (mname
+        # reads m["name"] either way — see the render loop) but now lets
+        # the manager edit the name too, and enables "+ Додати спосіб
+        # доставки" — matching the standalone/web calculators' flexibility
+        # instead of being locked to whatever the region has configured.
+        for m in methods:
+            m["editable_name"] = True
+        try:
+            price_tiers = (
+                db.get_manager_region_price_tiers_overrides(manager_id, rid) or []
+            )
+            if not price_tiers:
+                price_tiers = db.get_region_price_tiers(rid) or []
+        except Exception:
+            pass
+        return methods, price_tiers
+
+    methods0, tiers0 = _load_for_region(cur_region[0])
+    cur_uuid = [_resolve_region_id(db, company_id, cur_region[0])]
+    dm_overrides_state = [
+        db.get_manager_delivery_overrides(manager_id, region_id=cur_uuid[0]) or {}
+    ]
+    # No real per-company price tiers configured for this region (always
+    # true in the standalone/portable app, which has no regions at all) —
+    # render a growable manual list ("+" adds as many levels as needed)
+    # instead of a "not configured" message + a single fixed manual field.
+    tiers_dynamic = not bool(tiers0)
+
+    def _all_ccys(methods, tiers) -> list[str]:
+        s: set[str] = {"USD", "UAH", "EUR", "PLN", "CNY"}
+        for m in methods:
+            s.add(str(m.get("effective_price_currency") or m.get("price_currency") or "USD").upper())
+        for t in tiers:
+            s.add(str(t.get("currency") or "USD").upper())
+        return sorted(s)
+
+    ccy_opts0 = [(c, c) for c in _all_ccys(methods0, tiers0)]
+    pf_buy_ccy  = str(pf.get("purchase_ccy") or "CNY")
+    pf_pkg_ccy  = str(pf.get("pkg_ccy") or "CNY")
+    pf_cost_ccy = str(pf.get("cost_ccy") or "USD")
+
+    # ── Input widgets ──────────────────────────────────────────────────────────
+    _CCY_W = 114   # currency dropdown width
+    _PR_W  = _INP_W - _CCY_W - 4  # price field width = 274-114-4 = 156
+    price_f    = _field(_t("calc.cost.purchase_price", "Ціна закупівлі *"),  width=_PR_W,  value=pf.get("purchase_price", ""))
+    pkg_f      = _field(_t("calc.cost.pkg_price", "Ціна упаковки"),     width=_PR_W,  value=pf.get("pkg_price", ""), optional=True)
+    weight_f   = _field(_t("calc.cost.weight", "Вага, кг *"),        width=_INP_W, value=pf.get("weight", ""))
+    rent_f     = _field(_t("calc.field.rent_pct", "Рентабельність, %"), width=_INP_W, value=pf.get("rent_pct", ""), optional=True)
+    clo_rate_f = _field(_t("calc.cost_clo.duty_rate", "Ставка мита, % *"),   width=_INP_W, value=pf.get("clo_rate", ""))
+    clo_coef_f = _field(_t("calc.cost_clo.freight_coef", "Коеф. для нарахування мита (CLA) *"),  width=_INP_W, value=pf.get("clo_coef", ""))
+    buy_ccy_dd  = _dd(_t("calc.field.currency", "Валюта"),  ccy_opts0, value=pf_buy_ccy,  width=_CCY_W)
+    pkg_ccy_dd  = _dd(_t("calc.field.currency", "Валюта"),  ccy_opts0, value=pf_pkg_ccy,  width=_CCY_W)
+    cost_ccy_dd = _dd(_t("calc.cost.cost_currency", "Валюта С/В"), ccy_opts0, value=pf_cost_ccy, width=_INP_W)
+
+    _TIER_CCYS = ("USD", "UAH", "EUR", "PLN", "CNY")
+    custom_tier_name_f = _field(
+        _t("calc.tier.custom_name", "Назва рівня"), width=_INP_W,
+        value=pf.get("custom_tier_name", ""), number=False, optional=True,
+    )
+    custom_tier_price_f = _field(
+        _t("calc.tier.custom_price", "Ціна рівня"), width=_PR_W,
+        value=pf.get("custom_tier_price", ""), optional=True,
+    )
+    custom_tier_ccy_dd = _dd(
+        _t("calc.field.currency", "Валюта"), [(c, c) for c in _TIER_CCYS],
+        value=str(pf.get("custom_tier_ccy") or "USD"), width=_CCY_W,
+    )
+
+    # ── Dynamic sections ───────────────────────────────────────────────────────
+    methods_col = ft.Column([], spacing=6, tight=True)
+    tiers_col   = ft.Column([], spacing=4, tight=True)
+    method_widgets: dict[str, dict] = {}
+    tier_widgets:   dict[str, dict] = {}
+    manual_tiers_col = ft.Column([], spacing=4, tight=True)
+    manual_tier_widgets: dict[str, dict] = {}
+    _manual_tiers_next_id = [1]
+    if tiers_dynamic:
+        _mt_seed = pf.get("manual_tiers")
+        if not _mt_seed and pf.get("custom_tier_name"):
+            # Backward compat: a saved calc from before this dynamic list
+            # existed only had one singular custom_tier_name/price/ccy.
+            _mt_seed = [{
+                "name": pf.get("custom_tier_name"), "price": pf.get("custom_tier_price"),
+                "ccy": pf.get("custom_tier_ccy"),
+            }]
+        manual_tiers_state: list[dict] = [
+            {"id": t.get("id") or f"manual_tier_{i + 1}", "name": t.get("name", ""),
+             "price": t.get("price", ""), "ccy": t.get("ccy") or "USD"}
+            for i, t in enumerate(_mt_seed or [])
+        ]
+        _manual_tiers_next_id[0] = len(manual_tiers_state) + 1
+    else:
+        manual_tiers_state = []
+
+    def _rebuild_methods(methods: list[dict], pf_methods: dict, dm_overrides: dict | None = None):
+        method_widgets.clear()
+        rows = []
+        # Every method carries editable_name=True now (region-configured
+        # ones are stamped True in _load_for_region, seeded with the
+        # region's real name/tariff; standalone/web ones start blank) — so
+        # this always renders a growable list (rename in place, "+" for as
+        # many as needed) rather than a fixed, uneditable preset.
+        dynamic = bool(methods) and all(bool(x.get("editable_name")) for x in methods)
+        if not methods:
+            rows.append(ft.Text(_t("calc.cost.no_delivery_methods", "Типи доставки не налаштовані для цього регіону"),
+                                size=11, color=_MUTED, italic=True))
+        for idx, m in enumerate(methods):
+            mid   = str(m.get("id") or "")
+            # editable_name (standalone portable app only, no real company
+            # delivery methods configured) — the manager types their own
+            # delivery name instead of picking from a fixed preset list.
+            editable_name = bool(m.get("editable_name"))
+            mname = str(m.get("name") or "").strip() if editable_name else str(m.get("name") or mid)
+            eff   = m.get("effective_price_per_kg") or m.get("base_price_per_kg") or 0
+            mccy  = str(m.get("effective_price_currency") or m.get("price_currency") or "USD").upper()
+            pf_m  = (pf_methods or {}).get(mid) or {}
+            # Deliberately ignores dm_overrides / m["user_enabled"] (the
+            # manager's general "which delivery methods do I use" setting,
+            # shared with Orders) — the calculator is a scratch/what-if tool,
+            # so it always starts with nothing pre-checked unless restoring
+            # a previously SAVED calculation, never a general app setting.
+            cb_val = bool(pf_m.get("checked", False))
+
+            def _on_cb(ev, method_id=mid):
+                cur_ov = dm_overrides_state[0]
+                if method_id not in cur_ov or not isinstance(cur_ov[method_id], dict):
+                    cur_ov[method_id] = {}
+                cur_ov[method_id]["enabled"] = bool(ev.control.value)
+                db.save_manager_delivery_overrides(manager_id, cur_ov, region_id=cur_uuid[0])
+
+            tariff_f = ft.TextField(
+                label=_t("calc.cost.tariff_per_kg", "тариф/кг"),
+                value=str(pf_m.get("tariff") or eff or ""),
+                width=82, border_radius=6,
+                keyboard_type=ft.KeyboardType.NUMBER, dense=True,
+                content_padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                label_style=ft.TextStyle(size=10),
+                text_style=ft.TextStyle(size=12),
+            )
+            # Two rows per method (name up top, checkbox+tariff+currency
+            # below) instead of cramming everything into one row — at the
+            # narrower -15% widths, one row didn't leave enough room for
+            # longer delivery names before they got clipped.
+            if editable_name:
+                cb = ft.Checkbox(value=cb_val, on_change=_on_cb)
+                name_f = ft.TextField(
+                    value=str(pf_m.get("name") or mname or ""),
+                    hint_text=_t("calc.cost.delivery_name_hint", "Назва доставки"),
+                    dense=True, border_radius=6, expand=True,
+                    content_padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                    text_style=ft.TextStyle(size=12),
+                )
+                method_widgets[mid] = {"name": mname or _t("calc.cost.delivery_generic_name", "Доставка {n}").format(n=idx + 1),
+                                       "name_f": name_f, "ccy": mccy, "cb": cb, "tariff_f": tariff_f}
+                top_row = ft.Row([name_f], spacing=0, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+            else:
+                cb = ft.Checkbox(value=cb_val, on_change=_on_cb)
+                method_widgets[mid] = {"name": mname, "name_f": None, "ccy": mccy, "cb": cb, "tariff_f": tariff_f}
+                top_row = ft.Row(
+                    [ft.Text(mname, size=11, color=_DARK, expand=True)],
+                    spacing=0, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                )
+            bottom_controls = [
+                cb, tariff_f,
+                ft.Text(mccy, size=9, color=_MUTED, width=28),
+            ]
+            if dynamic and len(methods) > 1:
+                bottom_controls.append(ft.IconButton(
+                    ft.Icons.CLOSE, icon_size=14, icon_color=_MUTED,
+                    tooltip=_t("common.delete", "Видалити"),
+                    on_click=lambda _, method_id=mid: _remove_method_slot(method_id),
+                ))
+            rows.append(ft.Column(
+                [
+                    top_row,
+                    ft.Row(bottom_controls, spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ],
+                spacing=2, tight=True,
+            ))
+        if dynamic:
+            rows.append(ft.TextButton(
+                "+ " + _t("calc.cost.add_delivery_method", "Додати спосіб доставки"),
+                icon=ft.Icons.ADD, on_click=_add_method_slot,
+                style=ft.ButtonStyle(padding=0),
+            ))
+        methods_col.controls = rows
+
+    def _snapshot_methods_pf() -> dict:
+        return {
+            mid: {
+                "checked": w["cb"].value, "tariff": w["tariff_f"].value,
+                **({"name": w["name_f"].value} if w.get("name_f") else {}),
+            }
+            for mid, w in method_widgets.items()
+        }
+
+    def _add_method_slot(_=None):
+        snap = _snapshot_methods_pf()
+        n = len(methods0) + 1
+        methods0.append({
+            "id": f"custom_method_{n}", "name": "", "effective_price_per_kg": 0,
+            "effective_price_currency": "USD", "editable_name": True,
+        })
+        _rebuild_methods(methods0, snap, dm_overrides_state[0])
+        with contextlib.suppress(Exception):
+            page.update()
+
+    def _remove_method_slot(mid: str):
+        snap = _snapshot_methods_pf()
+        snap.pop(mid, None)
+        methods0[:] = [m for m in methods0 if str(m.get("id") or "") != mid]
+        _rebuild_methods(methods0, snap, dm_overrides_state[0])
+        with contextlib.suppress(Exception):
+            page.update()
+
+    def _rebuild_tiers(tiers: list[dict], pf_tiers: dict):
+        tier_widgets.clear()
+        rows = []
+        if not tiers:
+            rows.append(ft.Text(_t("calc.cost.no_price_tiers", "Ціни продажу не налаштовані для цього регіону"),
+                                size=11, color=_MUTED, italic=True))
+        for t in tiers:
+            tid  = str(t.get("id") or "")
+            tnm  = str(t.get("name") or tid)
+            tccy = str(t.get("currency") or "USD").upper()
+            tf   = ft.TextField(
+                value=str((pf_tiers or {}).get(tid) or ""),
+                width=96, border_radius=6,
+                keyboard_type=ft.KeyboardType.NUMBER, dense=True,
+                content_padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                text_style=ft.TextStyle(size=12),
+            )
+            tier_widgets[tid] = {"name": tnm, "ccy": tccy, "field": tf}
+            rows.append(ft.Row(
+                [ft.Text(f"{tnm} ({tccy})", size=10, expand=True,
+                         overflow=ft.TextOverflow.ELLIPSIS), tf],
+                spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ))
+        tiers_col.controls = rows
+
+    def _sync_manual_tiers_from_widgets():
+        for t in manual_tiers_state:
+            w = manual_tier_widgets.get(t["id"])
+            if w:
+                t["name"] = w["name_f"].value
+                t["price"] = w["price_f"].value
+                t["ccy"] = w["ccy_dd"].value
+
+    def _rebuild_manual_tiers():
+        manual_tier_widgets.clear()
+        rows = []
+        for t in manual_tiers_state:
+            tid = t["id"]
+            name_f = ft.TextField(
+                value=str(t.get("name") or ""),
+                hint_text=_t("calc.tier.custom_name", "Назва рівня"),
+                dense=True, border_radius=6, expand=True,
+                content_padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                text_style=ft.TextStyle(size=12),
+            )
+            price_f = ft.TextField(
+                value=str(t.get("price") or ""), width=90, border_radius=6, dense=True,
+                keyboard_type=ft.KeyboardType.NUMBER,
+                content_padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                text_style=ft.TextStyle(size=12),
+            )
+            ccy_dd = _dd("", [(c, c) for c in _TIER_CCYS], value=str(t.get("ccy") or "USD"), width=_CCY_W)
+            manual_tier_widgets[tid] = {"name_f": name_f, "price_f": price_f, "ccy_dd": ccy_dd}
+            rows.append(ft.Container(
+                padding=ft.padding.only(bottom=4),
+                border=ft.border.only(bottom=ft.BorderSide(1, _BORDER)),
+                content=ft.Column(
+                    [
+                        ft.Row(
+                            [
+                                name_f,
+                                ft.IconButton(
+                                    ft.Icons.CLOSE, icon_size=14, icon_color=_MUTED,
+                                    tooltip=_t("common.delete", "Видалити"),
+                                    on_click=lambda _, tid=tid: _remove_manual_tier(tid),
+                                ),
+                            ],
+                            spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                        ft.Row([price_f, ccy_dd], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    ],
+                    spacing=4, tight=True,
+                ),
+            ))
+        rows.append(ft.TextButton(
+            "+ " + _t("calc.tier.add_level", "Додати рівень ціни"),
+            icon=ft.Icons.ADD, on_click=_add_manual_tier,
+            style=ft.ButtonStyle(padding=0),
+        ))
+        manual_tiers_col.controls = rows
+
+    def _add_manual_tier(_=None):
+        _sync_manual_tiers_from_widgets()
+        n = _manual_tiers_next_id[0]
+        _manual_tiers_next_id[0] += 1
+        manual_tiers_state.append({"id": f"manual_tier_{n}", "name": "", "price": "", "ccy": "USD"})
+        _rebuild_manual_tiers()
+        with contextlib.suppress(Exception):
+            page.update()
+
+    def _remove_manual_tier(tid: str):
+        _sync_manual_tiers_from_widgets()
+        manual_tiers_state[:] = [t for t in manual_tiers_state if t["id"] != tid]
+        _rebuild_manual_tiers()
+        with contextlib.suppress(Exception):
+            page.update()
+
+    if tiers_dynamic:
+        _rebuild_manual_tiers()
+
+    # Restoring a saved calculation: the standalone/editable-name delivery
+    # list always starts from a single blank slot (see
+    # _StandaloneDB._default_delivery_methods), but the saved calc may have
+    # 2+ user-added ones — without re-creating a slot for each saved id
+    # here, _rebuild_methods below only had "method_1" to iterate over and
+    # silently dropped every other saved delivery method on reopen (looked
+    # like they'd been deleted, even though _get_data had saved them fine).
+    _pf_methods_seed = pf.get("methods") or {}
+    if methods0 and all(bool(m.get("editable_name")) for m in methods0):
+        _existing_method_ids = {str(m.get("id") or "") for m in methods0}
+        for _extra_id in _pf_methods_seed:
+            if _extra_id not in _existing_method_ids:
+                methods0.append({
+                    "id": _extra_id, "name": "", "effective_price_per_kg": 0,
+                    "effective_price_currency": "USD", "editable_name": True,
+                })
+
+    _rebuild_methods(methods0, pf.get("methods") or {}, dm_overrides_state[0])
+    _rebuild_tiers(tiers0, pf.get("tiers") or {})
+
+    # ── Region section ─────────────────────────────────────────────────────────
+    region_section: list = []
+    if len(regions_list) > 1:
+        def _on_region_change(e):
+            rid_name = str(e.control.value or "").strip()
+            if not rid_name:
+                return
+            try:
+                cur_region[0] = rid_name
+                cur_uuid[0]   = _resolve_region_id(db, company_id, rid_name)
+                dm_overrides_state[0] = db.get_manager_delivery_overrides(manager_id, region_id=cur_uuid[0]) or {}
+                new_m, new_t = _load_for_region(rid_name)
+                new_ccys = _all_ccys(new_m, new_t)
+                new_opts = [ft.dropdown.Option(key="", text=_t("calc.field.choose_placeholder", "— оберіть —"))] + [
+                    ft.dropdown.Option(key=c, text=c) for c in new_ccys
+                ]
+                for dd in (buy_ccy_dd, pkg_ccy_dd, cost_ccy_dd):
+                    cur_v = dd.value
+                    dd.options = new_opts
+                    if cur_v not in new_ccys:
+                        dd.value = new_ccys[0] if new_ccys else None
+                _rebuild_methods(new_m, {}, dm_overrides_state[0])
+                _rebuild_tiers(new_t, {})
+                result_col.controls = []
+            except Exception:
+                logger.exception("Region switch failed in cost+duty calculator (region=%s)", rid_name)
+                result_col.controls = [
+                    ft.Container(
+                        bgcolor="#FEE2E2", border=ft.border.all(1, "#DC2626"),
+                        border_radius=8, padding=ft.padding.all(12),
+                        content=ft.Text(
+                            _t("calc.err.region_switch", "⚠ Помилка перемикання регіону: {region}").format(region=rid_name),
+                            color=_ERR_FG, size=12,
+                        ),
+                    )
+                ]
+            with contextlib.suppress(Exception):
+                page.update()
+
+        region_dd = _dd(_t("calc.field.region", "Регіон"), [(r, r) for r in regions_list],
+                        value=cur_region[0], width=_INP_W)
+        region_dd.on_select = _on_region_change
+        region_section = [_section(_t("calc.field.region", "Регіон")), region_dd]
+
+    # ── Inputs column ──────────────────────────────────────────────────────────
+    inputs_col = ft.Column(
+        [
+            *region_section,
+            _section(_t("calc.cost.section.purchase", "Закупівля")),
+            ft.Row([price_f, buy_ccy_dd], spacing=4),
+            ft.Row([pkg_f,   pkg_ccy_dd], spacing=4),
+            weight_f,
+            _section(_t("calc.cost.section.cost_currency", "Валюта собівартості")),
+            cost_ccy_dd,
+            _section(_t("calc.cost.section.delivery_methods", "Типи доставки  (✓ — обрати, тариф — редагується)")),
+            ft.Container(content=methods_col),
+            _section(_t("calc.cost_clo.section.duty", "Мито (ставка × (С/В ÷ коеф. коригування))")),
+            clo_rate_f,
+            clo_coef_f,
+            _section(_t("calc.field.rent_pct_optional", "Рентабельність (необов'яз.)")),
+            rent_f,
+            _section(_t("calc.cost.section.price_tiers", "Ціни продажу (необов'яз.)")),
+            *(
+                [ft.Container(content=manual_tiers_col)]
+                if tiers_dynamic else
+                [
+                    ft.Container(content=tiers_col),
+                    _section(_t("calc.tier.custom_section", "Додатковий рівень ціни (вручну)")),
+                    custom_tier_name_f,
+                    ft.Row([custom_tier_price_f, custom_tier_ccy_dd], spacing=4),
+                ]
+            ),
+        ],
+        spacing=4,
+        scroll=ft.ScrollMode.AUTO,
+        width=_INP_W,
+    )
+
+    # ── Results column ─────────────────────────────────────────────────────────
+    result_col = ft.Column(
+        [],
+        spacing=8,
+        scroll=ft.ScrollMode.AUTO,
+        width=_RES_W,
+    )
+
+    # ── Calculate ─────────────────────────────────────────────────────────────
+    def _calculate(_=None):
+        rates = _fetch_uah_rates(page)
+        purchase_price = _safe_float(price_f.value)
+        pkg_price      = _safe_float(pkg_f.value) or 0.0
+        weight         = _safe_float(weight_f.value)
+        rent_pct       = _safe_float(rent_f.value)
+        clo_rate       = _safe_float(clo_rate_f.value)
+        clo_coef       = _safe_float(clo_coef_f.value)
+        buy_ccy  = str(buy_ccy_dd.value  or "USD").upper()
+        pkg_ccy  = str(pkg_ccy_dd.value  or "USD").upper()
+        cost_ccy = str(cost_ccy_dd.value or "USD").upper()
+
+        def _err(msg: str):
+            result_col.controls = [
+                ft.Container(
+                    bgcolor="#FEF3C7", border=ft.border.all(1, "#F59E0B"),
+                    border_radius=8, padding=ft.padding.all(12),
+                    content=ft.Text(f"⚠  {msg}", color=_C_WARN, size=12),
+                )
+            ]
+            with contextlib.suppress(Exception):
+                page.update()
+
+        if purchase_price is None:
+            _err(_t("calc.err.enter_purchase_price", "Введіть ціну закупівлі"))
+            return
+        if weight is None:
+            _err(_t("calc.err.enter_weight", "Введіть вагу"))
+            return
+        if clo_rate is None:
+            _err(_t("calc.cost_clo.err.enter_duty_rate", "Введіть ставку мита"))
+            return
+        if not clo_coef:
+            _err(_t("calc.cost_clo.err.enter_freight_coef", "Введіть коефіцієнт для нарахування мита (CLA)"))
+            return
+
+        selected = [(mid, w) for mid, w in method_widgets.items() if w["cb"].value]
+        if not selected:
+            _err(_t("calc.err.choose_delivery_method", "Оберіть хоча б один тип доставки"))
+            return
+
+        buy_in_cv = _convert(purchase_price, buy_ccy, cost_ccy, rates)
+        if buy_in_cv is None:
+            detail = (
+                f" ({'; '.join(_FX_LAST_ERRORS)})" if _FX_LAST_ERRORS
+                else " " + _t("calc.err.rates_not_loaded", "(курси ще не завантажені — спробуйте ще раз за кілька секунд)")
+            )
+            _err(_t("calc.err.no_rate", "Немає курсу {a} → {b}").format(a=buy_ccy, b=cost_ccy) + detail)
+            return
+        pkg_in_cv  = (_convert(pkg_price, pkg_ccy, cost_ccy, rates) or 0.0) if pkg_price else 0.0
+        base_cost  = buy_in_cv + pkg_in_cv
+        has_rent   = rent_pct is not None and 0 < rent_pct < 100
+
+        tier_vals: list[tuple[str, str, float]] = []
+        for tid, tw in tier_widgets.items():
+            v = _safe_float(tw["field"].value)
+            if v is not None and v > 0:
+                tier_vals.append((tw["name"], tw["ccy"], v))
+        if tiers_dynamic:
+            for w in manual_tier_widgets.values():
+                nm = str(w["name_f"].value or "").strip()
+                pr = _safe_float(w["price_f"].value)
+                if nm and pr is not None and pr > 0:
+                    tier_vals.append((nm, str(w["ccy_dd"].value or "USD").upper(), pr))
+        else:
+            custom_tier_name = str(custom_tier_name_f.value or "").strip()
+            custom_tier_price = _safe_float(custom_tier_price_f.value)
+            if custom_tier_name and custom_tier_price is not None and custom_tier_price > 0:
+                tier_vals.append((custom_tier_name, str(custom_tier_ccy_dd.value or "USD").upper(), custom_tier_price))
+
+        extra_ccys: set[str] = {buy_ccy, pkg_ccy}
+        cards = []
+
+        for mid, mw in selected:
+            tariff      = _safe_float(mw["tariff_f"].value) or 0.0
+            mccy        = mw["ccy"]
+            mw_name     = (str(mw["name_f"].value or "").strip() if mw.get("name_f") else "") or mw["name"]
+            delivery_cv = _convert(weight * tariff, mccy, cost_ccy, rates) or (weight * tariff)
+            extra_ccys.add(mccy)
+            cv = base_cost + delivery_cv
+            clo_amount = clo_rate / 100.0 * (cv / clo_coef)
+            cv_clo = cv + clo_amount
+
+            # Every row up to (not including) the final "Собівартість з
+            # митом" total gets its % share of that total (cv_clo) — that
+            # includes the "С/В без мита" subtotal, not just the leaf cost
+            # components. None on rows after it. See _cost_card's docstring.
+            pct_of = (lambda amt: amt / cv_clo * 100) if cv_clo > 0 else (lambda amt: None)
+
+            card_rows: list[tuple[str, str, str, bool, float | None]] = [
+                (_t("calc.result.purchase_price", "Ціна закупівлі:"), _fmt_money(buy_in_cv, cost_ccy), _DARK, False, pct_of(buy_in_cv)),
+            ]
+            if pkg_in_cv:
+                card_rows.append((_t("calc.result.packaging", "Упаковка:"), _fmt_money(pkg_in_cv, cost_ccy), _MUTED, False, pct_of(pkg_in_cv)))
+            card_rows.append(
+                (_t("calc.result.delivery_line", "Доставка ({weight} кг × {tariff} {ccy}/кг):").format(weight=weight, tariff=tariff, ccy=mccy),
+                 _fmt_money(delivery_cv, cost_ccy), _MUTED, False, pct_of(delivery_cv))
+            )
+            card_rows.append((_t("calc.cost_clo.result.cost_no_duty", "С/В без мита:"), _fmt_money(cv, cost_ccy), _C_BLUE, True, pct_of(cv)))
+            card_rows.append(
+                (_t("calc.cost_clo.result.duty_line", "Мито ({rate:.1f}% ÷ {coef:g}):").format(rate=clo_rate, coef=clo_coef),
+                 _fmt_money(clo_amount, cost_ccy), _ERR_FG, True, pct_of(clo_amount))
+            )
+            card_rows.append((_t("calc.cost_clo.result.cost_with_duty", "Собівартість з митом:"), _fmt_money(cv_clo, cost_ccy), _C_OK, True, None))
+
+            if has_rent:
+                sale = cv_clo / (1.0 - rent_pct / 100.0)
+                card_rows.append(
+                    (_t("calc.result.price_at_rent", "Ціна при рент. {pct:.0f}%:").format(pct=rent_pct), _fmt_money(sale, cost_ccy), _C_BLUE, True, None)
+                )
+
+            for tnm, tccy, tprice in tier_vals:
+                tprice_cv = _convert(tprice, tccy, cost_ccy, rates) or tprice
+                r_pct = (tprice_cv - cv_clo) / tprice_cv * 100 if tprice_cv > 0 else 0.0
+                clr = _C_OK if r_pct >= 20 else (_C_WARN if r_pct >= 0 else _C_ERR)
+                price_label = (
+                    f"{_fmt_money(tprice, tccy)} - {_fmt_money(tprice_cv, cost_ccy)}"
+                    if tccy != cost_ccy else _fmt_money(tprice_cv, cost_ccy)
+                )
+                card_rows.append(
+                    (f"{tnm} ({price_label}):",
+                     f"{r_pct:.1f}%", clr, False, None)
+                )
+
+            cards.append(_cost_card(mw_name, card_rows, highlight=True))
+
+        # Rates line
+        rate_parts = _rate_texts(buy_ccy, cost_ccy, extra_ccys, rates)
+        rate_str   = "  |  ".join(t.value for t in rate_parts) if rate_parts else ""
+
+        result_col.controls = [
+            ft.Container(
+                bgcolor=_C_BG,
+                border_radius=8,
+                padding=ft.padding.symmetric(horizontal=12, vertical=8),
+                content=ft.Column(
+                    [
+                        ft.Text(_t("calc.results_title", "Результати розрахунку"), size=12,
+                                weight=ft.FontWeight.W_700, color=_DARK),
+                        ft.Text(
+                            _t("calc.cost_clo.formula", "С/В з митом = С/В + Ставка мита% × (С/В ÷ Коефіцієнт для нарахування мита (CLA))"),
+                            size=9, color=_MUTED, italic=True,
+                        ),
+                        *(
+                            [ft.Text(rate_str, size=9, color=_MUTED)]
+                            if rate_str else []
+                        ),
+                    ],
+                    spacing=2, tight=True,
+                ),
+            ),
+            *cards,
+        ]
+        with contextlib.suppress(Exception):
+            page.update()
+
+    def _get_data() -> dict:
+        return {
+            "region_id":    cur_region[0],
+            "purchase_price": price_f.value,
+            "purchase_ccy": buy_ccy_dd.value,
+            "pkg_price":    pkg_f.value,
+            "pkg_ccy":      pkg_ccy_dd.value,
+            "cost_ccy":     cost_ccy_dd.value,
+            "weight":       weight_f.value,
+            "rent_pct":     rent_f.value,
+            "clo_rate":     clo_rate_f.value,
+            "clo_coef":     clo_coef_f.value,
+            "methods": {
+                mid: {
+                    "checked": w["cb"].value, "tariff": w["tariff_f"].value,
+                    **({"name": w["name_f"].value} if w.get("name_f") else {}),
+                }
+                for mid, w in method_widgets.items()
+            },
+            "tiers": {tid: tw["field"].value for tid, tw in tier_widgets.items()},
+            **(
+                {
+                    "manual_tiers": [
+                        {"id": tid, "name": w["name_f"].value, "price": w["price_f"].value, "ccy": w["ccy_dd"].value}
+                        for tid, w in manual_tier_widgets.items()
+                    ],
+                }
+                if tiers_dynamic else
+                {
+                    "custom_tier_name": custom_tier_name_f.value,
+                    "custom_tier_price": custom_tier_price_f.value,
+                    "custom_tier_ccy": custom_tier_ccy_dd.value,
+                }
+            ),
+        }
+
+    panel_body = ft.Row(
+        [
+            ft.Column(
+                [
+                    ft.Container(
+                        width=_LEFT_W,
+                        content=inputs_col,
+                    ),
+                    ft.FilledButton(
+                        "  " + _t("calc.action.calculate", "Розрахувати"),
+                        icon=ft.Icons.CALCULATE,
+                        on_click=_calculate,
+                        width=_LEFT_W,
+                        style=ft.ButtonStyle(
+                            shape=ft.RoundedRectangleBorder(radius=8),
+                        ),
+                    ),
+                ],
+                spacing=6,
+                tight=True,
+            ),
+            ft.VerticalDivider(width=1, color=_BORDER),
+            ft.Container(
+                width=_RIGHT_W,
+                content=result_col,
+            ),
+        ],
+        spacing=10,
+        vertical_alignment=ft.CrossAxisAlignment.START,
+    )
+    container = ft.Container(
+        border=ft.border.all(1, _BORDER),
+        border_radius=10,
+        padding=8,
+        content=ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Container(expand=True),
+                        ft.IconButton(
+                            ft.Icons.CLOSE, icon_size=14, tooltip=_t("calc.compare.remove_panel", "Прибрати панель"),
+                            on_click=on_remove,
+                        ),
+                    ],
+                    tight=True,
+                ),
+                panel_body,
+            ],
+            spacing=0, tight=True,
+        ),
+    )
+    return container, _get_data
+
+
+def _open_cost_clo(
+    page, db, manager_id: str, company_id: str, region_id: str,
+    regions_list: list[str], prefill: dict | None = None, back_fn=None,
+):
+    _t = i18n.bind(str(manager_id or ""))
+    _ACTIVE_MANAGER_ID[0] = str(manager_id or "")
+
+    def _factory(pf: dict, on_remove):
+        return _build_cost_clo_panel(
+            page, db, manager_id, company_id, region_id, regions_list, pf, on_remove
+        )
+
+    def _help(_):
+        from views.help_utils import show_modal_help
+        show_modal_help(page, _t("calc.cost_clo.title", "Собівартість з митом"), [
+            _t("calc.cost_clo.help1", "Мито нараховується тільки на ту частку доставки, що йде поза межами ЄС "
+               "(до кордону з країнами ЄС) — Коефіцієнт для нарахування мита (CLA) вже враховує цю частку."),
+            _t("calc.cost_clo.help2", "Формула: Мито = Ставка мита% × (С/В без мита ÷ Коефіцієнт для нарахування мита (CLA))."),
+            _t("calc.cost_clo.help3", "Приклад: інвойс 2 + логістика 1 = 3, ставка 9,7%, коефіцієнт 1,2 "
+               "(80% поза ЄС / 20% в межах ЄС) → мито = 9,7% × (3 ÷ 1,2) = 0,2425."),
+            _t("calc.cost_clo.help4", "Підсумкова С/В з митом використовується далі для рентабельності й "
+               "порівняння з цінами продажу — так само, як у звичайному "
+               "калькуляторі Собівартості."),
+            _t("calc.compare.help_note", "Кнопкою «+» можна додати ще одну панель для порівняння (до 5) — "
+               "копіюються лише введені значення, не результат."),
+        ])
+
+    def _reopen(data: dict):
+        _open_cost_clo(page, db, manager_id, company_id, region_id, regions_list, prefill=data, back_fn=back_fn)
+
+    _run_multi_panel_calculator(
+        page, db, manager_id, "cost_clo", _t("calc.cost_clo.title", "Собівартість з митом"), prefill, _factory,
+        single_panel_width=_LEFT_W + 21 + _RIGHT_W + 32,
+        back_fn=back_fn,
+        help_fn=_help,
+        reopen_fn=_reopen,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ── 3. Рентабельність ─────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
-def _open_profit(
+def _build_profit_panel(
     page,
     db,
     manager_id: str,
     company_id: str,
     region_id: str,
     regions_list: list[str],
-    prefill: dict | None = None,
-    back_fn=None,
+    prefill: dict | None,
+    on_remove,
 ):
+    _t = i18n.bind(str(manager_id or ""))
+    _ACTIVE_MANAGER_ID[0] = str(manager_id or "")
     pf = prefill or {}
     cur_region = [str(pf.get("region_id") or region_id or "")]
 
@@ -1302,6 +2916,11 @@ def _open_profit(
             return []
 
     tiers0 = _load_tiers(cur_region[0])
+    # No real per-company price tiers configured for this region (always
+    # true in the standalone/portable app, which has no regions at all) —
+    # render a growable manual list ("+" adds as many levels as needed)
+    # instead of a "not configured" message + a single fixed manual field.
+    tiers_dynamic = not bool(tiers0)
 
     def _all_ccys(tiers) -> list[str]:
         s: set[str] = {"USD", "UAH", "EUR", "PLN", "CNY"}
@@ -1312,14 +2931,45 @@ def _open_profit(
     ccy_opts0 = [(c, c) for c in _all_ccys(tiers0)]
     _PL = 280   # left column width
     _PR = 240   # right column width
-    cost_f  = _field("С/В *",           width=160, value=pf.get("cost", ""))
-    cost_dd = _dd("Валюта", ccy_opts0, value=str(pf.get("cost_ccy") or "USD"), width=114)
-    rent_f  = _field("Рентабельність, %", width=_PL - 4, value=pf.get("rent_pct", ""), optional=True)
+    cost_f  = _field(_t("calc.profit.cost", "С/В *"),           width=160, value=pf.get("cost", ""))
+    cost_dd = _dd(_t("calc.field.currency", "Валюта"), ccy_opts0, value=str(pf.get("cost_ccy") or "USD"), width=114)
+    rent_f  = _field(_t("calc.field.rent_pct", "Рентабельність, %"), width=_PL - 4, value=pf.get("rent_pct", ""), optional=True)
+
+    _TIER_CCYS = ("USD", "UAH", "EUR", "PLN", "CNY")
+    custom_tier_name_f = _field(
+        _t("calc.tier.custom_name", "Назва рівня"), width=_PL, value=pf.get("custom_tier_name", ""),
+        number=False, optional=True,
+    )
+    custom_tier_price_f = _field(
+        _t("calc.tier.custom_price", "Ціна рівня"), width=160, value=pf.get("custom_tier_price", ""), optional=True,
+    )
+    custom_tier_ccy_dd = _dd(
+        _t("calc.field.currency", "Валюта"), [(c, c) for c in _TIER_CCYS],
+        value=str(pf.get("custom_tier_ccy") or "USD"), width=114,
+    )
 
     tiers_col = ft.Column([], spacing=4)
     result_col = ft.Column([], spacing=4)
     rates_row = ft.Row([], wrap=True, spacing=6)
     tier_widgets: dict[str, dict] = {}
+    manual_tiers_col = ft.Column([], spacing=4, tight=True)
+    manual_tier_widgets: dict[str, dict] = {}
+    _manual_tiers_next_id = [1]
+    if tiers_dynamic:
+        _mt_seed = pf.get("manual_tiers")
+        if not _mt_seed and pf.get("custom_tier_name"):
+            _mt_seed = [{
+                "name": pf.get("custom_tier_name"), "price": pf.get("custom_tier_price"),
+                "ccy": pf.get("custom_tier_ccy"),
+            }]
+        manual_tiers_state: list[dict] = [
+            {"id": t.get("id") or f"manual_tier_{i + 1}", "name": t.get("name", ""),
+             "price": t.get("price", ""), "ccy": t.get("ccy") or "USD"}
+            for i, t in enumerate(_mt_seed or [])
+        ]
+        _manual_tiers_next_id[0] = len(manual_tiers_state) + 1
+    else:
+        manual_tiers_state = []
 
     def _rebuild_tiers(tiers: list[dict], pf_tiers: dict):
         tier_widgets.clear()
@@ -1327,7 +2977,7 @@ def _open_profit(
         if not tiers:
             rows.append(
                 ft.Text(
-                    "Ціни продажу не налаштовані для цього регіону",
+                    _t("calc.cost.no_price_tiers", "Ціни продажу не налаштовані для цього регіону"),
                     size=11,
                     color=_MUTED,
                     italic=True,
@@ -1364,6 +3014,81 @@ def _open_profit(
             )
         tiers_col.controls = rows
 
+    def _sync_manual_tiers_from_widgets():
+        for t in manual_tiers_state:
+            w = manual_tier_widgets.get(t["id"])
+            if w:
+                t["name"] = w["name_f"].value
+                t["price"] = w["price_f"].value
+                t["ccy"] = w["ccy_dd"].value
+
+    def _rebuild_manual_tiers():
+        manual_tier_widgets.clear()
+        rows = []
+        for t in manual_tiers_state:
+            tid = t["id"]
+            name_f = ft.TextField(
+                value=str(t.get("name") or ""),
+                hint_text=_t("calc.tier.custom_name", "Назва рівня"),
+                dense=True, border_radius=6, expand=True,
+                content_padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                text_style=ft.TextStyle(size=12),
+            )
+            price_f = ft.TextField(
+                value=str(t.get("price") or ""), width=90, border_radius=6, dense=True,
+                keyboard_type=ft.KeyboardType.NUMBER,
+                content_padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                text_style=ft.TextStyle(size=12),
+            )
+            ccy_dd = _dd("", [(c, c) for c in _TIER_CCYS], value=str(t.get("ccy") or "USD"), width=114)
+            manual_tier_widgets[tid] = {"name_f": name_f, "price_f": price_f, "ccy_dd": ccy_dd}
+            rows.append(ft.Container(
+                padding=ft.padding.only(bottom=4),
+                border=ft.border.only(bottom=ft.BorderSide(1, _BORDER)),
+                content=ft.Column(
+                    [
+                        ft.Row(
+                            [
+                                name_f,
+                                ft.IconButton(
+                                    ft.Icons.CLOSE, icon_size=14, icon_color=_MUTED,
+                                    tooltip=_t("common.delete", "Видалити"),
+                                    on_click=lambda _, tid=tid: _remove_manual_tier(tid),
+                                ),
+                            ],
+                            spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                        ft.Row([price_f, ccy_dd], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    ],
+                    spacing=4, tight=True,
+                ),
+            ))
+        rows.append(ft.TextButton(
+            "+ " + _t("calc.tier.add_level", "Додати рівень ціни"),
+            icon=ft.Icons.ADD, on_click=_add_manual_tier,
+            style=ft.ButtonStyle(padding=0),
+        ))
+        manual_tiers_col.controls = rows
+
+    def _add_manual_tier(_=None):
+        _sync_manual_tiers_from_widgets()
+        n = _manual_tiers_next_id[0]
+        _manual_tiers_next_id[0] += 1
+        manual_tiers_state.append({"id": f"manual_tier_{n}", "name": "", "price": "", "ccy": "USD"})
+        _rebuild_manual_tiers()
+        with contextlib.suppress(Exception):
+            page.update()
+
+    def _remove_manual_tier(tid: str):
+        _sync_manual_tiers_from_widgets()
+        manual_tiers_state[:] = [t for t in manual_tiers_state if t["id"] != tid]
+        _rebuild_manual_tiers()
+        with contextlib.suppress(Exception):
+            page.update()
+
+    if tiers_dynamic:
+        _rebuild_manual_tiers()
+
     _rebuild_tiers(tiers0, pf.get("tiers") or {})
 
     def _on_region_change(e):
@@ -1374,7 +3099,7 @@ def _open_profit(
             cur_region[0] = rid
             new_tiers = _load_tiers(rid)
             new_ccys = _all_ccys(new_tiers)
-            new_opts = [ft.dropdown.Option(key="", text="— оберіть —")] + [
+            new_opts = [ft.dropdown.Option(key="", text=_t("calc.field.choose_placeholder", "— оберіть —"))] + [
                 ft.dropdown.Option(key=c, text=c) for c in new_ccys
             ]
             cost_dd.options = new_opts
@@ -1388,7 +3113,7 @@ def _open_profit(
                     bgcolor="#FEE2E2", border=ft.border.all(1, "#DC2626"),
                     border_radius=8, padding=ft.padding.all(12),
                     content=ft.Text(
-                        f"⚠ Помилка перемикання регіону: {rid}",
+                        _t("calc.err.region_switch", "⚠ Помилка перемикання регіону: {region}").format(region=rid),
                         color=_ERR_FG, size=12,
                     ),
                 )
@@ -1399,26 +3124,13 @@ def _open_profit(
     region_section: list = []
     if len(regions_list) > 1:
         region_dd = _dd(
-            "Регіон", [(r, r) for r in regions_list], value=cur_region[0], width=200
+            _t("calc.field.region", "Регіон"), [(r, r) for r in regions_list], value=cur_region[0], width=200
         )
         region_dd.on_select = _on_region_change
-        region_section = [_section("Регіон"), region_dd]
-
-    dlg = _FloatDialog()
-
-    def _close(_=None):
-        with contextlib.suppress(Exception):
-            _fdlg_close(page, dlg)
-
-    async def _go_back(_=None):
-        _close()
-        if back_fn:
-            await asyncio.sleep(0.05)
-            with contextlib.suppress(Exception):
-                back_fn()
+        region_section = [_section(_t("calc.field.region", "Регіон")), region_dd]
 
     def _calculate(_=None):
-        rates = _fetch_uah_rates()
+        rates = _fetch_uah_rates(page)
         cv = _safe_float(cost_f.value)
         cccy = str(cost_dd.value or "USD").upper()
         rpct = _safe_float(rent_f.value)
@@ -1427,7 +3139,7 @@ def _open_profit(
                 ft.Container(
                     bgcolor="#FEF3C7", border=ft.border.all(1, "#F59E0B"),
                     border_radius=8, padding=ft.padding.all(12),
-                    content=ft.Text("⚠  Введіть С/В", color=_C_WARN, size=12),
+                    content=ft.Text("⚠  " + _t("calc.profit.err.enter_cost", "Введіть С/В"), color=_C_WARN, size=12),
                 )
             ]
             with contextlib.suppress(Exception):
@@ -1440,15 +3152,29 @@ def _open_profit(
             v = _safe_float(tw["field"].value)
             if v is not None and v > 0:
                 tier_vals.append((tw["name"], tw["ccy"], v))
+        if tiers_dynamic:
+            for w in manual_tier_widgets.values():
+                nm = str(w["name_f"].value or "").strip()
+                pr = _safe_float(w["price_f"].value)
+                if nm and pr is not None and pr > 0:
+                    tier_vals.append((nm, str(w["ccy_dd"].value or "USD").upper(), pr))
+        else:
+            custom_tier_name = str(custom_tier_name_f.value or "").strip()
+            custom_tier_price = _safe_float(custom_tier_price_f.value)
+            if custom_tier_name and custom_tier_price is not None and custom_tier_price > 0:
+                tier_vals.append((custom_tier_name, str(custom_tier_ccy_dd.value or "USD").upper(), custom_tier_price))
 
+        # Рентабельність has no itemized cost components (just a manually
+        # entered total), so — per explicit decision — it doesn't get the
+        # %-breakdown feature; every row here passes pct=None.
         extra_ccys: set[str] = set()
-        card_rows: list[tuple[str, str, str, bool]] = [
-            (f"С/В ({cccy}):", _fmt_money(cv, cccy), _C_OK, True),
+        card_rows: list[tuple[str, str, str, bool, float | None]] = [
+            (_t("calc.profit.result.cost_line", "С/В ({ccy}):").format(ccy=cccy), _fmt_money(cv, cccy), _C_OK, True, None),
         ]
         if has_rent:
             sale = cv / (1.0 - rpct / 100.0)
             card_rows.append(
-                (f"Ціна при рент. {rpct:.0f}%:", _fmt_money(sale, cccy), _C_BLUE, True)
+                (_t("calc.result.price_at_rent", "Ціна при рент. {pct:.0f}%:").format(pct=rpct), _fmt_money(sale, cccy), _C_BLUE, True, None)
             )
         for tnm, tccy, tprice in tier_vals:
             tprice_cv = _convert(tprice, tccy, cccy, rates) or tprice
@@ -1459,7 +3185,7 @@ def _open_profit(
                 if tccy != cccy else _fmt_money(tprice_cv, cccy)
             )
             card_rows.append(
-                (f"{tnm} ({price_label}):", f"{r_pct:.1f}%", clr, False)
+                (f"{tnm} ({price_label}):", f"{r_pct:.1f}%", clr, False, None)
             )
             extra_ccys.add(tccy)
 
@@ -1473,8 +3199,12 @@ def _open_profit(
                 padding=ft.padding.symmetric(horizontal=12, vertical=8),
                 content=ft.Column(
                     [
-                        ft.Text("Результати розрахунку", size=12,
+                        ft.Text(_t("calc.results_title", "Результати розрахунку"), size=12,
                                 weight=ft.FontWeight.W_700, color=_DARK),
+                        ft.Text(
+                            _t("calc.profit.formula", "Ціна = С/В ÷ (1 − Рентабельність%)  |  Рентабельність% = (Ціна − С/В) ÷ Ціна × 100"),
+                            size=9, color=_MUTED, italic=True,
+                        ),
                         *(
                             [ft.Text(rate_str, size=9, color=_MUTED)]
                             if rate_str else []
@@ -1483,51 +3213,56 @@ def _open_profit(
                     spacing=2, tight=True,
                 ),
             ),
-            _cost_card("Рентабельність", card_rows),
+            _cost_card(_t("calc.profit.title", "Рентабельність"), card_rows),
         ]
         rates_row.controls = []
         with contextlib.suppress(Exception):
             page.update()
 
-    def _do_save(_=None):
-        data = {
+    def _get_data() -> dict:
+        return {
             "region_id": cur_region[0],
             "cost": cost_f.value,
             "cost_ccy": cost_dd.value,
             "rent_pct": rent_f.value,
             "tiers": {tid: tw["field"].value for tid, tw in tier_widgets.items()},
-        }
-        _show_save_dialog(page, db, manager_id, "profit", data)
-
-    _PW = _PL + 1 + _PR + 32  # 280+1+240+32 = 553
-
-    dlg.title = ft.Row(
-        [
-            ft.Text("Рентабельність", weight="bold", size=13, expand=True),
-            ft.IconButton(ft.Icons.BOOKMARK_ADD_OUTLINED, tooltip="Зберегти",
-                          on_click=_do_save, icon_size=18),
-            *(
-                [ft.IconButton(ft.Icons.ARROW_BACK, tooltip="Назад",
-                               on_click=_go_back, icon_size=16)]
-                if back_fn else []
+            **(
+                {
+                    "manual_tiers": [
+                        {"id": tid, "name": w["name_f"].value, "price": w["price_f"].value, "ccy": w["ccy_dd"].value}
+                        for tid, w in manual_tier_widgets.items()
+                    ],
+                }
+                if tiers_dynamic else
+                {
+                    "custom_tier_name": custom_tier_name_f.value,
+                    "custom_tier_price": custom_tier_price_f.value,
+                    "custom_tier_ccy": custom_tier_ccy_dd.value,
+                }
             ),
-            ft.IconButton(ft.Icons.CLOSE, on_click=_close, icon_size=16),
-        ]
-    )
-    dlg.panel_width = _PW
+        }
 
     inputs_col = ft.Column(
         [
             *region_section,
-            _section("С/В"),
+            _section(_t("calc.profit.cost_section", "С/В")),
             ft.Row([cost_f, cost_dd], spacing=6),
-            _section("Рентабельність (необов'яз.)"),
+            _section(_t("calc.field.rent_pct_optional", "Рентабельність (необов'яз.)")),
             rent_f,
-            _section("Ціни продажу (необов'яз.)"),
-            tiers_col,
+            _section(_t("calc.cost.section.price_tiers", "Ціни продажу (необов'яз.)")),
+            *(
+                [ft.Container(content=manual_tiers_col)]
+                if tiers_dynamic else
+                [
+                    tiers_col,
+                    _section(_t("calc.tier.custom_section", "Додатковий рівень ціни (вручну)")),
+                    custom_tier_name_f,
+                    ft.Row([custom_tier_price_f, custom_tier_ccy_dd], spacing=6),
+                ]
+            ),
             ft.Container(height=4),
             ft.FilledButton(
-                "  Розрахувати", on_click=_calculate, icon=ft.Icons.CALCULATE,
+                "  " + _t("calc.action.calculate", "Розрахувати"), on_click=_calculate, icon=ft.Icons.CALCULATE,
                 width=_PL,
                 style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8)),
             ),
@@ -1537,103 +3272,118 @@ def _open_profit(
         width=_PL,
     )
 
-    dlg.content = ft.Container(
-        padding=ft.padding.symmetric(horizontal=16, vertical=8),
-        content=ft.Row(
-            [
-                ft.Container(content=inputs_col, width=_PL, height=_PANEL_H),
-                ft.VerticalDivider(width=1, color=_BORDER),
-                ft.Container(
-                    content=ft.Column(
-                        [result_col],
-                        spacing=4,
-                        scroll=ft.ScrollMode.AUTO,
-                    ),
-                    width=_PR,
-                    height=_PANEL_H,
+    panel_body = ft.Row(
+        [
+            ft.Container(content=inputs_col, width=_PL),
+            ft.VerticalDivider(width=1, color=_BORDER),
+            ft.Container(
+                content=ft.Column(
+                    [result_col],
+                    spacing=4,
                 ),
+                width=_PR,
+            ),
+        ],
+        spacing=10,
+        vertical_alignment=ft.CrossAxisAlignment.START,
+    )
+    container = ft.Container(
+        border=ft.border.all(1, _BORDER),
+        border_radius=10,
+        padding=8,
+        content=ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Container(expand=True),
+                        ft.IconButton(
+                            ft.Icons.CLOSE, icon_size=14, tooltip=_t("calc.compare.remove_panel", "Прибрати панель"),
+                            on_click=on_remove,
+                        ),
+                    ],
+                    tight=True,
+                ),
+                panel_body,
             ],
-            spacing=10,
-            vertical_alignment=ft.CrossAxisAlignment.START,
+            spacing=0, tight=True,
         ),
     )
-    _fdlg_open(page, dlg)
+    return container, _get_data
+
+
+def _open_profit(
+    page, db, manager_id: str, company_id: str, region_id: str,
+    regions_list: list[str], prefill: dict | None = None, back_fn=None,
+):
+    _t = i18n.bind(str(manager_id or ""))
+    _ACTIVE_MANAGER_ID[0] = str(manager_id or "")
+
+    def _factory(pf: dict, on_remove):
+        return _build_profit_panel(
+            page, db, manager_id, company_id, region_id, regions_list, pf, on_remove
+        )
+
+    def _reopen(data: dict):
+        _open_profit(page, db, manager_id, company_id, region_id, regions_list, prefill=data, back_fn=back_fn)
+
+    _run_multi_panel_calculator(
+        page, db, manager_id, "profit", _t("calc.profit.title", "Рентабельність"), prefill, _factory,
+        single_panel_width=238 + 1 + 204 + 32,  # -15%, matches cost/cost_clo's _LEFT_W/_RIGHT_W reduction
+        back_fn=back_fn,
+        reopen_fn=_reopen,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ── 4. Обертаємість / Забезпеченість (combined) ───────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
-def _open_turnover_coverage(page, db, manager_id: str, prefill: dict | None = None, back_fn=None):
+def _build_turnover_panel(page, db, manager_id: str, prefill: dict | None, on_remove):
+    _t = i18n.bind(str(manager_id or ""))
+    _ACTIVE_MANAGER_ID[0] = str(manager_id or "")
     pf = prefill or {}
-    dlg = _FloatDialog()
     _FW = 336  # field width
-    start_f = _field("Склад початок *", width=_FW, value=pf.get("start", ""))
-    end_f = _field("Склад кінець *", width=_FW, value=pf.get("end", ""))
-    days_f = _field("Кількість днів у періоді *", width=_FW, value=pf.get("days", ""))
-    cost_f = _field("С/В реалізованого товару *", width=_FW, value=pf.get("cost", ""))
+    start_f = _field(_t("calc.turnover.start", "Склад початок *"), width=_FW, value=pf.get("start", ""))
+    end_f = _field(_t("calc.turnover.end", "Склад кінець *"), width=_FW, value=pf.get("end", ""))
+    days_f = _field(_t("calc.turnover.days", "Кількість днів у періоді *"), width=_FW, value=pf.get("days", ""))
+    cost_f = _field(_t("calc.turnover.cost", "С/В реалізованого товару *"), width=_FW, value=pf.get("cost", ""))
 
     turnover_text = ft.Text("—", size=20, weight="bold", color=_ACCENT)
     coverage_text = ft.Text("—", size=20, weight="bold", color=_ACCENT)
-
-    def _close(_=None):
-        with contextlib.suppress(Exception):
-            _fdlg_close(page, dlg)
-
-    async def _go_back(_=None):
-        _close()
-        if back_fn:
-            await asyncio.sleep(0.05)
-            with contextlib.suppress(Exception):
-                back_fn()
 
     def _calculate(_=None):
         start = _safe_float(start_f.value)
         end = _safe_float(end_f.value)
         days = _safe_float(days_f.value)
         cv = _safe_float(cost_f.value)
+        days_word = _t("calc.turnover.days_unit", "днів")
         if None in (start, end, days, cv):
-            turnover_text.value = "⚠ Заповніть усі поля"
+            turnover_text.value = "⚠ " + _t("calc.turnover.err.fill_all", "Заповніть усі поля")
             turnover_text.color = _WARN_FG
             coverage_text.value = ""
         elif cv == 0:
-            turnover_text.value = "⚠ С/В = 0"
+            turnover_text.value = "⚠ " + _t("calc.turnover.err.cost_zero", "С/В = 0")
             turnover_text.color = _WARN_FG
             coverage_text.value = ""
         else:
             avg = (start + end) / 2.0
             turnover = (avg * days) / cv
             coverage = (end * days) / cv
-            turnover_text.value = f"{_fmt_val(turnover, 1)} днів"
+            turnover_text.value = f"{_fmt_val(turnover, 1)} {days_word}"
             turnover_text.color = _ACCENT
-            coverage_text.value = f"{_fmt_val(coverage, 1)} днів"
+            coverage_text.value = f"{_fmt_val(coverage, 1)} {days_word}"
             coverage_text.color = _ACCENT
         with contextlib.suppress(Exception):
             page.update()
 
-    def _do_save(_=None):
-        _show_save_dialog(
-            page, db, manager_id, "turnover",
-            {"start": start_f.value, "end": end_f.value,
-             "days": days_f.value, "cost": cost_f.value},
-        )
+    def _get_data() -> dict:
+        return {
+            "start": start_f.value, "end": end_f.value,
+            "days": days_f.value, "cost": cost_f.value,
+        }
 
-    dlg.title = ft.Row(
-        [
-            ft.Text("Оборот / Забезпеченість", weight="bold", size=13, expand=True),
-            ft.IconButton(ft.Icons.BOOKMARK_ADD_OUTLINED, tooltip="Зберегти",
-                          on_click=_do_save, icon_size=18),
-            *(
-                [ft.IconButton(ft.Icons.ARROW_BACK, tooltip="Назад",
-                               on_click=_go_back, icon_size=16)]
-                if back_fn else []
-            ),
-            ft.IconButton(ft.Icons.CLOSE, on_click=_close, icon_size=16),
-        ]
-    )
     _PW = 400
     _IW = _PW - 32
-    dlg.panel_width = _PW
-    dlg.content = ft.Container(
+    panel_body = ft.Container(
         width=_PW,
         padding=ft.padding.symmetric(horizontal=16, vertical=10),
         content=ft.Column(
@@ -1641,11 +3391,11 @@ def _open_turnover_coverage(page, db, manager_id: str, prefill: dict | None = No
                 ft.Container(
                     content=ft.Column([
                         ft.Text(
-                            "Обертаємість = ((Поч + Кін) / 2 × Дні) / С/В",
+                            _t("calc.turnover.formula1", "Обертаємість = ((Поч + Кін) / 2 × Дні) / С/В"),
                             size=9, color=_MUTED, italic=True,
                         ),
                         ft.Text(
-                            "Забезпеченість = (Кін × Дні) / С/В",
+                            _t("calc.turnover.formula2", "Забезпеченість = (Кін × Дні) / С/В"),
                             size=9, color=_MUTED, italic=True,
                         ),
                     ], spacing=2, tight=True),
@@ -1657,7 +3407,7 @@ def _open_turnover_coverage(page, db, manager_id: str, prefill: dict | None = No
                 days_f,
                 cost_f,
                 ft.FilledButton(
-                    "  Розрахувати", on_click=_calculate, icon=ft.Icons.CALCULATE,
+                    "  " + _t("calc.action.calculate", "Розрахувати"), on_click=_calculate, icon=ft.Icons.CALCULATE,
                     width=_IW,
                     style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8)),
                 ),
@@ -1665,11 +3415,11 @@ def _open_turnover_coverage(page, db, manager_id: str, prefill: dict | None = No
                 ft.Container(
                     content=ft.Column([
                         ft.Row([
-                            ft.Text("Обертаємість:", size=12, color=_MUTED, width=130),
+                            ft.Text(_t("calc.turnover.turnover_label", "Обертаємість:"), size=12, color=_MUTED, width=130),
                             turnover_text,
                         ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                         ft.Row([
-                            ft.Text("Забезпеченість:", size=12, color=_MUTED, width=130),
+                            ft.Text(_t("calc.turnover.coverage_label", "Забезпеченість:"), size=12, color=_MUTED, width=130),
                             coverage_text,
                         ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                     ], spacing=8, tight=True),
@@ -1681,7 +3431,46 @@ def _open_turnover_coverage(page, db, manager_id: str, prefill: dict | None = No
             tight=True,
         ),
     )
-    _fdlg_open(page, dlg)
+    container = ft.Container(
+        border=ft.border.all(1, _BORDER),
+        border_radius=10,
+        padding=8,
+        content=ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Container(expand=True),
+                        ft.IconButton(
+                            ft.Icons.CLOSE, icon_size=14, tooltip=_t("calc.compare.remove_panel", "Прибрати панель"),
+                            on_click=on_remove,
+                        ),
+                    ],
+                    tight=True,
+                ),
+                panel_body,
+            ],
+            spacing=0, tight=True,
+        ),
+    )
+    return container, _get_data
+
+
+def _open_turnover_coverage(page, db, manager_id: str, prefill: dict | None = None, back_fn=None):
+    _t = i18n.bind(str(manager_id or ""))
+    _ACTIVE_MANAGER_ID[0] = str(manager_id or "")
+
+    def _factory(pf: dict, on_remove):
+        return _build_turnover_panel(page, db, manager_id, pf, on_remove)
+
+    def _reopen(data: dict):
+        _open_turnover_coverage(page, db, manager_id, prefill=data, back_fn=back_fn)
+
+    _run_multi_panel_calculator(
+        page, db, manager_id, "turnover", _t("calc.turnover.title", "Оборот / Забезпеченість"), prefill, _factory,
+        single_panel_width=400,
+        back_fn=back_fn,
+        reopen_fn=_reopen,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1691,11 +3480,12 @@ def _open_saved(
     page, db, manager_id: str, company_id: str, region_id: str, regions_list: list[str],
     back_fn=None,
 ):
+    _t = i18n.bind(str(manager_id or ""))
     dlg = _FloatDialog()
     list_col = ft.Column([], spacing=4, scroll=ft.ScrollMode.AUTO)
 
     filter_cbs: dict[str, ft.Checkbox] = {
-        k: ft.Checkbox(label=v, value=True) for k, v in _CALC_TYPES
+        k: ft.Checkbox(label=_calc_type_label(_t, k), value=True) for k, v in _CALC_TYPES
     }
 
     def _close(_=None):
@@ -1722,7 +3512,7 @@ def _open_saved(
 
         if not filtered:
             list_col.controls = [
-                ft.Text("Немає збережених розрахунків", size=11, color=_MUTED)
+                ft.Text(_t("calc.saved.empty", "Немає збережених розрахунків"), size=11, color=_MUTED)
             ]
             with contextlib.suppress(Exception):
                 page.update()
@@ -1741,7 +3531,7 @@ def _open_saved(
                         [
                             ft.Container(
                                 content=ft.Text(
-                                    str(s.get("calc_label") or ""),
+                                    _calc_type_label(_t, str(s.get("calc_type") or "")),
                                     size=10,
                                     color=_ACCENT,
                                     weight="bold",
@@ -1767,14 +3557,20 @@ def _open_saved(
                             ft.Row(
                                 [
                                     ft.TextButton(
-                                        "Відкрити",
+                                        _t("calc.saved.open", "Відкрити"),
                                         on_click=lambda _, e=entry: _open_entry(e),
+                                    ),
+                                    ft.IconButton(
+                                        ft.Icons.EDIT_OUTLINED,
+                                        icon_size=16,
+                                        tooltip=_t("common.edit", "Редагувати"),
+                                        on_click=lambda _, e=entry: _do_rename(e),
                                     ),
                                     ft.IconButton(
                                         ft.Icons.DELETE_OUTLINE,
                                         icon_size=16,
                                         icon_color=_ERR_FG,
-                                        tooltip="Видалити",
+                                        tooltip=_t("common.delete", "Видалити"),
                                         on_click=lambda _, e=entry: _do_delete(e),
                                     ),
                                 ],
@@ -1794,18 +3590,50 @@ def _open_saved(
         _delete_calc_entry(db, manager_id, str(entry.get("id") or ""))
         _refresh_list()
 
+    def _do_rename(entry: dict):
+        name_f = ft.TextField(
+            label=_t("calc.save_dlg.name_label", "Назва розрахунку"),
+            value=str(entry.get("name") or ""), width=300, border_radius=8, autofocus=True,
+        )
+        rdlg = ft.AlertDialog(modal=True)
+
+        def _do(_e=None):
+            nm = str(name_f.value or "").strip()
+            if nm:
+                _rename_calc_entry(db, manager_id, str(entry.get("id") or ""), nm)
+            with contextlib.suppress(Exception):
+                page.pop_dialog()
+            _refresh_list()
+
+        rdlg.title = ft.Text(_t("calc.rename_dlg.title", "Перейменувати розрахунок"), weight="bold")
+        rdlg.content = ft.Container(width=320, padding=16, content=name_f)
+        rdlg.actions = [
+            ft.TextButton(_t("common.cancel", "Скасувати"), on_click=lambda _: page.pop_dialog()),
+            ft.FilledButton(_t("common.save", "Зберегти"), on_click=_do),
+        ]
+        rdlg.actions_alignment = ft.MainAxisAlignment.END
+        name_f.on_submit = _do
+        page.show_dialog(rdlg)
+
     for cb in filter_cbs.values():
         cb.on_change = _refresh_list
 
+    def _on_lang_select(code: str) -> None:
+        i18n.save_manager_language(db, str(manager_id or ""), code)
+        _close()
+        _open_saved(page, db, manager_id, company_id, region_id, regions_list, back_fn=back_fn)
+
     dlg.title = ft.Row(
         [
-            ft.Text("Збережені розрахунки", weight="bold", size=13, expand=True),
+            ft.Text(_t("calc.saved.title", "Збережені розрахунки"), weight="bold", size=13, expand=True,
+                    no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
+            i18n.build_language_switcher(db, _on_lang_select, manager_id=str(manager_id or "")),
             *(
-                [ft.IconButton(ft.Icons.ARROW_BACK, tooltip="Назад",
+                [ft.IconButton(ft.Icons.ARROW_BACK, tooltip=_t("common.back", "Назад"),
                                on_click=_go_back, icon_size=16)]
                 if back_fn else []
             ),
-            ft.IconButton(ft.Icons.CLOSE, on_click=_close, icon_size=16),
+            _close_or_refresh_btn(page, _close, icon_size=16),
         ]
     )
     dlg.panel_width = 740
@@ -1847,6 +3675,7 @@ def open_calculators_modal(
 ):
     """Open the main calculators picker dialog."""
     _t = i18n.bind(str(manager_id or ""))
+    _ACTIVE_MANAGER_ID[0] = str(manager_id or "")
     rl = regions_list or ([region_id] if region_id else [])
 
     if prefill_type:
@@ -1875,6 +3704,7 @@ def open_calculators_modal(
     icons_map = {
         "basic": ft.Icons.CALCULATE,
         "cost": ft.Icons.ATTACH_MONEY,
+        "cost_clo": ft.Icons.LOCAL_SHIPPING,
         "profit": ft.Icons.TRENDING_UP,
         "turnover": ft.Icons.LOOP,
         "saved": ft.Icons.BOOKMARK,
@@ -1882,6 +3712,7 @@ def open_calculators_modal(
     _calc_labels = {
         "basic": _t("calc.type.basic", "Звичайний"),
         "cost": _t("calc.type.cost", "Собівартість"),
+        "cost_clo": _t("calc.type.cost_clo", "С/В з митом"),
         "profit": _t("calc.type.profit", "Рентабельність"),
         "turnover": _t("calc.type.turnover", "Оборот / Забезп."),
         "saved": _t("calc.type.saved", "Збережені"),
@@ -1928,14 +3759,25 @@ def open_calculators_modal(
             _t("calc.picker_help.step2", "2. Вибраний калькулятор відкриється одразу."),
         ])
 
+    def _on_lang_select(code: str) -> None:
+        i18n.save_manager_language(db, str(manager_id or ""), code)
+        _close()
+        open_calculators_modal(
+            page, db, manager_id, company_id, region_id, regions_list,
+            prefill_type=prefill_type, prefill_data=prefill_data,
+        )
+
     dlg.title = ft.Row(
         [
-            ft.Text(_t("calc.picker_title", "Калькулятори"), weight="bold", expand=True),
+            ft.Text(_t("calc.picker_title", "Калькулятори"), weight="bold", expand=True,
+                    no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
+            i18n.build_language_switcher(db, _on_lang_select, manager_id=str(manager_id or "")),
             ft.IconButton(icon=ft.Icons.HELP_OUTLINE, icon_size=16, tooltip=_t("common.help.tooltip", "Довідка"), on_click=_picker_help),
-            ft.IconButton(ft.Icons.CLOSE, on_click=_close, icon_size=18),
+            _close_or_refresh_btn(page, _close, icon_size=18),
         ]
     )
     dlg.panel_width = 420
+    dlg.center_content = True
     dlg.content = ft.Container(
         width=420,
         padding=16,
@@ -1952,6 +3794,10 @@ def _dispatch(page, db, manager_id, company_id, region_id, regions_list, key, da
         _open_basic(page, db, manager_id, back_fn=_back)
     elif key == "cost":
         _open_cost(
+            page, db, manager_id, company_id, region_id, regions_list, prefill=data, back_fn=_back
+        )
+    elif key == "cost_clo":
+        _open_cost_clo(
             page, db, manager_id, company_id, region_id, regions_list, prefill=data, back_fn=_back
         )
     elif key == "profit":

@@ -17,7 +17,7 @@ from views import themes as _themes
 from views.calculators_view import open_calculators_modal
 from views.notebook_view import get_notebook_badge_counts, open_notebook_modal
 
-# Р’Р°Р¶РєС– view РїС–РґРІР°РЅС‚Р°Р¶СѓСЋС‚СЊСЃСЏ Р»С–РЅРёРІРѕ РІ show_* — С€РІРёРґС€РёР№ СЃС‚Р°СЂС‚ РїС–СЃР»СЏ РІС…РѕРґСѓ.
+# Важкі view підвантажуються ліниво в show_* — швидший старт після входу.
 
 
 def _normalize_role(role):
@@ -1003,31 +1003,34 @@ class MainDashboard:
                 spacing=0,
                 horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
             )
-            if key == "gsm_parser":
-                # Flet's after_event auto-update (see flet/messaging/
-                # session.py's after_event/__auto_update) walks UP from
-                # whatever control fired an event until it finds an
-                # "isolated" ancestor, then diffs THAT control's whole
-                # subtree — and only Page itself ships isolated=True out
-                # of the box, so any event handler anywhere in the app
-                # that doesn't explicitly call .update() on something
-                # falls back to diffing the ENTIRE page tree. Since every
-                # cached tab wrapper stays alive (just hidden) for the
-                # instant-switch fast path, GSM Parser's ~1000+ built rows
-                # are part of that page tree even while some OTHER tab or
-                # dialog is what's actually being interacted with — live
-                # py-spy captures showed the main thread stuck for a long
-                # time inside Flet's own object_patch comparison for
-                # exactly this reason (confirmed live during testing:
-                # closing an unrelated dialog hung because of this).
-                # Marking this wrapper isolated makes it the stopping
-                # point for auto-update walks that pass through it, and
-                # (per Flet's diffing) an ancestor's own diff shouldn't
-                # need to recurse into an isolated descendant's subtree
-                # either — scoping the cost to whichever tab actually
-                # changed instead of the whole page.
-                with contextlib.suppress(Exception):
-                    col._isolated = True
+            # Flet's after_event auto-update (see flet/messaging/
+            # session.py's after_event/__auto_update) walks UP from
+            # whatever control fired an event until it finds an
+            # "isolated" ancestor, then diffs THAT control's whole
+            # subtree — and only Page itself ships isolated=True out
+            # of the box, so any event handler anywhere in the app
+            # that doesn't explicitly call .update() on something
+            # falls back to diffing the ENTIRE page tree. Since every
+            # cached tab wrapper stays alive (just hidden) for the
+            # instant-switch fast path, EVERY other tab's rows (GSM
+            # Parser's ~1000+, Orders' hundreds, etc.) are part of that
+            # page tree even while just ONE tab is what's actually
+            # being interacted with — live py-spy captures showed the
+            # main thread stuck for a long time inside Flet's own
+            # object_patch comparison for exactly this reason
+            # (confirmed live during testing: closing an unrelated
+            # dialog hung because of this — originally only fixed for
+            # gsm_parser specifically, generalized to every tab here
+            # since the same cost applies regardless of which tab is
+            # active or which one is heaviest).
+            # Marking this wrapper isolated makes it the stopping
+            # point for auto-update walks that pass through it, and
+            # (per Flet's diffing) an ancestor's own diff shouldn't
+            # need to recurse into an isolated descendant's subtree
+            # either — scoping the cost to whichever tab actually
+            # changed instead of the whole page.
+            with contextlib.suppress(Exception):
+                col._isolated = True
             self._cached_view_wrappers[key] = col
             self.content_area.controls.append(col)
             # Ensure wrapper.page propagates so views can call self._page()
@@ -1258,15 +1261,35 @@ class MainDashboard:
             hv._live_orders_snapshot = list(ov._orders)
         elif self._preloaded_orders:
             hv._live_orders_snapshot = list(self._preloaded_orders)
-        # Refresh packaging stock card in-place (DB fetch in thread, UI on main loop).
+        # Refresh packaging stock card in-place (DB fetch in thread, UI on
+        # main loop) — but only while Home is actually the tab on screen,
+        # and only when packaging genuinely changed since we last checked.
+        # This used to run the DB fetch unconditionally every 45s forever
+        # (for the life of the session, once Home had been opened once),
+        # regardless of either — real, avoidable background load.
+        if getattr(self.page, "_active_view", None) != "show_home":
+            return
         col = getattr(hv, "_pack_stock_items_col", None)
-        if col is not None:
-            try:
-                rows = await asyncio.to_thread(hv._packaging_stock_rows)
-            except Exception:
-                rows = []
-            with contextlib.suppress(Exception):
-                hv._apply_pack_rows_to_col(col, rows)
+        if col is None:
+            return
+        try:
+            pulses = await asyncio.to_thread(
+                self.db.get_companies_sync_pulses, [self.company_id], ["packaging"]
+            )
+            pulse_ts = int(
+                ((pulses or {}).get(self.company_id) or {}).get("packaging") or 0
+            )
+        except Exception:
+            pulse_ts = 0
+        if pulse_ts and pulse_ts <= int(getattr(self, "_home_pack_pulse_ts", 0) or 0):
+            return
+        try:
+            rows = await asyncio.to_thread(hv._packaging_stock_rows)
+        except Exception:
+            rows = []
+        self._home_pack_pulse_ts = pulse_ts
+        with contextlib.suppress(Exception):
+            hv._apply_pack_rows_to_col(col, rows)
         # NEVER call hv.build() from background — causes visible page flash every 45s.
 
     def _gsm_tg_flush_permitted(self) -> bool:
@@ -1832,6 +1855,27 @@ class MainDashboard:
             "updated_at": int(datetime.now().timestamp()),
             "ui_theme": _themes.get_active_theme_key(_mid),
             "ui_nav_pack": _themes.get_active_nav_pack_key(_mid),
+            # Region is global across tabs (see _switch_workspace's
+            # restore_manager_region=False), but cold start only ever restores
+            # from the fixed Home row's own "region" field — which only gets
+            # refreshed when Home itself happens to be the active tab during a
+            # region change (_save_active_workspace_context only touches the
+            # CURRENTLY active workspace). A user who changes region while on
+            # some other tab (e.g. Розклад Замовлень) would have that other
+            # tab's row updated correctly, but Home's stayed stale — so the
+            # next cold start silently reverted to whatever region Home last
+            # had, taking every region-keyed per-tab setting (like Order
+            # Schedule's visible_months_count) down a different, stale key
+            # with it. Saved independently of any single workspace row so
+            # cold start can restore the actual last-used region.
+            "current_region": self.current_region,
+            # Manager selection (viewing a subordinate, or the aggregate
+            # "all managers" mode) — by explicit request this now survives a
+            # restart too, restored (with re-validation against
+            # visible_managers) in _ensure_workspace_state_loaded.
+            "current_manager_id": self.current_manager_id,
+            "current_general_mode": bool(self.current_general_mode),
+            "current_general_manager_ids": list(self.current_general_manager_ids or []),
         }
 
     def _persist_workspace_state(self):
@@ -1912,23 +1956,63 @@ class MainDashboard:
             _themes.set_active_nav_pack(manager_id, payload.get("ui_nav_pack"))
             i18n.set_active_language(manager_id, payload.get("ui_language"))
         self._apply_workspace_context(self._active_workspace())
-        # On startup always reset to own account — never open with a subordinate's context.
+        # Prefer the independently-saved last-used region over Home's own
+        # (possibly stale) "region" field — see _serialize_workspace_state's
+        # "current_region" comment for why Home's row alone isn't reliable.
+        _saved_region = (payload or {}).get("current_region") if isinstance(payload, dict) else None
+        if _saved_region is not None:
+            _regions = self._refresh_regions() or []
+            _region_choices = ([ALL_REGIONS_KEY] if len(_regions) > 1 else []) + _regions
+            if _saved_region in _region_choices:
+                self.current_region = _saved_region
+                self._refresh_regions()
+        # Restore the last-used manager selection (viewing a specific
+        # subordinate, or the aggregate "all managers" mode) across restart —
+        # by explicit request, this now survives a restart instead of always
+        # resetting to "own account". Validated against visible_managers so a
+        # subordinate who lost access since the last session (removed, role
+        # changed) can't be silently restored into.
         own_id = str(self.user_data.get("id") or "").strip()
-        _was_subordinate = own_id and self.current_manager_id != own_id
-        if own_id:
+        _visible_ids = {
+            m.get("id")
+            for m in (self.visible_managers or [])
+            if isinstance(m, dict) and m.get("id")
+        }
+        _saved_mgr = (payload or {}).get("current_manager_id") if isinstance(payload, dict) else None
+        _saved_general_mode = bool((payload or {}).get("current_general_mode")) if isinstance(payload, dict) else False
+        _saved_general_ids = [
+            str(x) for x in ((payload or {}).get("current_general_manager_ids") or []) if str(x)
+        ]
+        _restored_subordinate = False
+        if _saved_general_mode and _saved_general_ids:
+            _valid_ids = [mid for mid in _saved_general_ids if mid in _visible_ids]
+            if _valid_ids:
+                self.current_general_mode = True
+                self.current_general_manager_ids = _valid_ids
+                self.current_manager_id = own_id
+                _restored_subordinate = True
+        elif _saved_mgr and _saved_mgr != own_id and _saved_mgr in _visible_ids:
+            self.current_manager_id = _saved_mgr
+            self.current_manager_name = next(
+                (
+                    m.get("full_name") or m.get("id")
+                    for m in (self.visible_managers or [])
+                    if isinstance(m, dict) and m.get("id") == _saved_mgr
+                ),
+                _saved_mgr,
+            )
+            _restored_subordinate = True
+        if not _restored_subordinate and own_id:
             self.current_manager_id = own_id
             self.current_manager_name = (
                 str(self.user_data.get("full_name") or "Мої дані").strip() or "Мої дані"
             )
-        if _was_subordinate:
-            # Previous session ended on a subordinate — cached view data is stale.
-            # Invalidate caches and reset all saved tab contexts to own account.
-            self._view_cache.clear()
-            self._cached_view_wrappers.clear()
-            self._preloaded_orders = None
-            for _ws in self._workspaces:
-                if isinstance(_ws, dict):
-                    _ws["manager_id"] = own_id
+        if _restored_subordinate:
+            # _refresh_managers() already ran once (before this restore, with
+            # the default own-account context) to populate visible_managers —
+            # rerun it so the manager button row's "active" highlight matches
+            # what we just restored.
+            self._refresh_managers()
         self._refresh_workspace_tabs()
 
     def _apply_workspace_context(self, ws, restore_manager_region=True):
@@ -2275,7 +2359,7 @@ class MainDashboard:
             title_padding=ft.padding.only(left=16, right=16, top=16, bottom=4),
         )
         with contextlib.suppress(Exception):
-            self.page.open(_dlg[0])
+            self.page.show_dialog(_dlg[0])
 
     def _save_active_workspace_context(self):
         ws = self._active_workspace()
@@ -2691,10 +2775,14 @@ class MainDashboard:
                 self._refresh_managers()
                 self._ensure_workspace_state_loaded()
                 if not self._sync_poll_started:
+                    # Background cross-client polling removed (1 менеджер = 1
+                    # категорія — no one else can change what this manager
+                    # sees, so there is nothing to silently poll for). Fresh
+                    # data now only comes from Ctrl+F5 (_handle_ctrl_f5) or a
+                    # normal tab switch. _sync_last_pulses/_load_sync_snapshot
+                    # stay — Ctrl+F5 still uses them to report what changed.
                     self._sync_last_pulses = self._load_sync_snapshot()
                     self._sync_poll_started = True
-                    self.page.run_task(self._sync_poll_loop)
-                    self.page.run_task(self._home_auto_refresh_loop)
                 # gsm_local_tg_flush_loop (a local, 180s-interval flush of
                 # queued Telegram notifications) is NOT started anymore —
                 # the server-side daemon (gsm_parser_scheduler.py's
@@ -2888,7 +2976,7 @@ class MainDashboard:
                     ],
                 )
                 try:
-                    self.page.open(dlg)
+                    self.page.show_dialog(dlg)
                 except Exception:
                     self.page.dialog = dlg
                     dlg.open = True
@@ -3547,10 +3635,11 @@ class MainDashboard:
                 pass
 
             if not self._sync_poll_started:
+                # See matching comment at the other call site: no more
+                # background cross-client polling — Ctrl+F5 is now the only
+                # way this session pulls fresh data from the DB.
                 self._sync_last_pulses = self._load_sync_snapshot()
                 self._sync_poll_started = True
-                self.page.run_task(self._sync_poll_loop)
-                self.page.run_task(self._home_auto_refresh_loop)
             # gsm_local_tg_flush_loop no longer started here either — see
             # the matching comment at the other call site (removed): the
             # server daemon alone flushes queued Telegram notifications
@@ -3671,7 +3760,7 @@ class MainDashboard:
                 title_padding=ft.padding.only(left=16, right=16, top=16, bottom=4),
             )
             with contextlib.suppress(Exception):
-                self.page.open(_dlg[0])
+                self.page.show_dialog(_dlg[0])
 
         def _mmb(e):
             self._set_sidebar_visible(False)
@@ -4561,7 +4650,7 @@ class MainDashboard:
             actions_alignment=ft.MainAxisAlignment.END,
         )
         try:
-            self.page.open(dlg)
+            self.page.show_dialog(dlg)
         except Exception:
             self.page.dialog = dlg
             dlg.open = True
@@ -4988,6 +5077,10 @@ class MainDashboard:
         cache_key = "suppliers"
         if not quick_filter and self._view_cache.get(cache_key):
             self._activate_cached_view(cache_key)
+            _inst = (self._view_cache.get(cache_key) or {}).get("instance")
+            if _inst is not None and hasattr(_inst, "resume"):
+                with contextlib.suppress(Exception):
+                    self.page.run_task(_inst.resume)
             return
 
         if quick_filter:
@@ -5035,6 +5128,10 @@ class MainDashboard:
         cache_key = "packaging"
         if self._view_cache.get(cache_key):
             self._activate_cached_view(cache_key)
+            _inst = (self._view_cache.get(cache_key) or {}).get("instance")
+            if _inst is not None and hasattr(_inst, "resume"):
+                with contextlib.suppress(Exception):
+                    self.page.run_task(_inst.resume)
             return
 
         _col = self._get_or_create_cached_wrapper(cache_key)
@@ -5910,12 +6007,20 @@ class MainDashboard:
 
         _snack("Перевірка оновлень з БД…")
 
-        # Step 1: fetch fresh pulses from DB and compare against local snapshot
+        # Step 1: force-invalidate EVERY scope's cache unconditionally — this
+        # is the only manual "get me the truth from the DB" trigger left now
+        # that background polling is gone, so it must not depend on a pulse
+        # timestamp diff being airtight. The pulse comparison below still
+        # runs (against force_refresh=True, so it reads the DB, not a cached
+        # pulse) purely to report which scopes actually changed.
         changed_scopes: set[str] = set()
         company_id = (self.company_id or "").strip()
         if company_id:
+            all_scopes = self._sync_scopes()
+            for scope in all_scopes:
+                with contextlib.suppress(Exception):
+                    self.db.invalidate_scope_cache(company_id, scope)
             try:
-                all_scopes = self._sync_scopes()
                 pulses = await asyncio.to_thread(
                     self.db.get_companies_sync_pulses,
                     [company_id],
@@ -5933,8 +6038,6 @@ class MainDashboard:
                     if now_ts <= 0:
                         continue
                     if now_ts != prev:
-                        # DB differs from local snapshot → invalidate local cache
-                        self.db.invalidate_scope_cache(company_id, scope)
                         changed_scopes.add(scope)
                         self._sync_last_pulses[key] = now_ts
                         snapshot_changed = True
@@ -6098,9 +6201,9 @@ class MainDashboard:
         _walk(ca, [], 0)
         return results
 
-    _SEARCH_HL_COLOR = "#2563EB"  # РїРѕС‚РѕС‡РЅРёР№ Р·Р±С–Рі — РЅР°СЃРёС‡РµРЅРёР№ СЃРёРЅС–Р№
+    _SEARCH_HL_COLOR = "#2563EB"  # поточний збіг — насичений синій
     _SEARCH_HL_TEXT_COLOR = "#FFFFFF"  # білий текст на поточному
-    _SEARCH_HL_ALL_COLOR = "#BFDBFE"  # С–РЅС€С– Р·Р±С–РіРё — СЃРІС–С‚Р»Рѕ-СЃРёРЅС–Р№
+    _SEARCH_HL_ALL_COLOR = "#BFDBFE"  # інші збіги — світло-синій
     _SEARCH_HL_ALL_TEXT_COLOR = "#1E40AF"  # темно-синій текст на інших
 
     def _sweep_clear_highlights(self) -> None:

@@ -19,6 +19,18 @@ _MUTED   = '#475569'
 _ALT2    = '#F9FAFB'
 _PANEL   = '#FFFFFF'
 
+# Shared, long-lived pool for the product-details dialog's concurrent DB
+# reads (see _build_product_details_dialog). db.py caches one Postgres
+# connection per THREAD ID for the process lifetime — spinning up a fresh
+# ThreadPoolExecutor per dialog open (as this used to do) meant every worker
+# thread died right after, orphaning its cached connection forever (never
+# reused, never closed). A few dialog opens were enough to exhaust the
+# server's connection limit, after which every new connection attempt just
+# hung — matching "works a few times, then every click does nothing until
+# app restart". A module-level pool keeps the same handful of worker threads
+# (and their cached connections) alive and reused across every open.
+_PRODUCT_DETAILS_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
 
 def _th_from_view(view) -> dict:
     from views.themes import get_active_theme
@@ -435,11 +447,18 @@ class ProductsView:
                 page.run_task(self._bg_products_sync_loop)
 
     def _products_scope_pulse_ts(self) -> int:
+        # Watches suppliers/packaging/catalog too, not just "products" — a
+        # supplier rename or packaging price change never bumps the
+        # "products" scope itself, so a products-only watch never noticed
+        # those changes and this tab kept showing stale nested data.
         try:
-            out = self.db.get_companies_sync_pulses([self.company_id], ["products"]) or {}
+            out = self.db.get_companies_sync_pulses(
+                [self.company_id], ["products", "suppliers", "packaging", "catalog"]
+            ) or {}
             by_company = out.get(self.company_id) if isinstance(out, dict) else {}
-            ts = (by_company or {}).get("products") if isinstance(by_company, dict) else 0
-            return int(ts or 0)
+            if not isinstance(by_company, dict):
+                return 0
+            return max((int(v or 0) for v in by_company.values()), default=0)
         except Exception:
             return 0
 
@@ -829,25 +848,28 @@ class ProductsView:
                             if use_products or not enabled_levels:
                                 continue
 
+                            # Batched: one query for every parent at this level
+                            # instead of one query per parent (same fix already
+                            # applied nearby — see get_category_level_nodes_
+                            # by_parents's docstring/usage around line 979).
                             parent_ids = [None]
                             leaf_rows = []
                             for lvl in enabled_levels:
                                 pos = int(lvl.get("position"))
                                 next_ids = []
                                 next_rows = []
-                                for parent_id in parent_ids:
-                                    rows = self.db.get_category_level_nodes(
-                                        category.get("id"),
-                                        pos,
-                                        parent_node_id=parent_id,
-                                    )
-                                    for row in rows or []:
-                                        if not isinstance(row, dict) or not row.get(
-                                            "id"
-                                        ):
-                                            continue
-                                        next_ids.append(row.get("id"))
-                                        next_rows.append(row)
+                                rows = self.db.get_category_level_nodes_by_parents(
+                                    category.get("id"),
+                                    pos,
+                                    parent_ids,
+                                )
+                                for row in rows or []:
+                                    if not isinstance(row, dict) or not row.get(
+                                        "id"
+                                    ):
+                                        continue
+                                    next_ids.append(row.get("id"))
+                                    next_rows.append(row)
                                 parent_ids = next_ids
                                 leaf_rows = next_rows
                                 if not parent_ids:
@@ -952,26 +974,30 @@ class ProductsView:
                         next_ids = []
                         next_rows = []
                         seen_next_ids = set()
-                        for parent_id in parent_ids:
-                            level_nodes = self.db.get_category_level_nodes(
-                                category_id,
-                                pos,
-                                parent_node_id=parent_id,
+                        # Batched: one query for every parent at this level
+                        # instead of one query per parent (was the dominant
+                        # N+1 behind slow Home-tab builds with many
+                        # categories/levels — see get_category_level_nodes_
+                        # by_parents's docstring).
+                        level_nodes = self.db.get_category_level_nodes_by_parents(
+                            category_id,
+                            pos,
+                            parent_ids,
+                        )
+                        for node in level_nodes or []:
+                            if not isinstance(node, dict):
+                                continue
+                            child_id = str(node.get("id") or "").strip()
+                            if not child_id or child_id in seen_next_ids:
+                                continue
+                            seen_next_ids.add(child_id)
+                            next_ids.append(child_id)
+                            next_rows.append(
+                                {
+                                    "id": child_id,
+                                    "name": str(node.get("name") or "").strip(),
+                                }
                             )
-                            for node in level_nodes or []:
-                                if not isinstance(node, dict):
-                                    continue
-                                child_id = str(node.get("id") or "").strip()
-                                if not child_id or child_id in seen_next_ids:
-                                    continue
-                                seen_next_ids.add(child_id)
-                                next_ids.append(child_id)
-                                next_rows.append(
-                                    {
-                                        "id": child_id,
-                                        "name": str(node.get("name") or "").strip(),
-                                    }
-                                )
                         parent_ids = next_ids
                         leaf_rows = next_rows
                         if not parent_ids:
@@ -980,18 +1006,21 @@ class ProductsView:
                     # Skip leaf nodes that have descendants (children on next level)
                     # to avoid showing "pending" series that structurally exist.
                     leaf_ids_with_children = set()
-                    if enabled_levels:
+                    if enabled_levels and leaf_rows:
                         last_pos = int(enabled_levels[-1].get("position") or 0)
                         next_pos = last_pos + 1
-                        for leaf in leaf_rows:
-                            leaf_id = leaf.get("id") or ""
-                            if not leaf_id:
+                        leaf_ids_all = [
+                            leaf.get("id") for leaf in leaf_rows if leaf.get("id")
+                        ]
+                        children_rows = self.db.get_category_level_nodes_by_parents(
+                            category_id, next_pos, leaf_ids_all
+                        )
+                        for child in children_rows or []:
+                            if not isinstance(child, dict):
                                 continue
-                            children = self.db.get_category_level_nodes(
-                                category_id, next_pos, parent_node_id=leaf_id
-                            )
-                            if children:
-                                leaf_ids_with_children.add(leaf_id)
+                            pid = str(child.get("parent_node_id") or "").strip()
+                            if pid and pid != "root":
+                                leaf_ids_with_children.add(pid)
 
                     for leaf in leaf_rows:
                         leaf_id = leaf.get("id") or ""
@@ -1096,6 +1125,30 @@ class ProductsView:
         notes_f = ft.TextField(
             label=self.t("products.field.notes", "Нотатки"), border_radius=10, multiline=True, min_lines=2, max_lines=4
         )
+        # See the matching field in show_product_dialog for the full
+        # rationale — same behavior here (visible only while packaging is
+        # None, cleared the moment a real packaging is picked).
+        packaging_note_f = ft.TextField(
+            label=self.t(
+                "products.field.packaging_note", "Опис стандартного пакування"
+            ),
+            border_radius=10,
+            multiline=True,
+            min_lines=1,
+            max_lines=3,
+            visible=self.packaging_enabled and not (packaging_f.value or ""),
+        )
+
+        def _on_packaging_change_sc(_=None):
+            packaging_note_f.visible = self.packaging_enabled and not (
+                packaging_f.value or ""
+            )
+            if not packaging_note_f.visible:
+                packaging_note_f.value = ""
+            with contextlib.suppress(Exception):
+                packaging_note_f.update()
+
+        packaging_f.on_change = _on_packaging_change_sc
 
         # Product images (up to 3) for series completion flow
         _sc_temp_paths = [None, None, None]
@@ -1156,6 +1209,7 @@ class ProductsView:
                     spacing=10,
                     wrap=True,
                 ),
+                ft.Container(width=730, content=packaging_note_f),
                 ft.Row(
                     [purchase_price_f, purchase_currency_f, purchase_sum_usd_f],
                     spacing=10,
@@ -1595,6 +1649,11 @@ class ProductsView:
                 "manager_id": self.manager_id or "",
                 "supplier_id": supplier_f.value or None,
                 "packaging_id": (packaging_f.value or None) if self.packaging_enabled else None,
+                "packaging_note": (
+                    (packaging_note_f.value or "").strip()
+                    if self.packaging_enabled and not (packaging_f.value or "")
+                    else ""
+                ),
                 "purchase_price": self._to_float_or_none(purchase_price_f.value),
                 "purchase_currency": self._normalize_currency_code(
                     purchase_currency_f.value, "USD"
@@ -2260,6 +2319,8 @@ class ProductsView:
             pass
 
     def load_products(self, force_reload: bool = False):
+        if not hasattr(self, "products_list"):
+            return
         self.products_list.controls.clear()
         self.products_meta.value = ""
         self._refresh_sort_order_controls()
@@ -2273,6 +2334,7 @@ class ProductsView:
                         self.company_id,
                         region_id,
                         manager_id=viewer_manager_id,
+                        force_refresh=force_reload,
                     )
                     or []
                 )
@@ -2299,7 +2361,10 @@ class ProductsView:
                 with contextlib.suppress(Exception):
                     supplier_rows = (
                         self.db.get_suppliers(
-                            self.company_id, region_id, manager_id=self.manager_id
+                            self.company_id,
+                            region_id,
+                            manager_id=self.manager_id,
+                            force_refresh=force_reload,
                         )
                         or []
                     )
@@ -2312,7 +2377,10 @@ class ProductsView:
                 with contextlib.suppress(Exception):
                     packaging_rows = (
                         self.db.get_packaging(
-                            self.company_id, region_id, manager_id=self.manager_id
+                            self.company_id,
+                            region_id,
+                            manager_id=self.manager_id,
+                            force_refresh=force_reload,
                         )
                         or []
                     )
@@ -2328,6 +2396,7 @@ class ProductsView:
                             self.company_id,
                             region_id,
                             manager_id=self.manager_id,
+                            force_refresh=force_reload,
                         )
                         or []
                     )
@@ -2367,6 +2436,7 @@ class ProductsView:
                         region_id,
                         manager_id=viewer_manager_id,
                         archived=True,
+                        force_refresh=force_reload,
                     )
                     or []
                 )
@@ -3634,6 +3704,7 @@ class ProductsView:
             secondary_parts.insert(1, f"В $ по курсу: {purchase_usd_label}")
 
         notes_text = str(product.get("notes") or "").strip()
+        packaging_note_text = str(product.get("packaging_note") or "").strip()
 
         def _show_product_photo(_):
             _urls = [
@@ -3755,7 +3826,7 @@ class ProductsView:
                 content_padding=ft.padding.all(0),
                 on_dismiss=lambda _: setattr(page, "on_keyboard_event", _prev_kb_handler[0]),
             )
-            page.open(_dlg_ref[0])
+            page.show_dialog(_dlg_ref[0])
 
         # Parse sales prices for the inline price panel
         _sales_rows = []
@@ -3853,6 +3924,16 @@ class ProductsView:
                                             ft.TextSpan("Ієрархія: ", style=ft.TextStyle(size=11, color="orange" if is_virtual else "grey700")),
                                             ft.TextSpan(hierarchy_label, style=ft.TextStyle(size=11, color="orange" if is_virtual else "grey700", weight=ft.FontWeight.BOLD)),
                                         ],
+                                    ),
+                                    *(
+                                        [
+                                            ft.Text(
+                                                f"Опис стандартного пакування: {packaging_note_text}",
+                                                size=11,
+                                                color="orange" if is_virtual else "grey700",
+                                            )
+                                        ]
+                                        if packaging_note_text else []
                                     ),
                                     *(
                                         [ft.Text(f"Нотатки: {notes_text}", size=11, color="orange" if is_virtual else "grey700")]
@@ -4040,21 +4121,23 @@ class ProductsView:
         # 4 independent DB reads, previously fetched one after another —
         # this whole function already runs on a background thread (see
         # show_product_details_dialog's asyncio.to_thread wrapper), so run
-        # them concurrently on a small local thread pool instead.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as _pool:
-            _f_companies = _pool.submit(self.db.get_all_companies)
-            _f_regions = _pool.submit(self.db.get_company_regions, company_id)
-            _f_node_path = _pool.submit(
-                self.db.get_node_path, product.get("catalog_node_id")
-            )
-            _f_delivery = _pool.submit(
-                self.db.get_effective_delivery_methods_for_manager,
-                company_id, self.manager_id, product_region_id,
-            )
-            _all_companies = _f_companies.result() or []
-            _all_regions = _f_regions.result() or []
-            _node_path_rows = _f_node_path.result() or []
-            _delivery_methods = _f_delivery.result() or []
+        # them concurrently on the shared pool instead (see
+        # _PRODUCT_DETAILS_POOL for why this must NOT be a fresh
+        # ThreadPoolExecutor created per call).
+        _pool = _PRODUCT_DETAILS_POOL
+        _f_companies = _pool.submit(self.db.get_all_companies)
+        _f_regions = _pool.submit(self.db.get_company_regions, company_id)
+        _f_node_path = _pool.submit(
+            self.db.get_node_path, product.get("catalog_node_id")
+        )
+        _f_delivery = _pool.submit(
+            self.db.get_effective_delivery_methods_for_manager,
+            company_id, self.manager_id, product_region_id,
+        )
+        _all_companies = _f_companies.result() or []
+        _all_regions = _f_regions.result() or []
+        _node_path_rows = _f_node_path.result() or []
+        _delivery_methods = _f_delivery.result() or []
 
         company_name = next(
             (
@@ -4477,6 +4560,10 @@ class ProductsView:
                                         wrap=True,
                                     ),
                                     _value_row("Ієрархія", hierarchy_text),
+                                    _value_row(
+                                        "Опис стандартного пакування",
+                                        product.get("packaging_note"),
+                                    ),
                                     _value_row("Нотатки", product.get("notes")),
                                     ft.Divider(),
                                     ft.Text(
@@ -4821,6 +4908,21 @@ class ProductsView:
         notes_f = ft.TextField(
             label=self.t("products.field.notes", "Нотатки"), border_radius=10, multiline=True, min_lines=3, max_lines=5
         )
+        # Free-text note for the actual packaging in use when "Пакування" is
+        # set to None (no tracked packaging record) — visible only in that
+        # case, and cleared the moment a real packaging is picked so a stale
+        # note can never linger unseen. Width spans supplier_f+packaging_f
+        # combined (360+10+360) so it lines up with the row above.
+        packaging_note_f = ft.TextField(
+            label=self.t(
+                "products.field.packaging_note", "Опис стандартного пакування"
+            ),
+            border_radius=10,
+            multiline=True,
+            min_lines=1,
+            max_lines=3,
+            visible=self.packaging_enabled,
+        )
         _existing_urls = [
             (product.get(k) or "") if isinstance(product, dict) else ""
             for k in ("image", "image2", "image3")
@@ -4885,6 +4987,20 @@ class ProductsView:
             weight_f.value = str(product.get("weight_kg") or "")
             production_term_f.value = str(product.get("production_term_days") or "")
             notes_f.value = product.get("notes") or ""
+            packaging_note_f.value = product.get("packaging_note") or ""
+
+        packaging_note_f.visible = self.packaging_enabled and not (packaging_f.value or "")
+
+        def _on_packaging_change(_=None):
+            packaging_note_f.visible = self.packaging_enabled and not (
+                packaging_f.value or ""
+            )
+            if not packaging_note_f.visible:
+                packaging_note_f.value = ""
+            with contextlib.suppress(Exception):
+                packaging_note_f.update()
+
+        packaging_f.on_change = _on_packaging_change
 
         def _refresh_purchase_sum_usd(_=None):
             ccy = self._normalize_currency_code(purchase_currency_f.value, "USD")
@@ -5795,6 +5911,11 @@ class ProductsView:
                 "manager_id": (self.manager_id or self.user_data.get("id") or ""),
                 "supplier_id": supplier_f.value or None,
                 "packaging_id": (packaging_f.value or None) if self.packaging_enabled else None,
+                "packaging_note": (
+                    (packaging_note_f.value or "").strip()
+                    if self.packaging_enabled and not (packaging_f.value or "")
+                    else ""
+                ),
                 "purchase_price": self._to_float_or_none(purchase_price_f.value),
                 "purchase_currency": self._normalize_currency_code(
                     purchase_currency_f.value, "USD"
@@ -5951,6 +6072,7 @@ class ProductsView:
                         wrap=True,
                         vertical_alignment=ft.CrossAxisAlignment.START,
                     ),
+                    ft.Container(width=730, content=packaging_note_f),
                     ft.Row(
                         [
                             purchase_price_f,

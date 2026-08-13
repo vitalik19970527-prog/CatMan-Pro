@@ -1447,7 +1447,7 @@ class WebSiteView:
             content_padding=ft.padding.all(0),
             on_dismiss=lambda _e: setattr(page, "on_keyboard_event", prev_kb[0]),
         )
-        page.open(dlg_ref[0])
+        page.show_dialog(dlg_ref[0])
 
     async def _pick_single_file(self, dialog_title: str, extensions: list[str]) -> str:
         page = self._page()

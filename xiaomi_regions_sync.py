@@ -3,13 +3,23 @@ Syncs Xiaomi regional model numbers from GitHub MobileModels_Fork.
 Fetches raw markdown, extracts model number → device/region mappings,
 matches to gsm_parser_devices (brand=Xiaomi), updates gsm_parser_regional_variants.
 
-Regions tracked: Global, Europe, Latin America, India.
-China is intentionally excluded: its device sizes are hard to source and
-not needed for this app.
+Size table (L/W/T/diagonal) is only built for Global and Europe — those are
+the only markets whose physical size we actually need. Every OTHER real
+export market GitHub lists (China, India, Latin America, Japan, Korea,
+Thailand, Taiwan, Brazil, Saudi Arabia, ...) is still *detected*, along with
+its own model number(s), so a device known to sell there shows a compact
+color-coded badge per region with the model number on hover — see
+OTHER_MARKET_REGIONS / device specs key "xiaomi_other_markets" (a dict of
+{region: models_str}, not just a name list). No size row is ever
+created/maintained for these — their physical size isn't tracked, just that
+the device exists there and under which model number.
 Rules:
 - If region exists and models unchanged → keep existing L/W/T/diagonal.
 - If models changed → update models, clear L/W/T/diagonal.
 - New regions are appended; existing regions that disappeared are NOT removed.
+- A region row with source='excluded' (superadmin manually deleted it via
+  the regional-variants editor) is a tombstone: never touched, never
+  re-populated from GitHub again — see _merge_variants.
 """
 
 import contextlib
@@ -28,10 +38,24 @@ SYNC_URL = (
     "master/brands/xiaomi_en.md"
 )
 
-TARGET_REGIONS = {"Global", "Europe", "Latin America", "India"}
+# Only these two get a size table (gsm_parser_regional_variants row).
+TARGET_REGIONS = {"Global", "Europe"}
+
+# Every real export market GitHub uses in this file, China included per
+# superadmin's explicit choice — checked in _extract_segment in this order
+# (multi-word names first, so "Latin America" / "Saudi Arabia" aren't cut
+# short by a bare word match).
+_ALL_REGIONS_ORDERED = [
+    "Latin America", "Saudi Arabia",  # multi-word first
+    "Global", "Europe", "China", "India", "Japan", "Korea", "Thailand", "Taiwan", "Brazil",
+]
+
+# Detected (with their own model numbers) but never sized — surfaced as a
+# compact "also on: <region>" badge per market, model number on hover.
+OTHER_MARKET_REGIONS = set(_ALL_REGIONS_ORDERED) - TARGET_REGIONS
 
 # Canonical display order inside variants list
-_REGION_ORDER = ["Global", "Europe", "Latin America", "India"]
+_REGION_ORDER = ["Global", "Europe"]
 
 
 # ---------------------------------------------------------------------------
@@ -45,8 +69,11 @@ def _extract_segment(segment: str) -> tuple[str, str, str]:
     Returns ("", "", "") when no target region found.
     """
     segment = segment.strip()
-    # Multi-word region must come first to avoid partial match of "India" inside "Latin America"
-    for region in ("Latin America", "Global", "Europe", "India"):
+    # Multi-word regions must come first in _ALL_REGIONS_ORDERED to avoid a
+    # partial match (e.g. a bare "America" or "Arabia" check would never
+    # fire here anyway since those aren't in the list on their own, but
+    # keeping multi-word entries first is the safe, cheap convention).
+    for region in _ALL_REGIONS_ORDERED:
         idx = segment.find(region)
         if idx == -1:
             continue
@@ -314,6 +341,11 @@ def _merge_variants(existing: list[dict], github_regions: dict[str, list]) -> li
     for region, model_entries in github_regions.items():
         rk = region.lower()
         target = by_region.get(rk)
+        if target is not None and str(target.get("source") or "") == "excluded":
+            # Superadmin manually deleted this region (see
+            # delete_gsm_regional_variant_region) — a tombstone, never
+            # re-populated by a later sync no matter what GitHub reports.
+            continue
         target_claimed = _extract_model_nums(target.get("models")) if target else set()
         # Codes claimed by some OTHER row (a manual split) are excluded —
         # GitHub only manages what's still assigned to this row.
@@ -384,6 +416,15 @@ def sync_xiaomi_regions(
         "updated": 0,
         "not_found": 0,
         "errors": 0,
+        # Devices whose badge-only "also on: ..." markets changed — tracked
+        # separately from "updated" (which only counts sized Global/Europe
+        # variant-table changes) because it drives its own trigger bump
+        # below. Without this, a run that only refreshes non-sized markets
+        # (China/Japan/etc.) left "updated" at 0 and never bumped
+        # gsm_parser_trigger, so every already-open app kept showing the
+        # OLD badge set indefinitely despite the DB being correct —
+        # confirmed live as the exact cause of "плашки не оновлюються".
+        "other_markets_updated": 0,
     }
 
     def _log(msg: str) -> None:
@@ -455,8 +496,22 @@ def sync_xiaomi_regions(
     newly_appeared: list[dict] = []
     for device_id, regions in device_regions.items():
         try:
+            size_regions = {r: v for r, v in regions.items() if r in TARGET_REGIONS}
+            # {region: "MODELNUM, MODELNUM2 ..."} — the model number(s) are
+            # what the badge shows on hover (see views/gsm_parser_view.py),
+            # not just which markets exist.
+            other_markets = {
+                r: _build_models_str(v)
+                for r, v in regions.items()
+                if r in OTHER_MARKET_REGIONS
+            }
+            if other_markets:
+                with contextlib.suppress(Exception):
+                    if db.set_gsm_xiaomi_other_markets(device_id, other_markets):
+                        stats["other_markets_updated"] += 1
+
             existing = db.get_gsm_regional_variants(device_id)
-            updated = _merge_variants(existing, regions)
+            updated = _merge_variants(existing, size_regions)
 
             # Save only when something changed
             if updated != existing:
@@ -531,6 +586,7 @@ def sync_xiaomi_regions(
         f"Готово: GitHub {stats['fetched']}, "
         f"збіглось {stats['matched']}, "
         f"оновлено {stats['updated']}, "
+        f"ринки-плашки оновлено {stats['other_markets_updated']}, "
         f"не знайдено {stats['not_found']}, "
         f"помилок {stats['errors']}"
     )
@@ -542,9 +598,15 @@ def sync_xiaomi_regions(
     # here too, a region-only run (e.g. this script invoked standalone,
     # outside the full parser flow) silently changes the DB but every
     # already-open app keeps showing its stale disk cache indefinitely.
-    if stats["updated"] > 0:
+    # Must fire on EITHER counter — other_markets_updated (badge-only
+    # markets like China/Japan/Saudi Arabia) changes independently of
+    # updated (sized Global/Europe variant-table changes); gating on
+    # "updated" alone meant a run that only refreshed badge markets never
+    # bumped the trigger at all, leaving every open app's badges stale
+    # forever even though the DB itself was already correct.
+    if stats["updated"] > 0 or stats["other_markets_updated"] > 0:
         with contextlib.suppress(Exception):
-            db.set_gsm_parse_trigger(stats["updated"])
+            db.set_gsm_parse_trigger(stats["updated"] + stats["other_markets_updated"])
 
     stats["newly_appeared"] = newly_appeared
     return stats

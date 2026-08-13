@@ -47,9 +47,9 @@ class PackagingView:
     EMPTY_TEXT_SIZE = 14
     ALL_REGIONS_KEY = "__all_regions__"
     # Persists the archive-section collapse toggle across PackagingView
-    # re-instantiation (a fresh instance is created on every tab load and
-    # every background sync-pulse reload, so a plain `self` attribute would
-    # reset to collapsed every time). Keyed by company_id.
+    # re-instantiation (dashboard.py caches one instance per session, but a
+    # region/manager switch or Ctrl+F5 still creates a fresh one, and a plain
+    # `self` attribute would reset to collapsed every time). Keyed by company_id.
     _archive_collapsed_by_company: dict = {}
 
     def __init__(self, content_area, user_data, db, current_region_name):
@@ -495,6 +495,45 @@ class PackagingView:
             self._header_loading_indicator.visible = False
         if self.content_area.page and hasattr(self.content_area, "update"):
             self.content_area.update()
+        self._packaging_ui_ready = True
+        with contextlib.suppress(Exception):
+            self._packaging_pulse_ts = self._packaging_scope_pulse_ts()
+
+    def _packaging_scope_pulse_ts(self) -> int:
+        try:
+            out = self.db.get_companies_sync_pulses(
+                [self.company_id], ["packaging", "suppliers", "catalog"]
+            ) or {}
+            by_company = out.get(self.company_id) if isinstance(out, dict) else {}
+            if not isinstance(by_company, dict):
+                return 0
+            return max((int(v or 0) for v in by_company.values()), default=0)
+        except Exception:
+            return 0
+
+    async def resume(self) -> None:
+        """Called when returning to this cached tab. This view previously had
+        NO reload mechanism at all once built once — a packaging change made
+        on another device/session (or by a керівник's own subordinate) never
+        showed up here short of an app restart. Cheap pulse check + a real
+        (force_refresh) reload only when something genuinely changed."""
+        if not getattr(self, "_packaging_ui_ready", False):
+            return
+
+        async def _bg_packaging_pulse_check():
+            try:
+                new_pulse = await asyncio.to_thread(self._packaging_scope_pulse_ts)
+                cached_pulse = int(getattr(self, "_packaging_pulse_ts", 0) or 0)
+                if new_pulse > cached_pulse:
+                    self._packaging_pulse_ts = new_pulse
+                    self.load_packaging(force_refresh=True)
+            except Exception:
+                pass
+
+        _pg = self._page()
+        if _pg and hasattr(_pg, "run_task"):
+            with contextlib.suppress(Exception):
+                _pg.run_task(_bg_packaging_pulse_check)
 
     def _set_loading_text(self, text: str) -> None:
         try:
@@ -511,13 +550,18 @@ class PackagingView:
         except Exception:
             pass
 
-    def load_packaging(self):
+    def load_packaging(self, force_refresh: bool = False):
+        if not hasattr(self, "packaging_list"):
+            return
         self.packaging_list.controls.clear()
         current_region_id = self._effective_region_id()
 
         load_manager_id = self.manager_id
         raw_packaging = self.db.get_packaging(
-            self.company_id, current_region_id, manager_id=load_manager_id
+            self.company_id,
+            current_region_id,
+            manager_id=load_manager_id,
+            force_refresh=force_refresh,
         )
         packaging = raw_packaging if isinstance(raw_packaging, list) else []
         self._set_loading_text(f"Пакування: {len(packaging)}")
@@ -725,7 +769,7 @@ class PackagingView:
                 content_padding=ft.padding.all(0),
                 on_dismiss=lambda _: setattr(page, "on_keyboard_event", _prev_kb[0]),
             )
-            page.open(_dlg_ref[0])
+            page.show_dialog(_dlg_ref[0])
 
         return ft.Row(
             [
@@ -1329,15 +1373,20 @@ class PackagingView:
         # відтоді забрали, щоб не зламати перегляд/збереження існуючого.
         region_rows_all = _regions_for(default_company_id)
         _existing_region_id = str((packaging or {}).get("region_id") or "").strip()
+        # Batched: was one manager_has_category_access_in_region() call PER
+        # region (role lookup + scope queries + catalog_nodes lookup each
+        # time) — now a single query computes every allowed region up front.
+        _allowed_region_ids = self.db.get_manager_create_allowed_region_ids(
+            self.manager_id, self.company_id
+        )
         region_rows = [
             r
             for r in region_rows_all
             if isinstance(r, dict)
             and (
                 str(r.get("id") or "") == _existing_region_id
-                or self.db.manager_has_category_access_in_region(
-                    self.manager_id, self.company_id, r.get("id")
-                )
+                or _allowed_region_ids is None
+                or str(r.get("id") or "") in _allowed_region_ids
             )
         ]
         region_options = [

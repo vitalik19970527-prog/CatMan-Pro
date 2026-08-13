@@ -275,12 +275,30 @@ class SettingsView:
                 or ""
             ).strip()
 
+        # This one _build_inner() cycle reads the same manager's workspace-state
+        # blob 5 separate times (layout/visible-columns/production-term/theme/
+        # nav-pack), each a real DB round-trip on the Postgres path — cache it
+        # per manager_id for this build so those collapse into one fetch. Only
+        # used by the *_load_* readers below, never by the _save_* writers,
+        # which must always read fresh at the moment they act (read-modify-write
+        # triggered later by user interaction, not part of this initial load).
+        _ws_state_cache: dict = {}
+
+        def _cached_workspace_state(manager_id: str) -> dict:
+            if manager_id in _ws_state_cache:
+                return _ws_state_cache[manager_id]
+            payload = self.db.get_manager_workspace_state(manager_id) or {}
+            if not isinstance(payload, dict):
+                payload = {}
+            _ws_state_cache[manager_id] = payload
+            return payload
+
         def _load_settings_layout_state():
             manager_id = _workspace_user_id()
             if not manager_id:
                 return
             try:
-                payload = self.db.get_manager_workspace_state(manager_id) or {}
+                payload = _cached_workspace_state(manager_id)
                 if not isinstance(payload, dict):
                     return
                 store = (
@@ -329,7 +347,7 @@ class SettingsView:
             if not manager_id:
                 return
             try:
-                payload = self.db.get_manager_workspace_state(manager_id) or {}
+                payload = _cached_workspace_state(manager_id)
                 store = (
                     payload.get("settings_visible_columns")
                     if isinstance(payload, dict)
@@ -352,7 +370,7 @@ class SettingsView:
             if not manager_id:
                 return {}
             try:
-                payload = self.db.get_manager_workspace_state(manager_id) or {}
+                payload = _cached_workspace_state(manager_id)
                 store = (
                     payload.get("manager_production_term")
                     if isinstance(payload.get("manager_production_term"), dict)
@@ -2810,7 +2828,7 @@ class SettingsView:
             if not manager_id:
                 return DEFAULT_THEME
             try:
-                payload = self.db.get_manager_workspace_state(manager_id) or {}
+                payload = _cached_workspace_state(manager_id)
                 return str(payload.get("ui_theme") or DEFAULT_THEME)
             except Exception:
                 return DEFAULT_THEME
@@ -2820,7 +2838,7 @@ class SettingsView:
             if not manager_id:
                 return DEFAULT_NAV_PACK
             try:
-                payload = self.db.get_manager_workspace_state(manager_id) or {}
+                payload = _cached_workspace_state(manager_id)
                 return str(payload.get("ui_nav_pack") or DEFAULT_NAV_PACK)
             except Exception:
                 return DEFAULT_NAV_PACK
@@ -2850,6 +2868,78 @@ class SettingsView:
                 self.db.save_manager_workspace_state(manager_id, payload)
             except Exception:
                 pass
+
+        def _build_storage_location_controls():
+            import app_storage
+
+            path_text = ft.Text(
+                app_storage.get_current_storage_dir(), size=12, color=_th_muted,
+                selectable=True,
+            )
+            status_text = ft.Text("", size=11)
+            busy = [False]
+
+            async def _pick_folder(_=None):
+                if busy[0]:
+                    return
+                pg = self.content_area.page if self.content_area else None
+                if not pg:
+                    return
+                fp = ft.FilePicker()
+                pg.services.append(fp)
+                pg.update()
+                await asyncio.sleep(0.2)
+                new_dir = await fp.get_directory_path(
+                    dialog_title="Оберіть папку для збереження кешу",
+                )
+                with contextlib.suppress(Exception):
+                    pg.services.remove(fp)
+                    pg.update()
+                if not new_dir:
+                    return
+                busy[0] = True
+                status_text.value = "Переносимо файли..."
+                status_text.color = _th_muted
+                with contextlib.suppress(Exception):
+                    status_text.update()
+                ok, msg = await asyncio.to_thread(
+                    app_storage.set_storage_dir, new_dir
+                )
+                busy[0] = False
+                status_text.value = msg
+                status_text.color = "#15803D" if ok else "#DC2626"
+                if ok:
+                    path_text.value = app_storage.get_current_storage_dir()
+                with contextlib.suppress(Exception):
+                    path_text.update()
+                    status_text.update()
+
+            return ft.Column(
+                [
+                    ft.Text(
+                        "Тут кешуються локальні файли цього застосунку на цьому пристрої"
+                        " (замовлення, налаштування таблиць тощо). Поточна папка:",
+                        size=12,
+                        color=_th_muted,
+                    ),
+                    path_text,
+                    ft.FilledButton(
+                        "Обрати іншу папку",
+                        icon=ft.Icons.FOLDER_OPEN,
+                        on_click=_pick_folder,
+                    ),
+                    status_text,
+                    ft.Text(
+                        "При зміні всі наявні файли переносяться в нову папку"
+                        " автоматично — на старому диску нічого не залишається."
+                        " Після перенесення перезапустіть застосунок.",
+                        size=11,
+                        color=_th_muted,
+                        italic=True,
+                    ),
+                ],
+                spacing=8,
+            )
 
         def _build_theme_picker_controls():
             current_theme = _load_current_theme()
@@ -3687,6 +3777,11 @@ class SettingsView:
                     visible=True,
                 ),
                 *_build_gsm_parser_block(),
+                build_collapsible_block(
+                    "Місце збереження кешу",
+                    [_build_storage_location_controls()],
+                    initially_open=False,
+                ),
                 build_collapsible_block(
                     "Тема оформлення",
                     [_build_theme_picker_controls()],

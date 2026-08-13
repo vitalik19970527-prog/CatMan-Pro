@@ -61,14 +61,14 @@ class Config:
     SUPERADMIN_EMAIL = os.getenv("SUPERADMIN_EMAIL", "")
     WORK_EMAIL = os.getenv("WORK_EMAIL", "")
 
-    # в”Ђв”Ђв”Ђ Р’РµСЂСЃС–СЏ РїСЂРѕРіСЂР°РјРё в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
-    # Р—РјС–РЅСЋР№С‚Рµ С†РµР№ СЂСЏРґРѕРє РїСЂРё РєРѕР¶РЅРѕРјСѓ СЂРµР»С–Р·С–.
-    # Р¤РѕСЂРјР°С‚: MAJOR.MINOR.PATCH  (РЅР°РїСЂРёРєР»Р°Рґ "1.2.0")
-    APP_VERSION = "1.1.4"
+    # ─── Версія програми ─────────────────────────────────────────────
+    # Змінюйте цей рядок при кожному релізі.
+    # Формат: MAJOR.MINOR.PATCH  (наприклад "1.2.0")
+    APP_VERSION = "1.3.4"
 
-    # в”Ђв”Ђв”Ђ РџРѕСЃРёР»Р°РЅРЅСЏ РЅР° СЃРєР°С‡СѓРІР°РЅРЅСЏ РѕРЅРѕРІР»РµРЅРЅСЏ в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
-    # Р’СЃС‚Р°РІС‚Рµ СЃСЋРґРё РїСЂСЏРјРµ РїРѕСЃРёР»Р°РЅРЅСЏ РЅР° .exe РїС–СЃР»СЏ С‚РѕРіРѕ СЏРє Р±СѓРґРµРјРѕ РіРѕС‚РѕРІС– РґРѕ СЂРµР»С–Р·Сѓ.
-    # РџСЂРёРєР»Р°Рґ GitHub Releases: "https://github.com/YOUR_USER/catman-pro/releases/latest/download/CatManPro.exe"
+    # ─── Посилання на скачування оновлення ─────────────────────
+    # Вставте сюди пряме посилання на .exe після того як будемо готові до релізу.
+    # Приклад GitHub Releases: "https://github.com/YOUR_USER/catman-pro/releases/latest/download/CatManPro.exe"
     UPDATE_DOWNLOAD_URL = os.getenv("UPDATE_DOWNLOAD_URL", "")
 
     # Online-fast profile: keep hot data in memory briefly for instant UI while syncing aggressively.
@@ -122,12 +122,12 @@ class Config:
         os.getenv("SYNC_POST_CHANGE_POLL_SECONDS", "3") or "3"
     )
 
-    # В«Р’Р·Р°С”РјРѕСЂРѕР·СЂР°С…СѓРЅРєРёВ»: С„РѕРЅРѕРІС– РїРµСЂРµРІС–СЂРєРё Р·Р°РјРѕРІР»РµРЅСЊ Р±РµР· РїРѕРІРЅРѕС— РїРµСЂРµР±СѓРґРѕРІРё РІРєР»Р°РґРєРё.
+    # «Взаєморозрахунки»: фонові перевірки замовлень без повної перебудови вкладки.
     PAYMENTS_AUTO_REFRESH_INTERVAL_SECONDS = float(
         os.getenv("PAYMENTS_AUTO_REFRESH_INTERVAL_SECONDS", "15") or "15"
     )
 
-    # В«Р—Р°РјРѕРІР»РµРЅРЅСЏВ»: РјС–РЅС–РјСѓРј РјС–Р¶ С…РІРёР»СЏРјРё live-row sync (get_order_by_id РїРѕ РІС–РґРєСЂРёС‚РёС… СЂСЏРґРєР°С…).
+    # «Замовлення»: мінімум між хвилями live-row sync (get_order_by_id по відкритих рядках).
     ORDERS_LIVE_SYNC_DEBOUNCE_SECONDS = float(
         os.getenv("ORDERS_LIVE_SYNC_DEBOUNCE_SECONDS", "2.0") or "2.0"
     )
@@ -153,6 +153,36 @@ class Config:
     PERSISTENT_CACHE_FOREVER = str(
         os.getenv("PERSISTENT_CACHE_FOREVER", "0")
     ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

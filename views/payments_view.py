@@ -1040,7 +1040,11 @@ class PaymentsView:
         return len(self._orders) < before
 
     async def _bg_sync_loop(self) -> None:
-        _last_pulse_check = 0.0
+        # DB pulse polling removed (_bg_payments_pulse_check) — that part
+        # detected changes from ANOTHER device/session, which can't happen
+        # anymore under 1 менеджер = 1 категорія; Ctrl+F5 covers the manual
+        # case. The in-memory __sync_seq__ mirroring stays (no DB call —
+        # keeps this session's own concurrently-open views consistent).
         while True:
             try:
                 await asyncio.sleep(1.5)
@@ -1059,13 +1063,6 @@ class PaymentsView:
                         else:
                             with contextlib.suppress(Exception):
                                 self._update_counters()
-                # Periodically poll the DB pulse for changes made from another
-                # device/session, even while this tab stays open the whole
-                # time (not just when the user switches away and back).
-                _now = time.monotonic()
-                if (_now - _last_pulse_check) >= 20.0:
-                    _last_pulse_check = _now
-                    await self._bg_payments_pulse_check()
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -1500,7 +1497,10 @@ class PaymentsView:
                 self._update_balance_display()
 
     def _persist_order_async(
-        self, order_payload: dict, rebuild_after: bool = False
+        self,
+        order_payload: dict,
+        rebuild_after: bool = False,
+        flush_immediately: bool = False,
     ) -> None:
         if self.is_read_only:
             return
@@ -1533,6 +1533,17 @@ class PaymentsView:
         self._save_outbox()
         self._refresh_sync_indicator_state()
         self._start_sync_timer()
+        if flush_immediately:
+            # Status/payment/delivery commits are deliberate, infrequent user
+            # actions (unlike the per-field blur autosaves that also call this
+            # method) — worth pushing to the DB right away instead of waiting
+            # up to 45s for _sync_timer_loop, since another device's Orders
+            # tab polls the DB pulse on its own ~20s cadence and can only see
+            # a change once it actually lands.
+            page = self._page()
+            if page and hasattr(page, "run_task"):
+                with contextlib.suppress(Exception):
+                    page.run_task(self._flush_outbox_async)
         if rebuild_after:
             with contextlib.suppress(Exception):
                 self._update_balance_display()
@@ -2231,7 +2242,14 @@ class PaymentsView:
                             weight=ft.FontWeight.W_700,
                             color=_MUTED,
                             text_align=ft.TextAlign.CENTER,
-                        )
+                        ),
+                        ft.Text(
+                            _tot_hint,
+                            size=10,
+                            weight=ft.FontWeight.W_700,
+                            color=_tot_fg,
+                            text_align=ft.TextAlign.CENTER,
+                        ),
                     ]
                     if non_usd_ccys:
                         for _ccy in non_usd_ccys:
@@ -2285,21 +2303,6 @@ class PaymentsView:
                         ),
                     )
                     boxes = [bal_box]
-
-                    hint_box = ft.Container(
-                        width=_ABW,
-                        padding=_ABP,
-                        bgcolor=_tot_bg,
-                        border_radius=8,
-                        alignment=ft.alignment.Alignment(0, -1),
-                        content=ft.Text(
-                            _tot_hint,
-                            size=10,
-                            weight=ft.FontWeight.W_700,
-                            color=_tot_fg,
-                            text_align=ft.TextAlign.CENTER,
-                        ),
-                    )
 
                     def _sum_chip(
                         label: str, by_ccy: dict, bg: str, fg: str
@@ -2380,7 +2383,6 @@ class PaymentsView:
                             color=_CHIP_T,
                         ),
                         *boxes,
-                        hint_box,
                         ft.Container(width=12),
                         debt_chip,
                         paid_chip,
@@ -2494,7 +2496,12 @@ class PaymentsView:
             _BPAD = ft.padding.symmetric(horizontal=10, vertical=4)
             _BLBL = _MUTED
 
-            def _bal_box(amount_str: str, sub_str: str = "") -> ft.Container:
+            def _build_balance_box() -> ft.Container:
+                # ONE box for "Баланс:" — label, then who-owes-whom hint,
+                # then every currency stacked as its own line (matching the
+                # "Сума замовлень"/"Сплачено" chips' own layout exactly,
+                # instead of one separate mini-box per currency plus a
+                # separate hint box floating next to them).
                 col = [
                     ft.Text(
                         self.t("payments.balance.label", "Баланс:"),
@@ -2504,22 +2511,69 @@ class PaymentsView:
                         text_align=ft.TextAlign.CENTER,
                     ),
                     ft.Text(
-                        amount_str,
+                        _tot_hint,
                         size=10,
                         weight=ft.FontWeight.W_700,
                         color=_tot_fg,
                         text_align=ft.TextAlign.CENTER,
                     ),
                 ]
-                if sub_str:
+                if not _all_ccys:
                     col.append(
                         ft.Text(
-                            sub_str,
+                            "0",
                             size=10,
+                            weight=ft.FontWeight.W_700,
                             color=_tot_fg,
                             text_align=ft.TextAlign.CENTER,
                         )
                     )
+                elif len(_all_ccys) == 1:
+                    ccy = _all_ccys[0]
+                    col.append(
+                        ft.Text(
+                            f"{_fmt_money(totals_by_ccy[ccy])} {_ccy_sym(ccy)}",
+                            size=10,
+                            weight=ft.FontWeight.W_700,
+                            color=_tot_fg,
+                            text_align=ft.TextAlign.CENTER,
+                        )
+                    )
+                    if ccy != "USD" and total_usd:
+                        col.append(
+                            ft.Text(
+                                f"≈ {_fmt_money(total_usd)} $",
+                                size=10,
+                                color=_tot_fg,
+                                text_align=ft.TextAlign.CENTER,
+                            )
+                        )
+                else:
+                    for target_ccy in _all_ccys:
+                        rate = self._supplier_to_usd_rate(target_ccy)
+                        amt = (
+                            (total_usd / rate)
+                            if (rate and rate > 0 and total_usd)
+                            else totals_by_ccy.get(target_ccy, 0.0)
+                        )
+                        col.append(
+                            ft.Text(
+                                f"{_fmt_money(amt)} {_ccy_sym(target_ccy)}",
+                                size=10,
+                                weight=ft.FontWeight.W_700,
+                                color=_tot_fg,
+                                text_align=ft.TextAlign.CENTER,
+                            )
+                        )
+                    if total_usd:
+                        col.append(
+                            ft.Text(
+                                f"≈ {_fmt_money(total_usd)} $",
+                                size=10,
+                                color=_tot_fg,
+                                text_align=ft.TextAlign.CENTER,
+                            )
+                        )
                 return ft.Container(
                     width=_BCW,
                     padding=_BPAD,
@@ -2531,48 +2585,6 @@ class PaymentsView:
                         spacing=2,
                         tight=True,
                         horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                    ),
-                )
-
-            def _make_bal_boxes(small: bool) -> list:
-                if not _all_ccys:
-                    return [_bal_box("0")]
-                if len(_all_ccys) == 1:
-                    ccy = _all_ccys[0]
-                    sub = (
-                        (f"≈ {_fmt_money(total_usd)} $")
-                        if ccy != "USD" and total_usd
-                        else ""
-                    )
-                    return [
-                        _bal_box(
-                            f"{_fmt_money(totals_by_ccy[ccy])} {_ccy_sym(ccy)}", sub
-                        )
-                    ]
-                boxes = []
-                for target_ccy in _all_ccys:
-                    rate = self._supplier_to_usd_rate(target_ccy)
-                    amt = (
-                        (total_usd / rate)
-                        if (rate and rate > 0 and total_usd)
-                        else totals_by_ccy.get(target_ccy, 0.0)
-                    )
-                    boxes.append(_bal_box(f"{_fmt_money(amt)} {_ccy_sym(target_ccy)}"))
-                return boxes
-
-            def _hint_box() -> ft.Container:
-                return ft.Container(
-                    width=_BCW,
-                    padding=_BPAD,
-                    bgcolor=_tot_bg,
-                    border_radius=8,
-                    alignment=ft.alignment.Alignment(0, 0),
-                    content=ft.Text(
-                        _tot_hint,
-                        size=10,
-                        weight=ft.FontWeight.W_700,
-                        color=_tot_fg,
-                        text_align=ft.TextAlign.CENTER,
                     ),
                 )
 
@@ -2589,8 +2601,7 @@ class PaymentsView:
                             color=_CHIP_T,
                         )
                     )
-                    row.controls.extend(_make_bal_boxes(small=False))
-                    row.controls.append(_hint_box())
+                    row.controls.append(_build_balance_box())
                 with contextlib.suppress(Exception):
                     tr.update()
 
@@ -2607,8 +2618,7 @@ class PaymentsView:
                         color=_CHIP_T,
                     )
                 )
-                _stb_row.controls.extend(_make_bal_boxes(small=True))
-                _stb_row.controls.append(_hint_box())
+                _stb_row.controls.append(_build_balance_box())
                 _stb_row.controls.extend(_suffix)
 
             # Rebuild debt/paid chip columns: cross-convert all currencies to each
@@ -2848,6 +2858,34 @@ class PaymentsView:
                             _uv.value = str(_unpaid_count)
                             _uv.color = _upd_fg
 
+                # Update "Аванс" cell
+                advance_ct = getattr(self, "_supplier_advance_refs", {}).get(sid)
+                if advance_ct is not None:
+                    _advance_count = sum(
+                        1
+                        for _o in olist
+                        if self._payment_bucket_key(_o.get("payment_status")) == "advance"
+                    )
+                    _ad = getattr(advance_ct, "data", None)
+                    if isinstance(_ad, dict):
+                        _av = _ad.get("val")
+                        if isinstance(_av, ft.Text):
+                            _av.value = str(_advance_count)
+
+                # Update "Передано" cell
+                transferred_ct = getattr(self, "_supplier_transferred_refs", {}).get(sid)
+                if transferred_ct is not None:
+                    _transferred_count = sum(
+                        1
+                        for _o in olist
+                        if self._payment_bucket_key(_o.get("payment_status")) == "transferred"
+                    )
+                    _td = getattr(transferred_ct, "data", None)
+                    if isinstance(_td, dict):
+                        _tv = _td.get("val")
+                        if isinstance(_tv, ft.Text):
+                            _tv.value = str(_transferred_count)
+
                 # Update "Замовлень" cell
                 count_ct = getattr(self, "_supplier_count_refs", {}).get(sid)
                 if count_ct is not None:
@@ -2856,6 +2894,19 @@ class PaymentsView:
                         _cv = _cd.get("val")
                         if isinstance(_cv, ft.Text):
                             _cv.value = str(len(olist))
+
+                # Explicit per-control update — the trailing page.update()
+                # below sometimes doesn't visually refresh these specific
+                # chips even though it completes without error (confirmed
+                # live: Ctrl+F5 always shows the correct — already-computed
+                # — number, only the in-place refresh was stale). Scoped
+                # updates on the actual mutated controls are more reliable
+                # than a single whole-page diff for this batch of scattered
+                # per-supplier containers.
+                for _ct in (container, debt_ct, paid_ct, unpaid_ct, advance_ct, transferred_ct, count_ct):
+                    if _ct is not None:
+                        with contextlib.suppress(Exception):
+                            _ct.update()
 
                 _any_changed = True
             except Exception:
@@ -2961,13 +3012,72 @@ class PaymentsView:
         # causing their IDs to display instead of names. Orders are already
         # scoped by region via _is_order_in_scope, so the supplier list is safe unfiltered.
 
+    def _apply_settlement_owner_scope(self, orders: list, mid: str) -> list:
+        """Взаєморозрахунки-only correction on top of the general order
+        scope: an order whose settlement has been frozen to specific
+        manager(s) (see database._maybe_snapshot_order_settlement_owner)
+        must count toward THAT manager's balance forever, regardless of
+        which manager a later category/level transfer makes the general
+        owner. General order visibility (analytics, С/В Замовлення, etc.)
+        fully follows the transfer — only this settlement view doesn't.
+
+        - Drops orders frozen to someone else (even though `orders` — built
+          from the general scope — would otherwise include them post-transfer).
+        - Adds back orders frozen to `mid` even if they fell out of `mid`'s
+          general scope entirely (e.g. the category was later fully handed
+          off) — their past payment still belongs on this manager's ledger.
+        """
+        oid_list = [
+            str((o or {}).get("id") or "").strip()
+            for o in orders
+            if isinstance(o, dict) and str((o or {}).get("id") or "").strip()
+        ]
+        try:
+            settle_map = self.db.get_entity_owners_map(
+                self.company_id, "order_settlement", oid_list
+            )
+        except Exception:
+            settle_map = {}
+        if not settle_map:
+            return orders
+
+        kept = [
+            o
+            for o in orders
+            if not settle_map.get(str((o or {}).get("id") or "").strip())
+            or mid in settle_map.get(str((o or {}).get("id") or "").strip(), set())
+        ]
+        loaded_ids = {str((o or {}).get("id") or "").strip() for o in kept}
+        try:
+            frozen_to_me = set(
+                self.db.get_entity_owner_entity_ids(
+                    self.company_id, mid, "order_settlement"
+                )
+                or []
+            )
+        except Exception:
+            frozen_to_me = set()
+        missing_ids = [oid for oid in frozen_to_me if oid not in loaded_ids]
+        if missing_ids:
+            with contextlib.suppress(Exception):
+                extra = self.db.get_orders_by_ids(self.company_id, missing_ids) or []
+                kept.extend(o for o in extra if isinstance(o, dict))
+        return kept
+
     def _load_data_from_db(self) -> None:
         try:
+            # NOTE: kept as [] (not None) when empty — get_orders() treats
+            # visible_product_ids=None as "no product filter at all" (every
+            # company order, ignoring manager_id too), while an explicit []
+            # correctly means "this manager has zero visible products, so
+            # zero orders". Silently converting empty-to-None used to leak
+            # every other manager's orders to a manager with no assigned
+            # category yet.
             visible_product_ids = [
                 str((p or {}).get("id") or "").strip()
                 for p in (self._products or [])
                 if isinstance(p, dict) and (p.get("id") or "").strip()
-            ] or None
+            ]
             # Payments balance is region-agnostic: always load ALL orders across
             # all regions so the supplier totals are consistent regardless of which
             # region button is active in the dashboard header.
@@ -2985,6 +3095,9 @@ class PaymentsView:
                             )
                             or []
                         )
+                        mgr_orders = self._apply_settlement_owner_scope(
+                            mgr_orders, mid
+                        )
                         mgr_name = (self._general_manager_names or {}).get(mid, mid)
                         for o in mgr_orders:
                             if isinstance(o, dict):
@@ -2995,7 +3108,7 @@ class PaymentsView:
                         pass
                 self._orders = combined
             else:
-                self._orders = (
+                _raw_orders = (
                     self.db.get_orders(
                         self.company_id,
                         None,  # all regions — balance must not depend on region filter
@@ -3004,6 +3117,9 @@ class PaymentsView:
                         visible_product_ids=visible_product_ids,
                     )
                     or []
+                )
+                self._orders = self._apply_settlement_owner_scope(
+                    _raw_orders, self.manager_id
                 )
         except Exception:
             self._orders = []
@@ -3353,6 +3469,8 @@ class PaymentsView:
         self._supplier_debt_refs = {}
         self._supplier_paid_refs = {}
         self._supplier_unpaid_refs = {}
+        self._supplier_advance_refs = {}
+        self._supplier_transferred_refs = {}
         self._supplier_count_refs = {}
         self._supplier_section_refs = {}
         self._supplier_expand_callbacks = {}
@@ -3575,7 +3693,9 @@ class PaymentsView:
         _SA = ft.alignment.Alignment(0, 0)
         _SHA = ft.CrossAxisAlignment.CENTER
 
-        def _bal_box_s(amount_str: str, sub_str: str = "") -> ft.Container:
+        def _build_balance_box_s() -> ft.Container:
+            # ONE box for "Баланс:" — see the matching _build_balance_box in
+            # _update_balance_display for the full rationale.
             col = [
                 ft.Text(
                     "Баланс:",
@@ -3585,19 +3705,69 @@ class PaymentsView:
                     text_align=ft.TextAlign.CENTER,
                 ),
                 ft.Text(
-                    amount_str,
+                    _tot_hint,
                     size=10,
                     weight=ft.FontWeight.W_700,
                     color=_tot_fg,
                     text_align=ft.TextAlign.CENTER,
                 ),
             ]
-            if sub_str:
+            if not _all_ccys:
                 col.append(
                     ft.Text(
-                        sub_str, size=11, color=_tot_fg, text_align=ft.TextAlign.CENTER
+                        "0",
+                        size=10,
+                        weight=ft.FontWeight.W_700,
+                        color=_tot_fg,
+                        text_align=ft.TextAlign.CENTER,
                     )
                 )
+            elif len(_all_ccys) == 1:
+                ccy = _all_ccys[0]
+                col.append(
+                    ft.Text(
+                        f"{_fmt_money(totals_by_ccy[ccy])} {_ccy_sym(ccy)}",
+                        size=10,
+                        weight=ft.FontWeight.W_700,
+                        color=_tot_fg,
+                        text_align=ft.TextAlign.CENTER,
+                    )
+                )
+                if ccy != "USD" and total_usd:
+                    col.append(
+                        ft.Text(
+                            f"≈ {_fmt_money(total_usd)} $",
+                            size=11,
+                            color=_tot_fg,
+                            text_align=ft.TextAlign.CENTER,
+                        )
+                    )
+            else:
+                for target_ccy in _all_ccys:
+                    rate = self._supplier_to_usd_rate(target_ccy)
+                    amt = (
+                        (total_usd / rate)
+                        if (rate and rate > 0 and total_usd)
+                        else totals_by_ccy.get(target_ccy, 0.0)
+                    )
+                    col.append(
+                        ft.Text(
+                            f"{_fmt_money(amt)} {_ccy_sym(target_ccy)}",
+                            size=10,
+                            weight=ft.FontWeight.W_700,
+                            color=_tot_fg,
+                            text_align=ft.TextAlign.CENTER,
+                        )
+                    )
+                if total_usd:
+                    col.append(
+                        ft.Text(
+                            f"≈ {_fmt_money(total_usd)} $",
+                            size=10,
+                            color=_tot_fg,
+                            text_align=ft.TextAlign.CENTER,
+                        )
+                    )
             return ft.Container(
                 width=_SCW,
                 padding=_SPD,
@@ -3609,30 +3779,6 @@ class PaymentsView:
                 ),
             )
 
-        def _make_bal_boxes(small: bool) -> list:
-            if not _all_ccys:
-                return [_bal_box_s("0")]
-            if len(_all_ccys) == 1:
-                ccy = _all_ccys[0]
-                sub = (
-                    (f"≈ {_fmt_money(total_usd)} $")
-                    if ccy != "USD" and total_usd
-                    else ""
-                )
-                return [
-                    _bal_box_s(f"{_fmt_money(totals_by_ccy[ccy])} {_ccy_sym(ccy)}", sub)
-                ]
-            boxes = []
-            for target_ccy in _all_ccys:
-                rate = self._supplier_to_usd_rate(target_ccy)
-                amt = (
-                    (total_usd / rate)
-                    if (rate and rate > 0 and total_usd)
-                    else totals_by_ccy.get(target_ccy, 0.0)
-                )
-                boxes.append(_bal_box_s(f"{_fmt_money(amt)} {_ccy_sym(target_ccy)}"))
-            return boxes
-
         _totals_row_controls = [
             ft.Text(
                 self.t("payments.balance.total", "Загальний баланс"),
@@ -3640,21 +3786,7 @@ class PaymentsView:
                 weight=ft.FontWeight.W_700,
                 color=_CHIP_T,
             ),
-            *_make_bal_boxes(small=False),
-            ft.Container(
-                width=_SCW,
-                padding=_SPD,
-                bgcolor=_tot_bg,
-                border_radius=8,
-                alignment=_SA,
-                content=ft.Text(
-                    _tot_hint,
-                    size=10,
-                    weight=ft.FontWeight.W_700,
-                    color=_tot_fg,
-                    text_align=ft.TextAlign.CENTER,
-                ),
-            ),
+            _build_balance_box_s(),
         ]
         totals_row = ft.Container(
             content=(
@@ -4531,15 +4663,38 @@ class PaymentsView:
         except Exception:
             pass
 
+    def _suppliers_by_id_cached(self) -> dict:
+        """Rebuilt lazily, invalidated whenever self._suppliers is replaced
+        (tracked by identity, not content — cheap and correct since
+        _load_lookups always assigns a brand-new list)."""
+        cache = getattr(self, "_suppliers_by_id_cache", None)
+        src = self._suppliers or []
+        if cache is not None and cache[0] is src:
+            return cache[1]
+        by_id = {
+            str((s or {}).get("id") or ""): s for s in src if isinstance(s, dict)
+        }
+        self._suppliers_by_id_cache = (src, by_id)
+        return by_id
+
+    def _products_by_id_cached(self) -> dict:
+        """Same identity-cached pattern as _suppliers_by_id_cached — avoids
+        rescanning the full product list on every line-item lookup."""
+        cache = getattr(self, "_products_by_id_cache", None)
+        src = self._products or []
+        if cache is not None and cache[0] is src:
+            return cache[1]
+        by_id = {
+            str((p or {}).get("id") or ""): p for p in src if isinstance(p, dict)
+        }
+        self._products_by_id_cache = (src, by_id)
+        return by_id
+
     def _supplier_currency(self, supplier_id: str) -> str:
-        sup = next(
-            (
-                s
-                for s in (self._suppliers or [])
-                if str((s or {}).get("id") or "") == supplier_id
-            ),
-            None,
-        )
+        # Was a linear scan of every supplier on every call — called several
+        # times per render pass (build tree, balance recompute, group stats,
+        # supplier section) for potentially every supplier in the company.
+        sup = self._suppliers_by_id_cached().get(str(supplier_id or ""))
         ccy = str((sup or {}).get("currency") or "USD").upper().strip() or "USD"
         return ccy
 
@@ -4801,14 +4956,7 @@ class PaymentsView:
         ccy = str(it0.get("purchase_currency") or sc).upper().strip() or sc
         if p is None:
             pid = str(it0.get("product_id") or "").strip()
-            prod = next(
-                (
-                    p
-                    for p in (self._products or [])
-                    if str((p or {}).get("id") or "") == pid
-                ),
-                None,
-            )
+            prod = self._products_by_id_cached().get(pid)
             p = _safe_float((prod or {}).get("purchase_price"), None)
             ccy = (
                 str((prod or {}).get("purchase_currency") or ccy or "").upper().strip()
@@ -4819,6 +4967,18 @@ class PaymentsView:
         return float(q) * float(p)
 
     def _order_amount_supplier_ccy(self, o: dict, supplier_ccy: str) -> Optional[float]:
+        # An order-level manual "Вартість" override must win regardless of
+        # item count — _line_amount_supplier_ccy only honors it when there's
+        # a single item, so a multi-item order's manually-typed total was
+        # silently ignored here (and everywhere that sums via this
+        # function: Взаєморозрахунки balance, etc.), even though Orders
+        # itself displays/saves the override fine. Confirmed live: editing
+        # the order-level "Вартість" on a multi-item order never showed up
+        # on Взаєморозрахунки/С/В Замовлення — only editing a specific
+        # item's qty/amount did.
+        order_man = _safe_float(o.get("amount_manual_override"), None)
+        if order_man is not None:
+            return float(order_man)
         items = o.get("items") if isinstance(o.get("items"), list) else []
         if not items:
             return None
@@ -4847,14 +5007,7 @@ class PaymentsView:
             w_u = _safe_float((it or {}).get("weight_per_unit_kg"), 0.0) or 0.0
             if w_u <= 0:
                 pid = str((it or {}).get("product_id") or "").strip()
-                prod = next(
-                    (
-                        p
-                        for p in (self._products or [])
-                        if isinstance(p, dict) and str((p or {}).get("id") or "") == pid
-                    ),
-                    None,
-                )
+                prod = self._products_by_id_cached().get(pid)
                 w_u = _safe_float((prod or {}).get("weight_kg"), 0.0) or 0.0
             return max(0.0, float(q) * float(w_u))
         except Exception:
@@ -4878,14 +5031,7 @@ class PaymentsView:
             if p is None:
                 # Fallback to product card purchase price/currency (matches Orders behavior).
                 pid = str((it or {}).get("product_id") or "").strip()
-                prod = next(
-                    (
-                        p
-                        for p in (self._products or [])
-                        if isinstance(p, dict) and str((p or {}).get("id") or "") == pid
-                    ),
-                    None,
-                )
+                prod = self._products_by_id_cached().get(pid)
                 p = _safe_float((prod or {}).get("purchase_price"), None)
                 ccy = (
                     str((prod or {}).get("purchase_currency") or ccy or "")
@@ -4979,18 +5125,36 @@ class PaymentsView:
         except Exception:
             return None
 
-    def _supplier_settlement_sum(self, supplier_id: str, supplier_ccy: str) -> float:
-        total = 0.0
-        for s in self._settlements or []:
+    def _settlement_sums_by_supplier_ccy_cached(self) -> dict:
+        """One pass over self._settlements building sum-per-(supplier_id,
+        currency) — _supplier_settlement_sum used to rescan the ENTIRE
+        settlements list per supplier per call site (called from at least 3
+        places per render pass: totals loop, debt-filter loop, and again
+        inside every _build_supplier_section call)."""
+        cache = getattr(self, "_settlement_sums_cache", None)
+        src = self._settlements or []
+        if cache is not None and cache[0] is src:
+            return cache[1]
+        sums: dict[tuple, float] = {}
+        for s in src:
             if not isinstance(s, dict):
                 continue
-            if str(s.get("supplier_id") or "").strip() != supplier_id:
-                continue
-            ccy = str(s.get("currency") or supplier_ccy).upper().strip() or supplier_ccy
-            if ccy != supplier_ccy:
-                continue
-            total += _safe_float(s.get("amount"), 0.0) or 0.0
-        return total
+            sid = str(s.get("supplier_id") or "").strip()
+            ccy = str(s.get("currency") or "").upper().strip()
+            key = (sid, ccy)
+            sums[key] = sums.get(key, 0.0) + (_safe_float(s.get("amount"), 0.0) or 0.0)
+        self._settlement_sums_cache = (src, sums)
+        return sums
+
+    def _supplier_settlement_sum(self, supplier_id: str, supplier_ccy: str) -> float:
+        # A settlement row with no currency recorded matched ANY supplier_ccy
+        # in the original per-call scan (`s.get("currency") or supplier_ccy`
+        # defaulted the row's ccy to whatever was being asked about) — the
+        # index keys those under "" instead, so both buckets must be summed.
+        sid = str(supplier_id or "").strip()
+        ccy = str(supplier_ccy or "").upper().strip()
+        sums = self._settlement_sums_by_supplier_ccy_cached()
+        return sums.get((sid, ccy), 0.0) + (sums.get((sid, ""), 0.0) if ccy else 0.0)
 
     def _build_supplier_section(
         self,
@@ -5213,6 +5377,24 @@ class PaymentsView:
             for o in orders_for_supplier
             if self._payment_bucket_key(o.get("payment_status")) != "paid"
         )
+        # "Не сплачених" above stays the combined "not fully paid yet" count
+        # (unpaid + advance + transferred) — but that used to be the ONLY
+        # number shown, hiding whether those orders already have an advance
+        # or were transferred. Split those two out as their own chips so
+        # it's clear without opening anything: e.g. "Не сплачених: 3,
+        # Аванс: 1, Передано: 1" tells you 1 of the 3 has genuinely nothing
+        # paid at all (confirmed live: "Не сплачених ... рахує Не сплачені,
+        # Аванс і Передано [разом]").
+        advance_count = sum(
+            1
+            for o in orders_for_supplier
+            if self._payment_bucket_key(o.get("payment_status")) == "advance"
+        )
+        transferred_count = sum(
+            1
+            for o in orders_for_supplier
+            if self._payment_bucket_key(o.get("payment_status")) == "transferred"
+        )
         _upd_bg = _OK_BG if unpaid_count == 0 else _ERR_BG
         _upd_fg = _OK_T if unpaid_count == 0 else _ERR
         _unpaid_val_text = ft.Text(
@@ -5245,6 +5427,68 @@ class PaymentsView:
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             ),
         )
+        _advance_val_text = ft.Text(
+            str(advance_count),
+            size=10,
+            weight=ft.FontWeight.W_700,
+            color=_WARN_T,
+            text_align=ft.TextAlign.CENTER,
+        )
+        advance_cell = ft.Container(
+            width=_CW,
+            padding=ft.padding.symmetric(horizontal=8, vertical=4),
+            bgcolor=_WARN_BG,
+            border_radius=6,
+            alignment=ft.alignment.Alignment(0, -1),
+            data={"val": _advance_val_text},
+            content=ft.Column(
+                [
+                    ft.Text(
+                        "Аванс:",
+                        size=9,
+                        weight=ft.FontWeight.W_700,
+                        color=_MUTED,
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                    _advance_val_text,
+                ],
+                spacing=2,
+                tight=True,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+        )
+        _transferred_val_text = ft.Text(
+            str(transferred_count),
+            size=10,
+            weight=ft.FontWeight.W_700,
+            color=_ACCENT,
+            text_align=ft.TextAlign.CENTER,
+        )
+        transferred_cell = ft.Container(
+            width=_CW,
+            padding=ft.padding.symmetric(horizontal=8, vertical=4),
+            bgcolor="#DBEAFE",
+            border_radius=6,
+            alignment=ft.alignment.Alignment(0, -1),
+            data={"val": _transferred_val_text},
+            content=ft.Column(
+                [
+                    ft.Text(
+                        "Передано:",
+                        size=9,
+                        weight=ft.FontWeight.W_700,
+                        color=_MUTED,
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                    _transferred_val_text,
+                ],
+                spacing=2,
+                tight=True,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+        )
+        self._supplier_advance_refs[supplier_id] = advance_cell
+        self._supplier_transferred_refs[supplier_id] = transferred_cell
         _count_val_text = ft.Text(
             str(order_count),
             size=10,
@@ -5304,6 +5548,8 @@ class PaymentsView:
                 ft.Row(
                     [
                         unpaid_cell,
+                        advance_cell,
+                        transferred_cell,
                         count_cell,
                         bal_cell,
                         debt_cell,
@@ -5459,6 +5705,7 @@ class PaymentsView:
             color: str = _TEXT,
             h: int = ROW_H,
             wrap: bool = True,
+            raw: bool = False,
         ):
             if int(w or 0) <= 0:
                 # Fully hide zero-width columns (e.g., "Вартість $" when supplier currency is USD).
@@ -5471,7 +5718,7 @@ class PaymentsView:
                 padding=ft.padding.all(0),
                 alignment=ft.Alignment(0, 0),
                 content=ft.Text(
-                    format_maybe_numeric_text(str(txt or "")),
+                    str(txt or "") if raw else format_maybe_numeric_text(str(txt or "")),
                     size=TXT,
                     weight="bold" if bold else "w400",
                     color=color,
@@ -5868,8 +6115,13 @@ class PaymentsView:
             ]
             # Fallback: if catalog rows don't carry supplier_id in this deployment,
             # build minimal options from existing supplier orders to keep the list relevant.
+            # orders_for_supplier is the manager's raw historical orders, which can
+            # still reference a product they've since been stripped of (kept in the
+            # DB for settlement history) — gate against self._products (manager_id-
+            # scoped) so a gave-away product can't reappear as a selectable option here.
             if not filtered_products:
                 try:
+                    _owned_pids = self._products_by_id_cached()
                     seen = set()
                     derived = []
                     for _o in orders_for_supplier or []:
@@ -5889,7 +6141,7 @@ class PaymentsView:
                             if not isinstance(_it, dict):
                                 continue
                             pid0 = str(_it.get("product_id") or "").strip()
-                            if not pid0 or pid0 in seen:
+                            if not pid0 or pid0 in seen or pid0 not in _owned_pids:
                                 continue
                             seen.add(pid0)
                             derived.append(
@@ -6132,7 +6384,9 @@ class PaymentsView:
                     except Exception:
                         pass
 
-                    self._persist_order_async(o, rebuild_after=True)
+                    self._persist_order_async(
+                        o, rebuild_after=True, flush_immediately=True
+                    )
 
                 _row_oid = str(o.get("id") or "").strip()
                 st_ctrl = _pm(
@@ -6244,11 +6498,8 @@ class PaymentsView:
                     )
                     new_bg = _ERR_BG if (has_transferred and not has_paid) else _base
                     if cell.bgcolor != new_bg:
-                        try:
-                            cell.bgcolor = new_bg
-                        except Exception:
-                            return
                         with contextlib.suppress(Exception):
+                            cell.bgcolor = new_bg
                             cell.update()
 
                 def _on_transferred_blur(_e, _o=o, _tf=transferred_tf):
@@ -6422,6 +6673,23 @@ class PaymentsView:
             _hdr_trans_has = bool(_hdr_transferred_stored.strip())
             _hdr_paid_bg = _ERR_BG if (_hdr_trans_has and not _hdr_paid_has) else None
             paid_tf_header = _tf(paid_stored, _wcol.get("paid", 0), h=row_h_hdr)
+            # Mutable ref so both blur handlers and the header-row builder share the same cell.
+            _hdr_paid_cell_ref: list = [None]
+
+            def _update_hdr_paid_cell_bg(_o_state=o, _ref=_hdr_paid_cell_ref, _base=bgp):
+                """Instantly redraw the header paid-cell background — red when transferred but not paid."""
+                cell = _ref[0]
+                if cell is None:
+                    return
+                has_paid = bool(str(_o_state.get("paid_amount") or "").strip())
+                has_transferred = bool(
+                    str(_o_state.get("transferred_amount") or "").strip()
+                )
+                new_bg = _ERR_BG if (has_transferred and not has_paid) else _base
+                if cell.bgcolor != new_bg:
+                    with contextlib.suppress(Exception):
+                        cell.bgcolor = new_bg
+                        cell.update()
             sc_g = (supplier_ccy or "USD").upper().strip() or "USD"
             sum_sup = self._order_amount_supplier_ccy(o, supplier_ccy)
             sum_txt = (
@@ -6476,7 +6744,9 @@ class PaymentsView:
                         o["items"][0]["paid_amount"] = str(o.get("paid_amount") or "")
                 except Exception:
                     pass
-                self._persist_order_async(o, rebuild_after=True)
+                self._persist_order_async(
+                    o, rebuild_after=True, flush_immediately=True
+                )
 
             st_hdr = _pm(
                 header_cs["status"],
@@ -6537,6 +6807,7 @@ class PaymentsView:
                 """Швидкий патч для transferred_amount у заголовку."""
                 val = str(_tf.value or "")
                 if val == str(_o.get("transferred_amount") or ""):
+                    _update_hdr_paid_cell_bg()
                     return
                 _o["transferred_amount"] = val
                 self._persist_order_patch(
@@ -6544,6 +6815,7 @@ class PaymentsView:
                     {"transferred_amount": val},
                     rebuild_after=True,
                 )
+                _update_hdr_paid_cell_bg()
 
             transferred_tf_header.on_blur = _on_transferred_hdr_blur
             transferred_tf_header.on_submit = _on_transferred_hdr_blur
@@ -6553,6 +6825,7 @@ class PaymentsView:
                 paid_val = str(_pf.value or "")
                 old_val = str(_o.get("paid_amount") or "")
                 if paid_val == old_val:
+                    _update_hdr_paid_cell_bg()
                     return
                 _o["paid_amount"] = paid_val
                 with contextlib.suppress(Exception):
@@ -6567,6 +6840,7 @@ class PaymentsView:
                     {"paid_amount": paid_val},
                     rebuild_after=True,
                 )
+                _update_hdr_paid_cell_bg()
 
             paid_tf_header.on_blur = _on_paid_hdr_blur
             paid_tf_header.on_submit = _on_paid_hdr_blur
@@ -6590,10 +6864,31 @@ class PaymentsView:
                     self._expanded_orders.add(oid)
                 detail_col.visible = oid in self._expanded_orders
                 exp_lbl.value = "−" if detail_col.visible else "+"
+                # This toggle deliberately does a targeted `pg.update(...)`
+                # instead of a full `_render_rows()` (avoids flicker/cost of
+                # rebuilding every row on every click) — but that means the
+                # `rows_host.height` computed in `_render_rows` (which does
+                # account for expanded orders' extra item rows) never runs
+                # again here, so the container stayed pinned at its
+                # collapsed height and silently clipped the newly-revealed
+                # item rows (confirmed live: an 11-item order, expanded,
+                # still only showed ~2-3 rows). Bump the same fixed height
+                # by exactly this order's own item-row delta so the two
+                # stay in sync without a full re-render.
+                with contextlib.suppress(Exception):
+                    _n_items_local = len(items) if isinstance(items, list) else 0
+                    _delta_rows = max(0, _n_items_local - 1)
+                    if _delta_rows and isinstance(
+                        getattr(rows_host, "height", None), (int, float)
+                    ):
+                        _sign = 1 if detail_col.visible else -1
+                        rows_host.height = int(
+                            rows_host.height
+                        ) + _sign * _delta_rows * ROW_H
                 pg = self._page()
                 if pg:
                     try:
-                        pg.update(detail_col, exp_lbl)
+                        pg.update(detail_col, exp_lbl, rows_host)
                     except Exception:
                         self._schedule_rerender()
                 else:
@@ -6771,7 +7066,9 @@ class PaymentsView:
                             )
                     except Exception:
                         pass
-                    self._persist_order_async(o, rebuild_after=True)
+                    self._persist_order_async(
+                        o, rebuild_after=True, flush_immediately=True
+                    )
 
                 prod_c = _pm(
                     line_cs["product"],
@@ -6891,6 +7188,10 @@ class PaymentsView:
                     )
                 )
 
+            _hdr_paid_cell = _ctrl_cell(
+                paid_tf_header, _wcol.get("paid", 0), bgc=_hdr_paid_bg or bgp, h=row_h_hdr
+            )
+            _hdr_paid_cell_ref[0] = _hdr_paid_cell
             hdr_row = ft.Row(
                 controls=[
                     _ctrl_cell(inv_tf_shared, _wcol.get("invoice", 0), bgc=bgp, h=row_h_hdr),
@@ -6903,9 +7204,7 @@ class PaymentsView:
                     ),
                     _ctrl_cell(pay_hdr, _wcol.get("payment", 0), bgc=bgp, h=row_h_hdr),
                     _ctrl_cell(transferred_tf_header, _wcol.get("transferred", 0), bgc=bgp, h=row_h_hdr),
-                    _ctrl_cell(
-                        paid_tf_header, _wcol.get("paid", 0), bgc=_hdr_paid_bg or bgp, h=row_h_hdr
-                    ),
+                    _hdr_paid_cell,
                     _text_cell(
                         f"{len(items)} товар(ів)",
                         _wcol.get("product", 0),
@@ -7038,10 +7337,27 @@ class PaymentsView:
 
             # Dynamically set visible height: header + up to 10 data rows (rows may include
             # compensations and opening balance). This avoids large empty gaps under table.
+            #
+            # Expanded orders (see _item_rows_for_order/self._expanded_orders) render
+            # extra detail rows below their own header row — one per line item — which
+            # this count used to completely ignore, capping the container at ~10 "rows"
+            # worth of height regardless of how many of those rows actually belonged to
+            # one expanded order's own item list. An 11-item order, expanded, still only
+            # got ~10 rows of height total, clipping most of its own items even though
+            # nothing else was on screen — confirmed live ("розкриваємо, а в нас всього
+            # три рядка відображається"). Counting each expanded order's item rows
+            # separately (and raising the overall cap accordingly) fixes that without
+            # making the panel unbounded for the collapsed/common case.
             try:
-                data_rows = len(subset) + len(compensations) + (1 if openings else 0)
+                extra_expanded_rows = 0
+                for _o in subset:
+                    _ouid = str(_o.get("id") or "").strip() or str(id(_o))
+                    if _ouid in self._expanded_orders:
+                        _n_items = len(_o.get("items")) if isinstance(_o.get("items"), list) else 0
+                        extra_expanded_rows += max(1, _n_items)
+                data_rows = len(subset) + len(compensations) + (1 if openings else 0) + extra_expanded_rows
                 data_rows = max(1, int(data_rows))
-                visible_rows = min(10, data_rows)
+                visible_rows = min(10 + extra_expanded_rows, data_rows)
                 # header_row uses HDR_H; data rows use ROW_H
                 rows_host.height = int(HDR_H + visible_rows * ROW_H)
             except Exception:
@@ -7162,7 +7478,8 @@ class PaymentsView:
                             str(s.get("invoice_no") or ""), _wcol.get("invoice", 0), bgc=BG_COMP
                         ),
                         _text_cell(
-                            str(s.get("order_no_1c") or ""), _wcol.get("order1c", 0), bgc=BG_COMP
+                            str(s.get("order_no_1c") or ""), _wcol.get("order1c", 0), bgc=BG_COMP,
+                            raw=True,
                         ),
                         _text_cell(
                             "Компенсація", _wcol.get("status", 0), bgc=BG_COMP, color=_CHIP_T
@@ -7752,7 +8069,27 @@ class PaymentsView:
 
         if not product_rows:
             # Fallback: derive only from supplier orders (still region-filtered by page).
+            # orders_for_supplier is the manager's raw historical orders, which can
+            # still reference a product they've since been stripped of (kept in the
+            # DB for settlement history) — gate against the manager's current product
+            # catalog (no supplier_id filter this time, so a catalog schema/tagging
+            # quirk on supplier_id alone can't be mistaken for "not owned") so a
+            # gave-away product can't reappear as a selectable option here.
             try:
+                _owned_pids = set()
+                with contextlib.suppress(Exception):
+                    _owned_pids = {
+                        str((p or {}).get("id") or "").strip()
+                        for p in (
+                            self.db.get_products(
+                                self.company_id,
+                                region_id=self.region_id,
+                                manager_id=active_manager_id or None,
+                            )
+                            or []
+                        )
+                        if isinstance(p, dict) and (p or {}).get("id")
+                    }
                 seen = set()
                 derived = []
                 for _o in orders_for_supplier or []:
@@ -7770,7 +8107,7 @@ class PaymentsView:
                         if not isinstance(it, dict):
                             continue
                         pid0 = str(it.get("product_id") or "").strip()
-                        if not pid0 or pid0 in seen:
+                        if not pid0 or pid0 in seen or pid0 not in _owned_pids:
                             continue
                         seen.add(pid0)
                         derived.append(

@@ -856,6 +856,61 @@ class OrdersView:
                 return cat_name
         return ""
 
+    def _multi_item_product_tooltip(self, items: list) -> str:
+        """Full item-by-item breakdown (name | category — qty) for a
+        multi-item order's product cell, shown instantly on hover so every
+        item is visible without expanding the row. Always shows the
+        category (not only when a name repeats) and never merges two items
+        that share a name but belong to different categories into one
+        line — same "Name | Кат: X" style as the disambiguated dropdown
+        labels elsewhere (see product_naming.compute_name_suffixes)."""
+        if not items:
+            return ""
+        products_by_id = self._products_by_id_cache or {}
+        cat_name_by_id: dict[str, str] = {
+            str((c or {}).get("id") or "")
+            .strip(): str((c or {}).get("name") or "")
+            .strip()
+            for c in (getattr(self, "_categories", None) or [])
+            if isinstance(c, dict) and (c.get("id") or "") and (c.get("name") or "")
+        }
+        if not hasattr(self, "_node_path_cache"):
+            self._node_path_cache = {}
+        _node_path_of = product_naming.make_node_path_resolver(
+            self.db, self._node_path_cache
+        )
+
+        def _qty_of(it: dict) -> float:
+            q = _safe_float((it or {}).get("qty"), None)
+            if q is None:
+                q = _safe_float((it or {}).get("quantity"), 0.0)
+            return float(q or 0.0)
+
+        def _fmt_qty(q: float) -> str:
+            if q == int(q):
+                return f"{int(q):,}".replace(",", " ")
+            return f"{q:,.1f}".replace(",", " ")
+
+        lines = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            pid = str(item.get("product_id") or "").strip()
+            product = products_by_id.get(pid) or {}
+            name = str(
+                product.get("name")
+                or item.get("product_name")
+                or item.get("name")
+                or "-"
+            ).strip()
+            cat_name = product_naming.resolve_category_label(
+                product, node_path_of=_node_path_of
+            ) or cat_name_by_id.get(str(product.get("category_id") or "").strip(), "")
+            qty_s = _fmt_qty(_qty_of(item))
+            label = f"{name} | Кат: {cat_name}" if cat_name else name
+            lines.append(f"{label} — {qty_s} шт.")
+        return "\n".join(lines)
+
     def _product_option_label_map(self, products: list | None = None) -> dict[str, str]:
         """Return {product_id: display_name}, appending " | Кат: X" / " | Постач: Y"
         for products whose name repeats elsewhere in `products` — see
@@ -919,9 +974,17 @@ class OrdersView:
         return f"orders_table:{cid}:{region}"
 
     def _workspace_user_id(self) -> str:
+        # Must match self.manager_id's own precedence (active_manager_id
+        # first) — this used to check ud["id"] first instead, which meant
+        # review/"перегляд" mode (where active_manager_id is set to the
+        # SUBORDINATE being reviewed, but ud["id"] stays the reviewer's own
+        # account — see dashboard.py's _build_context_user) loaded/saved
+        # the reviewer's own workspace bucket instead of the reviewed
+        # manager's, so a saved "display from month" cutoff never followed
+        # the manager who actually set it.
         ud = self.user_data or {}
         return str(
-            ud.get("id") or ud.get("active_manager_id") or self.manager_id or ""
+            ud.get("active_manager_id") or ud.get("id") or self.manager_id or ""
         ).strip()
 
     def _visible_orders_column_keys(self) -> set[str]:
@@ -944,6 +1007,8 @@ class OrdersView:
             "submission",
             "date_prod_end",
             "dur_prod",
+            "date_departed",
+            "dur_wait",
             "date_wh",
             "dur_deliv",
             "date_payment",
@@ -963,6 +1028,8 @@ class OrdersView:
                 cached.add("date_payment")
                 cached.add("date_receive")
                 cached.add("term_acc")
+                cached.add("date_departed")
+                cached.add("dur_wait")
             return cached or set(all_keys)
         uid = self._workspace_user_id()
         if not uid:
@@ -985,6 +1052,8 @@ class OrdersView:
                     visible.add("date_payment")
                     visible.add("date_receive")
                     visible.add("term_acc")
+                    visible.add("date_departed")
+                    visible.add("dur_wait")
                 return visible or set(all_keys)
         except Exception:
             pass
@@ -1014,6 +1083,8 @@ class OrdersView:
             "submission",
             "date_prod_end",
             "dur_prod",
+            "date_departed",
+            "dur_wait",
             "date_wh",
             "dur_deliv",
             "date_payment",
@@ -1182,8 +1253,11 @@ class OrdersView:
         return base
 
     def _layout_local_file_path(self) -> str:
+        # _workspace_user_id() (not user_data["id"] directly) — same review-
+        # mode fix as that method: must resolve to the manager actually
+        # being reviewed/worked as, not always the logged-in account itself.
         uid = (
-            str((self.user_data or {}).get("id") or "nouser")
+            str(self._workspace_user_id() or "nouser")
             .replace("/", "_")
             .replace("\\", "_")
         )
@@ -1604,7 +1678,13 @@ class OrdersView:
             self._update_counters()
 
     async def _bg_sync_loop(self) -> None:
-        _last_pulse_check = 0.0
+        # DB pulse polling for changes made from ANOTHER device/session
+        # removed (_bg_orders_pulse_check) — 1 менеджер = 1 категорія means
+        # that can't happen anymore; Ctrl+F5 covers it explicitly now. The
+        # cheap in-memory __sync_seq__ check stays: it mirrors THIS same
+        # session's own concurrently-open "general mode" (supervisor viewing
+        # several subordinates at once) instances against each other — no
+        # DB call involved, just a local dict read every 1.5s.
         while True:
             try:
                 await asyncio.sleep(1.5)
@@ -1612,14 +1692,6 @@ class OrdersView:
                 if seq != getattr(self, "_bg_sync_seq", 0):
                     self._bg_sync_seq = seq
                     self._bg_apply_sync()
-                # Periodically poll the DB pulse for changes made from another
-                # device/session, even while this tab stays open the whole
-                # time (not just when the user switches away and back — see
-                # _bg_orders_pulse_check docstring for why this exists).
-                _now = time.monotonic()
-                if self._orders_ui_ready and (_now - _last_pulse_check) >= 20.0:
-                    _last_pulse_check = _now
-                    await self._bg_orders_pulse_check()
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -1915,12 +1987,43 @@ class OrdersView:
 
             if error_count > 0:
                 self._set_sync_status("error", error_count)
+                logger.warning(
+                    "[orders pulse] flush had %d failing item(s) out of %d "
+                    "(kept in outbox for retry) — the items that DID succeed "
+                    "still bump the real DB pulse, so ownership is still "
+                    "recorded for them below.",
+                    error_count, len(oids),
+                )
             else:
                 self._refresh_sync_indicator_state()
 
             # Advance the cached pulse so the next resume() pulse check doesn't
-            # treat our own DB writes as "new remote data" and trigger a full reload.
-            if flushed_count > 0 and not self._outbox:
+            # treat our own DB writes as "new remote data" and trigger a full
+            # reload. Deliberately NOT conditioned on the outbox being fully
+            # empty — a partial failure elsewhere in the SAME batch (one item
+            # kept for retry) must never suppress recording ownership for the
+            # items that DID succeed, otherwise their pulse bump looks
+            # "external" forever even though flushed_count > 0 proves we
+            # caused it.
+            if flushed_count > 0:
+                # Primary, robust ownership marker: a plain wall-clock
+                # timestamp, set the INSTANT we know we wrote something —
+                # no further awaits, no second DB round trip that could
+                # itself race or fail. _pulse() stamps every pulse with
+                # int(time.time()) server-side, so "new_pulse is at/before
+                # roughly when I just wrote" is a reliable proxy for "this
+                # was (at least in part) my own write" even if the fancier
+                # exact-value confirmation below never completes.
+                own_write_ts = time.time()
+                self._last_own_write_ts = own_write_ts
+                with contextlib.suppress(Exception):
+                    self._shared_orders_map["__session_last_own_write_ts__"] = own_write_ts
+                self._last_local_fast_edit_ts = own_write_ts
+                logger.warning(
+                    "[orders pulse] flush recorded own write (wall-clock): "
+                    "flushed_count=%d own_write_ts=%.0f",
+                    flushed_count, own_write_ts,
+                )
                 try:
                     new_pulse = await asyncio.to_thread(self._orders_scope_pulse_ts)
                     self._orders_snapshot_pulse_ts = max(
@@ -1929,8 +2032,19 @@ class OrdersView:
                     # Tell all tabs: this pulse increase is from our own session.
                     with contextlib.suppress(Exception):
                         self._shared_orders_map["__session_db_pulse__"] = new_pulse
+                    logger.warning(
+                        "[orders pulse] flush recorded own write (exact pulse): "
+                        "flushed_count=%d new_pulse=%s session_db_pulse_now=%s",
+                        flushed_count, new_pulse,
+                        (self._shared_orders_map or {}).get("__session_db_pulse__"),
+                    )
                 except Exception:
-                    pass
+                    logger.exception(
+                        "[orders pulse] exact-pulse confirmation failed after flush "
+                        "(flushed_count=%d) — harmless now, the wall-clock marker "
+                        "above already covers ownership recognition",
+                        flushed_count,
+                    )
         finally:
             self._outbox_flush_running = False
             self._refresh_sync_indicator_state()
@@ -2170,6 +2284,23 @@ class OrdersView:
                     # Our own write — update cached pulse, no reload needed.
                     self._orders_snapshot_pulse_ts = new_pulse
                     return
+                # Primary ownership check: does new_pulse (itself a
+                # server-side int(time.time()) stamp — see _pulse()) land
+                # at/before roughly when WE last completed a successful
+                # flush? This doesn't depend on the exact-value confirmation
+                # above ever completing (that round trip can itself race or
+                # fail under rapid repeated edits — see the "exact pulse"
+                # logging), so it catches own-writes the exact-match check
+                # above misses.
+                last_own_write_ts = float(
+                    (self._shared_orders_map or {}).get(
+                        "__session_last_own_write_ts__", 0.0
+                    )
+                    or 0.0
+                )
+                if last_own_write_ts and new_pulse <= int(last_own_write_ts) + 3:
+                    self._orders_snapshot_pulse_ts = new_pulse
+                    return
                 # Skip reload while this session has unsaved local edits —
                 # either mid-flush (race window) or queued but not yet
                 # flushed (self._outbox non-empty). A full reload here
@@ -2188,9 +2319,16 @@ class OrdersView:
                 last_local_edit = float(
                     getattr(self, "_last_local_fast_edit_ts", 0.0) or 0.0
                 )
-                if time.time() - last_local_edit < 3.0:
+                if time.time() - last_local_edit < 8.0:
                     return
                 # Genuine external change — clear snapshot so next load fetches DB.
+                logger.warning(
+                    "[orders pulse] triggering full reload: new_pulse=%s cached_pulse=%s "
+                    "session_db_pulse=%s last_local_edit_age=%.1fs outbox=%d flush_running=%s",
+                    new_pulse, cached_pulse, session_db_pulse,
+                    time.time() - last_local_edit, len(self._outbox),
+                    self._outbox_flush_running,
+                )
                 region_id = self._effective_region_id()
                 _vkey = f"_orders_cache_session_verified_{region_id or 'all'}"
                 self.user_data.pop(_vkey, None)
@@ -2198,7 +2336,20 @@ class OrdersView:
                     f"_orders_cache_is_verifying_{region_id or 'all'}", None
                 )
                 _pg = self._page()
-                if _pg and hasattr(_pg, "run_task"):
+                # Only rebuild right now if Orders is the tab actually on
+                # screen — a full _async_initial_load ends in a synchronous
+                # control-tree rebuild that blocks the single shared event
+                # loop for however long it takes, which freezes EVERY open
+                # tab's UI (typing, dropdowns, buttons) for that whole
+                # window, not just this one. Cache flags are already
+                # cleared above, so the pulse compare above stays "changed"
+                # until resume() (fired when the user actually switches
+                # back to this tab) runs this same check and finds it active.
+                if (
+                    _pg
+                    and hasattr(_pg, "run_task")
+                    and getattr(_pg, "_active_view", None) == "show_orders"
+                ):
                     with contextlib.suppress(Exception):
                         _pg.run_task(self._async_initial_load)
                 return
@@ -2207,6 +2358,17 @@ class OrdersView:
                 self.db.get_reference_data_pulse, self.company_id
             )
             if ref_pulse > self._ref_data_pulse_ts:
+                _pg2 = self._page()
+                if getattr(_pg2, "_active_view", None) != "show_orders":
+                    # Leave _ref_data_pulse_ts untouched (still "stale") so
+                    # this same check redoes the work once resume() calls it
+                    # for real — see the matching comment above.
+                    return
+                logger.warning(
+                    "[orders pulse] reference-data changed, refreshing lookups + "
+                    "full rerender: ref_pulse=%s prev=%s",
+                    ref_pulse, self._ref_data_pulse_ts,
+                )
                 await asyncio.to_thread(self._load_lookups, True)
                 self._ref_data_pulse_ts = ref_pulse
                 self._schedule_full_rerender()
@@ -2262,16 +2424,6 @@ class OrdersView:
                 if isinstance(_vpc, (list, set, tuple)) and len(_vpc) > 0
                 else None
             )
-            products_by_id = {
-                str((p or {}).get("id") or "").strip(): p
-                for p in (self._products or [])
-                if isinstance(p, dict) and (p.get("id") or "")
-            }
-            delivery_by_id = {
-                str((d or {}).get("id") or "").strip(): d
-                for d in (self._delivery_methods or [])
-                if isinstance(d, dict) and (d.get("id") or "")
-            }
             all_rows = (
                 self.db.get_orders(
                     self.company_id,
@@ -2291,12 +2443,6 @@ class OrdersView:
                 if not oid or oid in _preload_seen:
                     continue
                 _preload_seen.add(oid)
-                with contextlib.suppress(Exception):
-                    row["_receive_month"] = self._order_receive_month_key(
-                        row,
-                        products_by_id=products_by_id,
-                        delivery_by_id=delivery_by_id,
-                    )
                 _local_preload.append(row)
             _local_preload.sort(key=_order_row_sort_key)
             self._orders = _local_preload
@@ -2329,17 +2475,6 @@ class OrdersView:
             f"load more orders start reset={reset} force_refresh={force_refresh}"
         )
         self._orders_loading = True
-
-        products_by_id = {
-            str((p or {}).get("id") or "").strip(): p
-            for p in (self._products or [])
-            if isinstance(p, dict) and (p.get("id") or "")
-        }
-        delivery_by_id = {
-            str((d or {}).get("id") or "").strip(): d
-            for d in (self._delivery_methods or [])
-            if isinstance(d, dict) and (d.get("id") or "")
-        }
 
         if reset:
             self._orders = []
@@ -2404,14 +2539,6 @@ class OrdersView:
                 for row in loaded_visible:
                     oid = (row.get("id") or "").strip()
                     if oid and oid not in known_ids:
-                        try:
-                            row["_receive_month"] = self._order_receive_month_key(
-                                row,
-                                products_by_id=products_by_id,
-                                delivery_by_id=delivery_by_id,
-                            )
-                        except Exception:
-                            pass
                         self._orders.append(row)
 
                 self._orders.sort(key=_order_row_sort_key)
@@ -3850,12 +3977,26 @@ class OrdersView:
 
         card_index, node_name_by_id = self._product_card_hierarchy_index()
 
+        # Scope suppliers/products to the manager's CURRENT ownership
+        # (self._suppliers_by_id / self._products_by_id_cache come from the
+        # manager_id-scoped get_suppliers/get_products calls in
+        # _load_lookups). self._orders still contains historical orders for
+        # a supplier/category/product the manager has since been stripped
+        # of (kept in the DB for settlement history) — without this check,
+        # a gave-away supplier/product would still show up as a selectable
+        # filter option here (confirmed live: user saw a transferred-away
+        # supplier and category in these dropdowns). categories/level_nodes
+        # below are already implicitly scoped this way, since card_index is
+        # itself built from self._products (see _product_card_hierarchy_index).
+        _scoped_suppliers = getattr(self, "_suppliers_by_id", None)
+        _scoped_products = getattr(self, "_products_by_id_cache", None)
+
         for o in self._orders or []:
             if not isinstance(o, dict):
                 continue
             sid = (o.get("supplier_id") or "").strip()
             sname = (o.get("supplier_name") or sid).strip()
-            if sid:
+            if sid and (_scoped_suppliers is None or sid in _scoped_suppliers):
                 suppliers[sid] = sname or sid
 
             did = (o.get("delivery_type_id") or "").strip()
@@ -3880,7 +4021,7 @@ class OrdersView:
                     continue
                 pid = (it.get("product_id") or "").strip()
                 pname = (it.get("product_name") or pid).strip()
-                if pid:
+                if pid and (_scoped_products is None or pid in _scoped_products):
                     products[pid] = pname or pid
                     card = card_index.get(pid) or {}
                     cat_id = str(card.get("category_id") or "").strip()
@@ -4068,11 +4209,22 @@ class OrdersView:
                         ).strip()
                         or "all"
                     )
-                    p_row = (
-                        store.get(f"{company_key}:{region_key}")
-                        if isinstance(store, dict)
-                        else None
-                    )
+                    p_row = None
+                    if isinstance(store, dict):
+                        # Exact company+region match first, then the "all
+                        # regions" entry for this company, then — as a last
+                        # resort — any single entry saved for this company
+                        # (covers a region_id mismatch between what Settings
+                        # saved under and what this specific order carries,
+                        # e.g. a legacy order with no region_id at all).
+                        p_row = store.get(f"{company_key}:{region_key}")
+                        if not isinstance(p_row, dict):
+                            p_row = store.get(f"{company_key}:all")
+                        if not isinstance(p_row, dict):
+                            for k, v in store.items():
+                                if isinstance(k, str) and k.startswith(f"{company_key}:") and isinstance(v, dict):
+                                    p_row = v
+                                    break
                     if isinstance(p_row, dict):
                         p_days = _safe_float(p_row.get("days"), None)
                         if p_days is not None:
@@ -4115,13 +4267,14 @@ class OrdersView:
 
         date_shipped = str(order.get("date_shipped") or "")[:10]
         date_wh = str(order.get("date_arrived_warehouse") or "")[:10]
+        date_departed = str(order.get("date_departed") or "")[:10] or date_shipped
 
         dur_prod = _safe_float(order.get("duration_production_days"), None)
         if dur_prod is None:
             dur_prod = _days_between(order_date, date_shipped)
         dur_deliv = _safe_float(order.get("duration_transit_days"), None)
         if dur_deliv is None:
-            dur_deliv = _days_between(date_shipped, date_wh)
+            dur_deliv = _days_between(date_departed, date_wh)
 
         prod_term_days = self._effective_production_term_days(order, products_by_id)
         if prod_term_days is None:
@@ -4185,13 +4338,15 @@ class OrdersView:
         products_by_id: dict | None = None,
         delivery_by_id: dict | None = None,
     ) -> str:
-        try:
-            cached = (order or {}).get("_receive_month")
-            if cached:
-                return str(cached or "")[:7]
-        except Exception:
-            pass
-
+        # Always recompute — the "Отримано" column itself always recomputes
+        # fresh at render time (_order_receive_date_iso, called directly),
+        # since it depends on status/date_shipped/production term that can
+        # change after the order was first loaded. This used to trust a
+        # month key cached once on first load (order["_receive_month"]),
+        # which went stale the moment any of those fields changed later
+        # (e.g. a background sync updating status/dates without touching
+        # that cache) — the filter then matched against a month that no
+        # longer matched what the column visibly showed.
         iso = self._order_receive_date_iso(
             order,
             products_by_id=products_by_id,
@@ -4422,8 +4577,8 @@ class OrdersView:
                 from datetime import date as _date_cls
 
                 _date_field_map = {
-                    "ready_for_shipment": "date_ready_at_supplier",
-                    "in_transit": "date_shipped",
+                    "ready_for_shipment": "date_shipped",
+                    "in_transit": "date_departed",
                     "at_warehouse": "date_arrived_warehouse",
                     "accepted": "date_accepted",
                 }
@@ -5208,7 +5363,7 @@ class OrdersView:
             on_accept_month,
         )
         payment_month_dd = _month_popup_button(
-            self.t("orders.filter.payment_month", "Сплата. Місяць"),
+            self.t("orders.filter.payment_month", "Оплата. Місяць"),
             self._filter_payment_month,
             self._payment_month_options(all_orders),
             on_payment_month,
@@ -6518,6 +6673,14 @@ class OrdersView:
 
             self._orders_ui_ready = True
             self._start_sync_timer()
+            _bg_pg = self._page()
+            if (
+                _bg_pg
+                and hasattr(_bg_pg, "run_task")
+                and not getattr(self, "_bg_sync_loop_started", False)
+            ):
+                self._bg_sync_loop_started = True
+                _bg_pg.run_task(self._bg_sync_loop)
             with contextlib.suppress(Exception):
                 self._no_db_after_ready = True
             if self._loading_box is not None:
@@ -7112,6 +7275,16 @@ class OrdersView:
                         "width": 45,
                     },
                     {
+                        "key": "date_departed",
+                        "label": self.t("orders.col.date_departed", "Відправл"),
+                        "width": 60,
+                    },
+                    {
+                        "key": "dur_wait",
+                        "label": self.t("orders.col.dur_wait", "Терм очікув"),
+                        "width": 45,
+                    },
+                    {
                         "key": "date_wh",
                         "label": self.t("orders.col.date_wh", "На складі"),
                         "width": 60,
@@ -7242,9 +7415,10 @@ class OrdersView:
         max_lines: int | None = 1,
         bgcolor: str = "#FFFFFF",
         text_align: ft.TextAlign = ft.TextAlign.CENTER,
+        raw: bool = False,
     ) -> ft.Container:
         display_text = "-" if text is None else str(text)
-        if display_text not in {"-", ""}:
+        if not raw and display_text not in {"-", ""}:
             with contextlib.suppress(Exception):
                 display_text = format_maybe_numeric_text(display_text)
         dyn_height = height
@@ -7346,6 +7520,8 @@ class OrdersView:
             "submission",
             "date_prod_end",
             "dur_prod",
+            "date_departed",
+            "dur_wait",
             "date_wh",
             "dur_deliv",
             "date_1c",
@@ -7931,28 +8107,50 @@ class OrdersView:
             pass
 
         date_prod_end = (draft_order.get("date_shipped") or "")[:10]
+        date_departed = (draft_order.get("date_departed") or "")[:10]
         date_wh = (draft_order.get("date_arrived_warehouse") or "")[:10]
         date_1c = (draft_order.get("date_accepted") or "")[:10]
         dur_prod = _days_between(order_date, date_prod_end)
-        dur_deliv = _days_between(date_prod_end, date_wh)
+        dur_wait = _days_between(date_prod_end, date_departed) if date_departed else None
+        dur_deliv = _days_between(date_departed or date_prod_end, date_wh)
         dur_acc = _days_between(date_wh, date_1c)
         draft_order["duration_production_days"] = dur_prod
+        draft_order["duration_wait_days"] = dur_wait
         draft_order["duration_transit_days"] = dur_deliv
         draft_order["duration_warehouse_days"] = dur_acc
 
-        # Same MAX-across-items (+ "Своя назва" workspace-default fallback)
-        # term used for the Оплата/Отримання date estimates — so the
-        # highlighting here always agrees with what those columns show.
+        # "Терм вир-ва" (dur_prod) highlights against the CONFIGURED
+        # production term — either the linked product's own term (Товари
+        # card) or, for a manual "Своя назва" line with no linked product,
+        # the workspace-default term set in Налаштування. Same term used
+        # for the Оплата/Отримання date estimates elsewhere, so all of
+        # these stay in agreement with each other.
         effective_production_term_days = self._effective_production_term_days(
             draft_order, products_by_id
         )
         dur_prod_bg = row_bg
+        dur_prod_fg = _TEXT
         if dur_prod is not None and effective_production_term_days is not None:
-            # Actual production time longer than the term → red;
-            # at or under the term → green.
             dur_prod_bg = (
-                "#FEE2E2" if dur_prod > effective_production_term_days else "#DCFCE7"
+                "#DCFCE7" if dur_prod <= effective_production_term_days else "#FEE2E2"
             )
+
+        # "Терм очікув" (dur_wait) fixed thresholds: 0-4 days green, 5-10
+        # yellow, 11+ regular red. Negative can't legitimately happen
+        # (Відправл before Готово) — data-entry error, same "toxic" red +
+        # white text treatment as dur_prod's negative case above.
+        dur_wait_bg = row_bg
+        dur_wait_fg = _TEXT
+        if dur_wait is not None:
+            if dur_wait < 0:
+                dur_wait_bg = "#DC2626"
+                dur_wait_fg = "#FFFFFF"
+            elif dur_wait <= 4:
+                dur_wait_bg = "#DCFCE7"
+            elif dur_wait <= 10:
+                dur_wait_bg = "#FEF9C3"
+            else:
+                dur_wait_bg = "#FEE2E2"
 
         if order_date and date_1c:
             log_days = _days_between(order_date, date_1c)
@@ -8121,8 +8319,20 @@ class OrdersView:
         def _draft_item_amounts_and_uc():
             _t, _tccy, _tusd, _ttext = _current_tariff_usd()
             try:
+                # Re-read fresh, not the outer `entered_fact_total` closed
+                # over at row-build time — this runs from
+                # _mark_dirty_and_update right after the order-level "Вага
+                # факт" field just wrote a new value into
+                # draft_order["__fact_weight_total"], and a stale/hardcoded
+                # None here silently ignored that edit, leaving С/В showing
+                # its old value until the next full reload from the server
+                # (confirmed live: "Змінюю вага факт, С/В не перераховується
+                # моментально автоматично").
+                _entered_fact_total_now = _safe_float(
+                    draft_order.get("__fact_weight_total"), None
+                )
                 resolved_w_for_calc, _prev_w_for_calc = _resolve_actual_weights(
-                    draft_items, None, prod_map=products_by_id
+                    draft_items, _entered_fact_total_now, prod_map=products_by_id
                 )
             except Exception:
                 resolved_w_for_calc = []
@@ -8340,6 +8550,12 @@ class OrdersView:
                 no_wrap=no_wrap,
                 max_lines=max_lines,
                 bgcolor=bgcolor,
+                # "ЗП обліку" (order_no_1c) is an accounting reference
+                # number, never a monetary amount — the generic
+                # format_maybe_numeric_text auto-formatting (thousands
+                # separator) that every other numeric-looking column gets
+                # here must never apply to it (see _table_cell's `raw`).
+                raw=(key == "order1c"),
             )
 
         dirty_state = {"value": False}
@@ -8565,10 +8781,14 @@ class OrdersView:
         def _recalc_duration_fields():
             d0 = (draft_order.get("order_date") or "")[:10]
             d1 = (draft_order.get("date_shipped") or "")[:10]
+            d1b = (draft_order.get("date_departed") or "")[:10]
             d2 = (draft_order.get("date_arrived_warehouse") or "")[:10]
             d3 = (draft_order.get("date_accepted") or "")[:10]
             draft_order["duration_production_days"] = _days_between(d0, d1)
-            draft_order["duration_transit_days"] = _days_between(d1, d2)
+            draft_order["duration_wait_days"] = (
+                _days_between(d1, d1b) if d1b else None
+            )
+            draft_order["duration_transit_days"] = _days_between(d1b or d1, d2)
             draft_order["duration_warehouse_days"] = _days_between(d2, d3)
 
         def _recalc_log_days():
@@ -8883,6 +9103,7 @@ class OrdersView:
         # _effective_item_date_field().
         _ITEM_DATE_OVERRIDE_FIELDS = {
             "date_shipped",
+            "date_departed",
             "date_arrived_warehouse",
             "date_accepted",
         }
@@ -9438,8 +9659,8 @@ class OrdersView:
                 picker = getattr(self, "_shared_date_picker", None)
                 if picker is None:
                     picker = ft.DatePicker(
-                        first_date=date(2018, 1, 1),
-                        last_date=date(2100, 12, 31),
+                        first_date=date(2020, 1, 1),
+                        last_date=date(2035, 12, 31),
                         entry_mode=ft.DatePickerEntryMode.CALENDAR_ONLY,
                         date_picker_mode=ft.DatePickerMode.DAY,
                         locale=ft.Locale("uk", "UA"),
@@ -9517,7 +9738,13 @@ class OrdersView:
             bgcolor=_ALT,
         )
         product_cell = _cell("product", product_text, size=8)
-        if product_text and product_text not in {"-", ""}:
+        if len(items) > 1:
+            _multi_item_tt = self._multi_item_product_tooltip(items)
+            if _multi_item_tt:
+                product_cell.tooltip = ft.Tooltip(
+                    message=_multi_item_tt, wait_duration=0
+                )
+        elif product_text and product_text not in {"-", ""}:
             product_cell.tooltip = ft.Tooltip(message=product_text, wait_duration=0)
         if _main_pid:
             from views.product_quick_view import product_icon_btn
@@ -9568,9 +9795,26 @@ class OrdersView:
                 "dur_prod",
                 f"{dur_prod} дн." if dur_prod is not None else "",
                 size=8,
+                color=dur_prod_fg,
                 bgcolor=dur_prod_bg,
             )
             if "dur_prod" in by_key
+            else ft.Container()
+        )
+        date_departed_cell = (
+            _cell("date_departed", date_departed, size=8)
+            if "date_departed" in by_key
+            else ft.Container()
+        )
+        dur_wait_cell = (
+            _cell(
+                "dur_wait",
+                f"{dur_wait} дн." if dur_wait is not None else "",
+                size=8,
+                color=dur_wait_fg,
+                bgcolor=dur_wait_bg,
+            )
+            if "dur_wait" in by_key
             else ft.Container()
         )
         date_wh_cell = (
@@ -9658,6 +9902,7 @@ class OrdersView:
         if order_id:
             _fr_get_page = self._page
             _fr_dc = dur_prod_cell
+            _fr_wc = dur_wait_cell
             _fr_dd = dur_deliv_cell
             _fr_da = dur_acc_cell
             _fr_dr = date_receive_cell
@@ -9670,6 +9915,7 @@ class OrdersView:
             def _make_fast_refresh(
                 _get_page=_fr_get_page,
                 _dc=_fr_dc,
+                _wc=_fr_wc,
                 _dd=_fr_dd,
                 _da=_fr_da,
                 _dr=_fr_dr,
@@ -9689,11 +9935,39 @@ class OrdersView:
                     try:
                         od = (updated.get("order_date") or "")[:10]
                         d1 = (updated.get("date_shipped") or "")[:10]
+                        d1b = (updated.get("date_departed") or "")[:10]
                         d2 = (updated.get("date_arrived_warehouse") or "")[:10]
                         d3 = (updated.get("date_accepted") or "")[:10]
                         dp = _days_between(od, d1)
-                        dd_v = _days_between(d1, d2)
+                        dw_v = _days_between(d1, d1b) if d1b else None
+                        dd_v = _days_between(d1b or d1, d2)
                         ta_v = _days_between(d2, d3)
+
+                        # "Терм вир-ва" vs the configured production term
+                        # (product card, or manager's "Своя назва" default) —
+                        # same comparison as the full row build, so the color
+                        # updates instantly on a fast in-place edit instead of
+                        # only on the next full rebuild. Explicit _rb default
+                        # (not None) so a cell that WAS colored gets reset if
+                        # the edit removes the date it was colored for.
+                        dp_bg = _rb
+                        eff_prod_term = self._effective_production_term_days(
+                            updated, _products_by_id
+                        )
+                        if dp is not None and eff_prod_term is not None:
+                            dp_bg = "#DCFCE7" if dp <= eff_prod_term else "#FEE2E2"
+
+                        # "Терм очікув" fixed thresholds (see _build_order_row).
+                        dw_bg = _rb
+                        if dw_v is not None:
+                            if dw_v < 0:
+                                dw_bg = "#DC2626"
+                            elif dw_v <= 4:
+                                dw_bg = "#DCFCE7"
+                            elif dw_v <= 10:
+                                dw_bg = "#FEF9C3"
+                            else:
+                                dw_bg = "#FEE2E2"
                         log_d = None
                         if od and d3:
                             log_d = _days_between(od, d3)
@@ -9744,7 +10018,8 @@ class OrdersView:
                             dev_text = f"{dev_days} дн."
                             dev_bg = "#DBEAFE" if dev_days <= 0 else "#FEE2E2"
                         updates = [
-                            (_dc, f"{dp} дн." if dp is not None else "", None),
+                            (_dc, f"{dp} дн." if dp is not None else "", dp_bg),
+                            (_wc, f"{dw_v} дн." if dw_v is not None else "", dw_bg),
                             (_dd, f"{dd_v} дн." if dd_v is not None else "", None),
                             (_da, dev_text, dev_bg),
                             (_dr, dr_val, dr_bg),
@@ -10055,6 +10330,14 @@ class OrdersView:
                         "date_shipped", str(v or "")[:10]
                     ),
                 )
+            if "date_departed" in by_key:
+                date_departed_cell = _inline_date_field(
+                    value=date_departed,
+                    width=by_key["date_departed"].get("width"),
+                    on_commit=lambda v: _commit_date_fast(
+                        "date_departed", str(v or "")[:10]
+                    ),
+                )
             if "date_wh" in by_key:
                 date_wh_cell = _inline_date_field(
                     value=date_wh,
@@ -10249,6 +10532,8 @@ class OrdersView:
                     submission_cell,
                     date_prod_end_cell,
                     dur_prod_cell,
+                    date_departed_cell,
+                    dur_wait_cell,
                     date_wh_cell,
                     dur_deliv_cell,
                     date_1c_cell,
@@ -10487,9 +10772,31 @@ class OrdersView:
                         "dur_prod",
                         f"{dur_prod} дн." if dur_prod is not None else "",
                         size=8,
+                        color=dur_prod_fg,
                         bgcolor=dur_prod_bg,
                     )
                     if "dur_prod" in by_key
+                    else ft.Container()
+                )
+                sub_date_departed = (
+                    _cell(
+                        "date_departed",
+                        _effective_item_date_field(it, "date_departed"),
+                        size=8,
+                        bgcolor=_SUB_BG,
+                    )
+                    if "date_departed" in by_key
+                    else ft.Container()
+                )
+                sub_dur_wait = (
+                    _cell(
+                        "dur_wait",
+                        f"{dur_wait} дн." if dur_wait is not None else "",
+                        size=8,
+                        color=dur_wait_fg,
+                        bgcolor=dur_wait_bg,
+                    )
+                    if "dur_wait" in by_key
                     else ft.Container()
                 )
                 sub_date_wh = (
@@ -10664,6 +10971,14 @@ class OrdersView:
                             width=by_key["date_prod_end"].get("width"),
                             on_commit=lambda v, i=idx: _commit_item_date_fast(
                                 i, "date_shipped", str(v or "")[:10]
+                            ),
+                        )
+                    if "date_departed" in by_key:
+                        sub_date_departed = _inline_date_field(
+                            value=_effective_item_date_field(it, "date_departed"),
+                            width=by_key["date_departed"].get("width"),
+                            on_commit=lambda v, i=idx: _commit_item_date_fast(
+                                i, "date_departed", str(v or "")[:10]
                             ),
                         )
                     if "date_wh" in by_key:
@@ -10858,6 +11173,8 @@ class OrdersView:
                                 sub_submission_cell,
                                 sub_date_prod_end,
                                 sub_dur_prod,
+                                sub_date_departed,
+                                sub_dur_wait,
                                 sub_date_wh,
                                 sub_dur_deliv,
                                 sub_date_1c,
@@ -11622,8 +11939,8 @@ class OrdersView:
             else:
                 picker = ft.DatePicker(
                     value=initial,
-                    first_date=date(2018, 1, 1),
-                    last_date=date(2100, 12, 31),
+                    first_date=date(2020, 1, 1),
+                    last_date=date(2035, 12, 31),
                     entry_mode=ft.DatePickerEntryMode.CALENDAR_ONLY,
                     date_picker_mode=ft.DatePickerMode.DAY,
                     locale=ft.Locale("uk", "UA"),
@@ -12211,8 +12528,8 @@ class OrdersView:
             else:
                 picker = ft.DatePicker(
                     value=initial,
-                    first_date=date(2018, 1, 1),
-                    last_date=date(2100, 12, 31),
+                    first_date=date(2020, 1, 1),
+                    last_date=date(2035, 12, 31),
                     entry_mode=ft.DatePickerEntryMode.CALENDAR_ONLY,
                     date_picker_mode=ft.DatePickerMode.DAY,
                     locale=ft.Locale("uk", "UA"),
@@ -12843,6 +13160,13 @@ class OrdersView:
             border_radius=8,
             width=152,
         )
+        date_departed_f = ft.TextField(
+            label=self.t("orders.field.departed_date", "Дата відправл."),
+            value=row.get("date_departed") or "",
+            hint_text="РРРР-ММ-ДД",
+            border_radius=8,
+            width=152,
+        )
         date_arrived_f = ft.TextField(
             label=self.t("orders.field.warehouse_date", "Дата на складі"),
             value=row.get("date_arrived_warehouse") or "",
@@ -12874,12 +13198,13 @@ class OrdersView:
                         color=_TEXT,
                     ),
                     ft.Row(
-                        [date_shipped_f, date_arrived_f, date_accepted_f],
+                        [date_shipped_f, date_departed_f, date_arrived_f, date_accepted_f],
                         spacing=8,
                         wrap=True,
                     ),
                     ft.Text(
                         f"Вироб-во: {_dur('duration_production_days')}  "
+                        f"Очікув.: {_dur('duration_wait_days')}  "
                         f"Доставка: {_dur('duration_transit_days')}  "
                         f"Приймання: {_dur('duration_warehouse_days')}",
                         size=11,
@@ -13170,6 +13495,7 @@ class OrdersView:
             now_iso = datetime.utcnow().isoformat(timespec="seconds")
             order_date_eff = (order_date_f.value or _today_str()).strip()[:10]
             date_shipped_eff = (date_shipped_f.value or "").strip()[:10]
+            date_departed_eff = (date_departed_f.value or "").strip()[:10]
             date_wh_eff = (date_arrived_f.value or "").strip()[:10]
             date_accepted_eff = (date_accepted_f.value or "").strip()[:10]
             payload = {
@@ -13194,12 +13520,20 @@ class OrdersView:
                 "submission_status": submission_dd.value or "not_submitted",
                 "comment": (comment_f.value or "").strip(),
                 "date_shipped": date_shipped_eff,
+                "date_departed": date_departed_eff,
                 "date_arrived_warehouse": date_wh_eff,
                 "date_accepted": date_accepted_eff,
                 "duration_production_days": _days_between(
                     order_date_eff, date_shipped_eff
                 ),
-                "duration_transit_days": _days_between(date_shipped_eff, date_wh_eff),
+                "duration_wait_days": (
+                    _days_between(date_shipped_eff, date_departed_eff)
+                    if date_departed_eff
+                    else None
+                ),
+                "duration_transit_days": _days_between(
+                    date_departed_eff or date_shipped_eff, date_wh_eff
+                ),
                 "duration_warehouse_days": _days_between(
                     date_wh_eff, date_accepted_eff
                 ),
@@ -13496,6 +13830,7 @@ class OrdersView:
         if not page:
             return
 
+        if self._general_mode and self._general_manager_ids:
             import flet as _ft
 
             from views.general_wrapper import build_general_sections
@@ -13755,8 +14090,8 @@ class OrdersView:
         _sync_indicator = self._build_sync_indicator()
 
         self._shared_date_picker = ft.DatePicker(
-            first_date=date(2018, 1, 1),
-            last_date=date(2100, 12, 31),
+            first_date=date(2020, 1, 1),
+            last_date=date(2035, 12, 31),
             entry_mode=ft.DatePickerEntryMode.CALENDAR_ONLY,
             date_picker_mode=ft.DatePickerMode.DAY,
             locale=ft.Locale("uk", "UA"),

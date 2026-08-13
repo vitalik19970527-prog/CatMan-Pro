@@ -1,4 +1,4 @@
-"""CatMan SupAdm — standalone Superadmin-only mini app.
+﻿"""CatMan SupAdm — standalone Superadmin-only mini app.
 
 Reuses database.py / superadmin_dashboard.py / i18n from the main CatMan Pro
 app (no business-logic duplication). Skips the regular AuthScreen entirely:
@@ -19,10 +19,12 @@ from contextlib import suppress
 
 import flet as ft
 
+import app_updater
 from database import DataManager
 from logger import logger
 from superadmin_dashboard import SuperAdminDashboard
 
+APP_VERSION = "1.3.4"
 _SINGLE_INSTANCE_PORT = 49713
 
 # Fixed owner identity — this app is single-purpose, not for general
@@ -235,7 +237,18 @@ def main(page: ft.Page):
         dash.build()
         page.update()
 
-    show_login()
+    async def _startup():
+        blocked = await app_updater.check_and_maybe_block(
+            page,
+            app_version=APP_VERSION,
+            get_policy_fn=DataManager().get_supadm_update_policy,
+            exe_basename="CatManSupAdm",
+        )
+        if blocked:
+            return
+        show_login()
+
+    page.run_task(_startup)
 
 
 if __name__ == "__main__":
@@ -260,3 +273,13 @@ if __name__ == "__main__":
         ft.run(main)
     finally:
         _lock.close()
+
+
+
+
+
+
+
+
+
+

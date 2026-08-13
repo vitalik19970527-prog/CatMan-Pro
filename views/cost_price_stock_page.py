@@ -1801,6 +1801,11 @@ class CostPriceStockView:
             )
             or []
         )
+        self._category_by_id = {
+            str(c.get("id")): c
+            for c in self._categories
+            if isinstance(c, dict) and c.get("id")
+        }
         self._set_loading_text(f"Категорії: {len(self._categories)}")
         try:
             self._ref_data_pulse_ts = self.db.get_reference_data_pulse(self.company_id)
@@ -2696,7 +2701,14 @@ class CostPriceStockView:
         return out
 
     def _target_margin(self, category_id: str) -> float | None:
-        return self.db.get_category_target_margin(category_id)
+        # get_category_target_margin does a live SQL SELECT when given a
+        # bare id string, but is a pure in-memory lookup when given the
+        # already-loaded category dict — this used to run one query PER
+        # TABLE ROW on every render (doubled: main + archive table), and
+        # again on every single qty/amount/price cell commit, for a value
+        # that's been sitting in self._category_by_id since _load().
+        cat = (getattr(self, "_category_by_id", None) or {}).get(str(category_id or ""))
+        return self.db.get_category_target_margin(cat if cat is not None else category_id)
 
     def _margin_colors(
         self, margin: float | None, target_margin_pct: float | None
@@ -3400,6 +3412,19 @@ class CostPriceStockView:
     def _bg_apply_sync(self) -> None:
         if not self._stock_ui_ready:
             return
+        # This rebuilds the unit-cost map + every warehouse row + a full
+        # render below when anything actually changed — heavy synchronous
+        # work on the single shared event loop. Any order edit anywhere
+        # (Orders/Payments/etc, via the shared orders map) used to trigger
+        # this in full for THIS tab even while it's cached in the
+        # background, freezing every other open tab's UI for however long
+        # the rebuild took. Skip it entirely while this tab isn't on
+        # screen — resume() independently re-syncs from the shared map
+        # (its own _resume_last_seq check, untouched by this early return)
+        # the moment the user actually switches back to this tab.
+        pg = self._pg()
+        if getattr(pg, "_active_view", "") != "show_cost_price_stock":
+            return
         purged = self._purge_deleted_orders()
         # Force-apply all orders from shared map (seq already confirmed changed).
         # We don't use _sync_from_shared_map() here because its field comparison
@@ -3653,10 +3678,12 @@ class CostPriceStockView:
                 page.run_task(_runner)
                 if not getattr(self, "_workspace_sync_loop_started", False):
                     self._workspace_sync_loop_started = True
+                    # Autosave/outbox-flush loop (this manager's own pending
+                    # local edits) — unrelated to cross-user polling, kept.
                     page.run_task(self._workspace_sync_loop)
-                if not getattr(self, "_bg_sync_loop_started", False):
-                    self._bg_sync_loop_started = True
-                    page.run_task(self._bg_sync_loop)
+                # _bg_sync_loop removed — see matching comment in
+                # cost_price_orders_table.py (cross-device change polling,
+                # no longer possible under 1 менеджер = 1 категорія).
                 return
         self._load()
         self._sync_to_shared_map()
