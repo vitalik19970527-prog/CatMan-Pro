@@ -1,0 +1,222 @@
+/* ==========================================================================
+   CatMan Pro + BA Analytics — сайт двох програм.
+   Спільна база (типографіка, кнопки, картки) + 3 теми через [data-theme]:
+   "home" (жовто-синя), "catman" (жовта, неяскрава), "ba" (синя).
+   ========================================================================== */
+
+:root {
+  --ink: #171A1E;
+  --ink-soft: #52606B;
+  --ink-faint: #818E97;
+  --bg: #FAFAF8;
+  --bg-raised: #FFFFFF;
+  --line: #E6E4DD;
+  --line-strong: #D2CFC4;
+
+  --shadow-card: 0 1px 2px rgba(23, 26, 30, 0.04), 0 8px 24px rgba(23, 26, 30, 0.06);
+  --shadow-lift: 0 24px 60px rgba(23, 26, 30, 0.16);
+
+  --font-display: "Iowan Old Style", "Palatino Linotype", Georgia, "Times New Roman", serif;
+  --font-body: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+
+  /* нейтральний акцент за замовчуванням (перевизначається темою) */
+  --accent: #1755D6;
+  --accent-deep: #0D3A94;
+  --accent-soft: #E8EFFC;
+  --accent-ink: #0D3A94;
+}
+
+/* CatMan Pro — жовтий, неяскравий (гірчичний/вохра, не лимонний) */
+[data-theme="catman"] {
+  --accent: #B8861A;
+  --accent-deep: #8F6A12;
+  --accent-soft: #FBF1DC;
+  --accent-ink: #7A5A10;
+}
+
+/* BA Analytics — синій */
+[data-theme="ba"] {
+  --accent: #1755D6;
+  --accent-deep: #0D3A94;
+  --accent-soft: #E8EFFC;
+  --accent-ink: #0D3A94;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.6;
+  overflow-x: hidden;
+}
+img { max-width: 100%; display: block; }
+a { color: inherit; text-decoration: none; }
+ul { padding: 0; margin: 0; list-style: none; }
+
+.wrap { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+.wrap-narrow { max-width: 760px; }
+
+h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; font-weight: 600; margin: 0; }
+.eyebrow {
+  font-family: var(--font-body); font-size: 12.5px; font-weight: 700;
+  letter-spacing: 0.1em; text-transform: uppercase; color: var(--accent-ink); margin: 0 0 10px;
+}
+.eyebrow.center { text-align: center; }
+.section-title { font-size: clamp(24px, 3.2vw, 34px); line-height: 1.25; max-width: 46ch; }
+.section-title.center { margin: 0 auto 14px; text-align: center; }
+.section-lede { font-size: 16px; color: var(--ink-soft); max-width: 60ch; }
+.section-lede.center { margin: 0 auto 36px; text-align: center; }
+
+/* ---------- buttons ---------- */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 13px 26px; border-radius: 10px; font-weight: 600; font-size: 15px;
+  border: 1px solid transparent; cursor: pointer;
+  transition: transform .15s ease, box-shadow .15s ease, background .15s ease, border-color .15s ease;
+}
+.btn:hover { transform: translateY(-1px); }
+.btn-primary { background: var(--accent); color: #fff; box-shadow: 0 10px 24px color-mix(in srgb, var(--accent) 35%, transparent); }
+.btn-primary:hover { background: var(--accent-deep); }
+.btn-ghost { background: transparent; color: var(--ink); border-color: var(--line-strong); }
+.btn-ghost:hover { border-color: var(--accent); color: var(--accent-ink); }
+.btn-small { padding: 9px 18px; font-size: 13.5px; }
+.btn-large { padding: 16px 34px; font-size: 16.5px; }
+
+/* ---------- header ---------- */
+.site-header {
+  position: sticky; top: 0; z-index: 40;
+  background: color-mix(in srgb, var(--bg) 90%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--line);
+}
+.header-row { display: flex; align-items: center; gap: 18px; height: 66px; flex-wrap: wrap; }
+.brand-group { display: flex; align-items: center; gap: 8px; margin-right: auto; }
+.brand {
+  display: flex; align-items: center; gap: 8px; font-family: var(--font-display);
+  font-size: 18px; font-weight: 700; color: var(--ink); padding: 7px 12px; border-radius: 9px;
+}
+.brand-mark { width: 10px; height: 10px; border-radius: 3px; background: var(--accent); flex: none; }
+.brand.is-active { background: var(--accent-soft); color: var(--accent-ink); }
+.header-cta { display: flex; align-items: center; gap: 10px; }
+
+/* ---------- hero ---------- */
+.hero { padding: 56px 0 44px; }
+.hero-grid { display: grid; grid-template-columns: 1fr; gap: 28px; }
+.hero-copy .lede { font-size: 17px; color: var(--ink-soft); max-width: 60ch; }
+.hero-actions { display: flex; gap: 12px; flex-wrap: wrap; margin: 20px 0 10px; }
+.hero-note { font-size: 13.5px; color: var(--ink-faint); }
+
+/* ---------- home: двоколірний поділ ---------- */
+.home-hero {
+  padding: 64px 0 40px;
+  background: linear-gradient(135deg, #FBF1DC 0%, #FAFAF8 45%, #E8EFFC 100%);
+  border-bottom: 1px solid var(--line);
+}
+.product-picker { display: grid; grid-template-columns: 1fr; gap: 20px; margin-top: 36px; }
+@media (min-width: 760px) { .product-picker { grid-template-columns: 1fr 1fr; } }
+.product-card {
+  display: block; padding: 28px; border-radius: 16px; background: var(--bg-raised);
+  border: 1px solid var(--line); box-shadow: var(--shadow-card); transition: box-shadow .15s ease, transform .15s ease;
+}
+.product-card:hover { box-shadow: var(--shadow-lift); transform: translateY(-2px); }
+.product-card--catman { border-top: 4px solid #B8861A; }
+.product-card--ba { border-top: 4px solid #1755D6; }
+.product-card h3 { font-size: 22px; margin-bottom: 8px; }
+.product-card p { color: var(--ink-soft); margin-bottom: 16px; }
+.product-card .btn { width: 100%; }
+.together-note {
+  margin-top: 28px; padding: 16px 20px; border-radius: 12px;
+  background: var(--bg-raised); border: 1px dashed var(--line-strong);
+  color: var(--ink-soft); font-size: 14.5px; text-align: center;
+}
+
+/* ---------- blocks grid (можливості) ---------- */
+.block-grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
+@media (min-width: 640px) { .block-grid { grid-template-columns: 1fr 1fr; } }
+@media (min-width: 980px) { .block-grid { grid-template-columns: 1fr 1fr 1fr; } }
+.block-card {
+  padding: 22px; border-radius: 14px; background: var(--bg-raised);
+  border: 1px solid var(--line); box-shadow: var(--shadow-card);
+}
+.block-card h3 { font-size: 17px; margin-bottom: 8px; }
+.block-card ul { margin-top: 10px; }
+.block-card li {
+  font-size: 14.5px; color: var(--ink-soft); padding: 5px 0 5px 18px; position: relative;
+}
+.block-card li::before {
+  content: ""; position: absolute; left: 2px; top: 13px; width: 6px; height: 6px;
+  border-radius: 50%; background: var(--accent);
+}
+
+/* ---------- section ---------- */
+.section { padding: 56px 0; }
+.band { padding: 28px 0; background: var(--accent-soft); }
+.band-narrow { max-width: 760px; }
+.band-text { font-size: 16px; color: var(--ink-soft); margin: 0; }
+.band-text strong { color: var(--ink); }
+
+/* ---------- trust ---------- */
+.trust-grid { display: grid; grid-template-columns: 1fr; gap: 20px; }
+@media (min-width: 640px) { .trust-grid { grid-template-columns: 1fr 1fr; } }
+@media (min-width: 980px) { .trust-grid { grid-template-columns: repeat(4, 1fr); } }
+.trust-card h3 { font-size: 16px; margin: 10px 0 6px; }
+.trust-card p { font-size: 14px; color: var(--ink-soft); margin: 0; }
+.feature-icon { display: inline-flex; color: var(--accent); }
+.feature-icon svg { width: 26px; height: 26px; }
+
+/* ---------- demo / test account ---------- */
+.demo-card {
+  max-width: 440px; margin: 0 auto 20px; border-radius: 14px; background: var(--bg-raised);
+  border: 1px solid var(--line); box-shadow: var(--shadow-card); overflow: hidden;
+}
+.demo-row { display: flex; justify-content: space-between; padding: 12px 20px; border-bottom: 1px solid var(--line); font-size: 15px; }
+.demo-row:last-child { border-bottom: none; }
+.demo-label { color: var(--ink-faint); }
+.demo-value { font-weight: 700; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* ---------- pricing note ---------- */
+.price-note {
+  max-width: 640px; margin: 0 auto; padding: 22px 26px; border-radius: 14px;
+  background: var(--accent-soft); text-align: center; color: var(--ink);
+}
+
+/* ---------- screenshots (lightbox) ---------- */
+.shot-frame {
+  border-radius: 14px; overflow: hidden; border: 1px solid var(--line);
+  box-shadow: var(--shadow-lift); background: var(--bg-raised); cursor: zoom-in;
+}
+.shot-chrome { display: flex; gap: 6px; padding: 10px 12px; background: #EDEBE3; }
+[data-theme="ba"] .shot-chrome { background: #E8EFFC; }
+.shot-chrome span { width: 9px; height: 9px; border-radius: 50%; background: var(--line-strong); }
+.shot-frame img { width: 100%; display: block; }
+.shot-placeholder { padding: 60px 20px; text-align: center; color: var(--ink-faint); }
+
+/* ---------- footer ---------- */
+.site-footer { padding: 28px 0 40px; border-top: 1px solid var(--line); margin-top: 20px; }
+.footer-row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; font-size: 14px; color: var(--ink-faint); }
+.footer-links { display: flex; gap: 18px; flex-wrap: wrap; }
+.footer-links a { color: var(--ink-soft); font-weight: 600; }
+.footer-links a:hover { color: var(--accent-ink); }
+
+/* ---------- lightbox ---------- */
+.lightbox-overlay {
+  position: fixed; inset: 0; background: rgba(10, 12, 14, 0.8); z-index: 100;
+  display: none; align-items: center; justify-content: center; padding: 24px;
+}
+.lightbox-overlay.is-open { display: flex; }
+.lightbox-box { max-width: 1000px; width: 100%; background: var(--bg-raised); border-radius: 14px; overflow: hidden; }
+.lightbox-head { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.lightbox-close { background: none; border: none; cursor: pointer; color: var(--ink-soft); padding: 6px; }
+.lightbox-body { max-height: 80vh; overflow: auto; }
+.lightbox-body img { width: 100%; }
+
+/* ---------- nav mobile ---------- */
+.nav-toggle { display: none; background: none; border: none; cursor: pointer; padding: 8px; }
+.nav-toggle span { display: block; width: 20px; height: 2px; background: var(--ink); margin: 4px 0; }
+@media (max-width: 760px) {
+  .header-cta .btn-small-label { display: none; }
+}
